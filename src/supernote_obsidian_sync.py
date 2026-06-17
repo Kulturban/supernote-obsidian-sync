@@ -498,9 +498,12 @@ def diagnose():
     print("")
 
 
-def watch_loop():
+def watch_loop(stop_event=None):
     """
     Keep scanning every CHECK_INTERVAL_SECONDS.
+
+    If stop_event is provided, the loop can be stopped cleanly by calling:
+    stop_event.set()
     """
     log("Supernote → Obsidian Sync started")
     log(f"Project folder: {PROJECT_DIR}")
@@ -510,8 +513,17 @@ def watch_loop():
     log(f"Log file: {LOG_FILE}")
 
     while True:
+        if stop_event is not None and stop_event.is_set():
+            log("Supernote → Obsidian Sync stopped")
+            break
+
         scan_once()
-        time.sleep(CHECK_INTERVAL_SECONDS)
+
+        for _ in range(CHECK_INTERVAL_SECONDS):
+            if stop_event is not None and stop_event.is_set():
+                log("Supernote → Obsidian Sync stopped")
+                return
+            time.sleep(1)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(

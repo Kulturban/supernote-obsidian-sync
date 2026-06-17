@@ -1,6 +1,5 @@
 import subprocess
 import threading
-from pathlib import Path
 
 import rumps
 
@@ -19,12 +18,17 @@ class SupernoteObsidianMenuBarApp(rumps.App):
         super().__init__("SN→Obsidian")
 
         self.watch_thread = None
+        self.stop_event = threading.Event()
         self.is_watching = False
 
+        self.sync_now_item = rumps.MenuItem("Sync now", callback=self.sync_now)
+        self.start_item = rumps.MenuItem("Start watching", callback=self.start_watching)
+        self.stop_item = rumps.MenuItem("Stop watching", callback=self.stop_watching)
+
         self.menu = [
-            rumps.MenuItem("Sync now", callback=self.sync_now),
-            rumps.MenuItem("Start watching", callback=self.start_watching),
-            rumps.MenuItem("Stop watching", callback=self.stop_watching),
+            self.sync_now_item,
+            self.start_item,
+            self.stop_item,
             None,
             rumps.MenuItem("Run diagnostics", callback=self.run_diagnostics),
             rumps.MenuItem("Open config", callback=self.open_config),
@@ -33,6 +37,15 @@ class SupernoteObsidianMenuBarApp(rumps.App):
             None,
             rumps.MenuItem("Quit", callback=self.quit_app),
         ]
+
+        self.update_menu_state()
+
+    def update_menu_state(self):
+        self.start_item.set_callback(None if self.is_watching else self.start_watching)
+        self.stop_item.set_callback(self.stop_watching if self.is_watching else None)
+
+        self.start_item.title = "Start watching" if not self.is_watching else "Watching is running"
+        self.stop_item.title = "Stop watching" if self.is_watching else "Stop watching"
 
     def notify(self, title, subtitle, message):
         rumps.notification(
@@ -60,14 +73,18 @@ class SupernoteObsidianMenuBarApp(rumps.App):
             rumps.alert("Already watching.")
             return
 
+        self.stop_event.clear()
         self.is_watching = True
+        self.update_menu_state()
 
         def run():
             try:
-                watch_loop()
+                watch_loop(stop_event=self.stop_event)
             except Exception as e:
-                self.is_watching = False
                 rumps.alert(f"Watcher stopped because of an error:\n\n{e}")
+            finally:
+                self.is_watching = False
+                self.update_menu_state()
 
         self.watch_thread = threading.Thread(target=run, daemon=True)
         self.watch_thread.start()
@@ -79,11 +96,18 @@ class SupernoteObsidianMenuBarApp(rumps.App):
         )
 
     def stop_watching(self, _):
-        # In this first simple version, stopping is done by quitting the app.
-        # We will improve this in the next step.
-        rumps.alert(
-            "For now, use Quit to stop watching.\n\n"
-            "We will add a cleaner stop function in the next version."
+        if not self.is_watching:
+            rumps.alert("Watching is not running.")
+            return
+
+        self.stop_event.set()
+        self.is_watching = False
+        self.update_menu_state()
+
+        self.notify(
+            "Supernote → Obsidian",
+            "Watching stopped",
+            "Automatic checking has stopped.",
         )
 
     def run_diagnostics(self, _):
@@ -118,6 +142,8 @@ class SupernoteObsidianMenuBarApp(rumps.App):
         subprocess.run(["open", str(PROJECT_DIR)])
 
     def quit_app(self, _):
+        if self.is_watching:
+            self.stop_event.set()
         rumps.quit_application()
 
 
