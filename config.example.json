@@ -1,0 +1,14 @@
+{
+  "source_dir": "/Users/YOUR_USERNAME/Library/Containers/com.ratta.supernote/Data/Library/Application Support/com.ratta.supernote/YOUR_SUPERNOTE_ID/Supernote/Note/YOUR_NOTEBOOK_OR_FOLDER",
+  "vault_dir": "/Users/YOUR_USERNAME/Documents/Obsidian Vault",
+  "obsidian_note_folder": "Supernote",
+  "attachment_folder": "Attachments/Supernote",
+  "state_file": "local/processed_notes.json",
+  "check_interval_seconds": 60,
+  "file_stability_wait_seconds": 10,
+  "supernote_tool_path": "/Users/YOUR_USERNAME/supernote-automation/.venv/bin/supernote-tool",
+  "task_marker": "#",
+  "task_tag": "#task",
+  "open_requires_obsidian_running": true
+}
+
