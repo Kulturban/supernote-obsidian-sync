@@ -1,8 +1,8 @@
 # Supernote → Obsidian Sync
 
-A small macOS Python tool for syncing handwritten Supernote `.note` files into an Obsidian vault.
+A macOS command-line tool for syncing handwritten Supernote `.note` files into an Obsidian vault.
 
-It converts Supernote notes to PDF, sends the PDF to Mistral OCR, saves the OCR result as Markdown, embeds the original PDF, and can convert handwritten task markers into Obsidian Tasks.
+It converts Supernote notes to PDF, sends the PDF to Mistral OCR, saves the OCR result as searchable Markdown, embeds the original PDF, and can convert handwritten task markers into Obsidian Tasks.
 
 ## Features
 
@@ -15,8 +15,8 @@ It converts Supernote notes to PDF, sends the PDF to Mistral OCR, saves the OCR 
 * Configurable via a local `config.json`
 * Private API key via local `.env`
 * Supports one-time sync and watch mode
-* Includes diagnostics command
-* Includes setup command
+* Includes setup and diagnostics commands
+* Installable with Homebrew
 
 ## Privacy warning
 
@@ -39,6 +39,7 @@ Never publish your:
 
 * macOS
 * Python 3
+* Homebrew
 * Obsidian
 * Supernote Partner app
 * `supernote-tool`
@@ -46,53 +47,68 @@ Never publish your:
 
 ## Installation with Homebrew
 
+Install the Homebrew tap and formula:
+
 ```bash
 brew tap Kulturban/supernote-obsidian-sync
 brew trust Kulturban/supernote-obsidian-sync
 brew install supernote-obsidian-sync
-
-## Installation from source
-
-Clone the repository:
-
-```bash
-git clone https://github.com/Kulturban/supernote-obsidian-sync.git
-cd supernote-obsidian-sync
 ```
 
-Create a virtual environment:
+Then run the first setup:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+supernote-obsidian-sync --setup
 ```
 
-## First setup
-
-Run:
-
-```bash
-./bin/supernote-obsidian-sync --setup
-```
-
-This creates the user settings folder:
+This creates the settings folder:
 
 ```text
 ~/Library/Application Support/Supernote Obsidian Sync/
 ```
 
-Inside this folder, edit:
-
-```text
-config.json
-.env
-```
-
-Add your Mistral API key to `.env`:
+Open the settings folder in Finder:
 
 ```bash
-MISTRAL_API_KEY=your_api_key_here
+open "$HOME/Library/Application Support/Supernote Obsidian Sync"
+```
+
+Edit `config.json`:
+
+```bash
+open -a TextEdit "$HOME/Library/Application Support/Supernote Obsidian Sync/config.json"
+```
+
+Edit `.env`:
+
+```bash
+open -a TextEdit "$HOME/Library/Application Support/Supernote Obsidian Sync/.env"
+```
+
+In `.env`, replace:
+
+```bash
+MISTRAL_API_KEY=your_mistral_api_key_here
+```
+
+with your real Mistral API key.
+
+Then run diagnostics:
+
+```bash
+supernote-obsidian-sync --diagnose
+```
+
+If all important checks pass, run one sync:
+
+```bash
+supernote-obsidian-sync --once
+```
+
+To keep watching continuously:
+
+```bash
+supernote-obsidian-sync
 ```
 
 ## Configuration
@@ -103,7 +119,7 @@ The config file is stored here:
 ~/Library/Application Support/Supernote Obsidian Sync/config.json
 ```
 
-Example:
+Example config:
 
 ```json
 {
@@ -121,31 +137,28 @@ Example:
 }
 ```
 
-## Usage
+### Important config fields
 
-Run setup:
+`source_dir`
+The folder where Supernote Partner stores your `.note` files.
 
-```bash
-./bin/supernote-obsidian-sync --setup
-```
+`vault_dir`
+Your Obsidian vault folder.
 
-Run diagnostics:
+`obsidian_note_folder`
+The folder inside your Obsidian vault where Markdown notes should be saved.
 
-```bash
-./bin/supernote-obsidian-sync --diagnose
-```
+`attachment_folder`
+The folder inside your Obsidian vault where PDFs and images should be saved.
 
-Run one sync scan:
+`supernote_tool_path`
+The path to your installed `supernote-tool`.
 
-```bash
-./bin/supernote-obsidian-sync --once
-```
+`task_marker`
+The handwritten marker used to create tasks. Default: `#`
 
-Run continuously:
-
-```bash
-./bin/supernote-obsidian-sync
-```
+`task_tag`
+The Obsidian task tag that will be inserted. Default: `#task`
 
 ## Task conversion
 
@@ -172,6 +185,38 @@ The marker and tag can be changed in `config.json`:
 }
 ```
 
+## Usage
+
+Run setup:
+
+```bash
+supernote-obsidian-sync --setup
+```
+
+Run diagnostics:
+
+```bash
+supernote-obsidian-sync --diagnose
+```
+
+Run one sync scan:
+
+```bash
+supernote-obsidian-sync --once
+```
+
+Run continuously:
+
+```bash
+supernote-obsidian-sync
+```
+
+Show help:
+
+```bash
+supernote-obsidian-sync --help
+```
+
 ## macOS permissions
 
 macOS may ask for permission to let Python access files from other apps.
@@ -181,18 +226,18 @@ If syncing fails, give Full Disk Access to:
 * Terminal
 * Obsidian
 * Supernote Partner
-* the Python executable inside `.venv`
+* the Python executable used by Homebrew
 
-Find the Python executable with:
+You can find the installed command with:
 
 ```bash
-.venv/bin/python -c "import sys; print(sys.executable)"
+which supernote-obsidian-sync
 ```
 
-Then add it in:
+Then check diagnostics again:
 
-```text
-System Settings → Privacy & Security → Full Disk Access
+```bash
+supernote-obsidian-sync --diagnose
 ```
 
 ## Troubleshooting
@@ -200,13 +245,19 @@ System Settings → Privacy & Security → Full Disk Access
 Run diagnostics:
 
 ```bash
-./bin/supernote-obsidian-sync --diagnose
+supernote-obsidian-sync --diagnose
 ```
 
 Check the log:
 
 ```bash
 tail -n 50 "$HOME/Library/Application Support/Supernote Obsidian Sync/supernote_obsidian_sync.log"
+```
+
+Open the settings folder:
+
+```bash
+open "$HOME/Library/Application Support/Supernote Obsidian Sync"
 ```
 
 Reset processed state:
@@ -217,6 +268,36 @@ rm "$HOME/Library/Application Support/Supernote Obsidian Sync/processed_notes.js
 
 This forces the script to process notes again.
 
+## Installation from source
+
+Clone the repository:
+
+```bash
+git clone https://github.com/Kulturban/supernote-obsidian-sync.git
+cd supernote-obsidian-sync
+```
+
+Create a virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
+```
+
+Run setup:
+
+```bash
+supernote-obsidian-sync --setup
+```
+
+Run diagnostics:
+
+```bash
+supernote-obsidian-sync --diagnose
+```
+
 ## Roadmap
 
 * [x] Basic Python sync script
@@ -225,7 +306,7 @@ This forces the script to process notes again.
 * [x] Diagnostics
 * [x] Setup command
 * [x] Command-line entry point
-* [ ] Homebrew installation
+* [x] Homebrew installation
 * [ ] macOS menu bar app
 * [ ] GUI settings window
 * [ ] packaged `.app`
