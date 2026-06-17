@@ -513,7 +513,7 @@ def watch_loop():
         scan_once()
         time.sleep(CHECK_INTERVAL_SECONDS)
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(
         description="Supernote → Obsidian Sync"
     )
@@ -538,3 +538,7 @@ if __name__ == "__main__":
         scan_once()
     else:
         watch_loop()
+
+
+if __name__ == "__main__":
+    main()
