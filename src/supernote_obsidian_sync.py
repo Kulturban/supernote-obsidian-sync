@@ -17,12 +17,22 @@ from mistralai import Mistral
 # ------------------------------------------------------------
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-LOCAL_DIR = PROJECT_DIR / "local"
-CONFIG_FILE = LOCAL_DIR / "config.json"
-ENV_FILE = LOCAL_DIR / ".env"
-LOG_FILE = LOCAL_DIR / "supernote_obsidian_sync.log"
 
-LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+APP_SUPPORT_DIR = (
+    Path.home()
+    / "Library"
+    / "Application Support"
+    / "Supernote Obsidian Sync"
+)
+
+# Backwards-compatible local folder for development.
+LOCAL_DIR = PROJECT_DIR / "local"
+
+CONFIG_FILE = APP_SUPPORT_DIR / "config.json"
+ENV_FILE = APP_SUPPORT_DIR / ".env"
+LOG_FILE = APP_SUPPORT_DIR / "supernote_obsidian_sync.log"
+
+APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -49,12 +59,12 @@ def expand_path(path_string: str) -> Path:
 
 def load_config() -> dict:
     """
-    Load user settings from local/config.json.
+    Load user settings from the macOS Application Support folder.
     """
     if not CONFIG_FILE.exists():
         raise SystemExit(
             f"Config file not found: {CONFIG_FILE}\n"
-            "Create local/config.json first."
+            "Run: supernote-obsidian-sync --setup"
         )
 
     return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -68,7 +78,14 @@ VAULT_DIR = expand_path(config["vault_dir"])
 OBSIDIAN_NOTE_DIR = VAULT_DIR / config["obsidian_note_folder"]
 PDF_DIR = VAULT_DIR / config["attachment_folder"]
 
-STATE_FILE = PROJECT_DIR / config["state_file"]
+state_file_config = config.get("state_file", "processed_notes.json")
+
+state_file_path = Path(state_file_config).expanduser()
+
+if state_file_path.is_absolute():
+    STATE_FILE = state_file_path
+else:
+    STATE_FILE = APP_SUPPORT_DIR / state_file_path
 
 CHECK_INTERVAL_SECONDS = int(config.get("check_interval_seconds", 60))
 FILE_STABILITY_WAIT_SECONDS = int(config.get("file_stability_wait_seconds", 10))
