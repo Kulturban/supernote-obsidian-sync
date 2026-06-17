@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "supernote-obsidian-sync"
+version = "0.2.0"
+description = "Sync Supernote handwritten notes to Obsidian as searchable Markdown using Mistral OCR."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Kulturban" }
+]
+dependencies = [
+  "python-dotenv",
+  "mistralai"
+]
+
+[project.urls]
+Homepage = "https://github.com/Kulturban/supernote-obsidian-sync"
+Repository = "https://github.com/Kulturban/supernote-obsidian-sync"
+Issues = "https://github.com/Kulturban/supernote-obsidian-sync/issues"
+
+[project.scripts]
+supernote-obsidian-sync = "supernote_obsidian_sync:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["supernote_obsidian_sync"]
