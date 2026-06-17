@@ -31,6 +31,21 @@ LOCAL_DIR = PROJECT_DIR / "local"
 CONFIG_FILE = APP_SUPPORT_DIR / "config.json"
 ENV_FILE = APP_SUPPORT_DIR / ".env"
 LOG_FILE = APP_SUPPORT_DIR / "supernote_obsidian_sync.log"
+EXAMPLE_CONFIG_FILE = PROJECT_DIR / "config.example.json"
+
+DEFAULT_CONFIG = {
+    "source_dir": "/Users/YOUR_USERNAME/Library/Containers/com.ratta.supernote/Data/Library/Application Support/com.ratta.supernote/YOUR_SUPERNOTE_ID/Supernote/Note/YOUR_NOTEBOOK_OR_FOLDER",
+    "vault_dir": "/Users/YOUR_USERNAME/Documents/Obsidian Vault",
+    "obsidian_note_folder": "Supernote",
+    "attachment_folder": "Attachments/Supernote",
+    "state_file": "processed_notes.json",
+    "check_interval_seconds": 60,
+    "file_stability_wait_seconds": 10,
+    "supernote_tool_path": "/Users/YOUR_USERNAME/path/to/supernote-tool",
+    "task_marker": "#",
+    "task_tag": "#task",
+    "open_requires_obsidian_running": True,
+}
 
 APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -60,12 +75,12 @@ def expand_path(path_string: str) -> Path:
 def load_config() -> dict:
     """
     Load user settings from the macOS Application Support folder.
+
+    If config.json does not exist yet, return DEFAULT_CONFIG so that
+    --setup can still run on a fresh installation.
     """
     if not CONFIG_FILE.exists():
-        raise SystemExit(
-            f"Config file not found: {CONFIG_FILE}\n"
-            "Run: supernote-obsidian-sync --setup"
-        )
+        return DEFAULT_CONFIG.copy()
 
     return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
 
@@ -407,6 +422,46 @@ def scan_once():
         except Exception as e:
             logging.exception(f"Error processing {note_file}")
             log(f"Error processing {note_file}: {e}")
+def setup():
+    """
+    Create the user settings folder and starter config files.
+    Existing files will not be overwritten.
+    """
+    APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+    print("\nSupernote → Obsidian Sync setup\n")
+    print(f"Settings folder:\n{APP_SUPPORT_DIR}\n")
+
+    if CONFIG_FILE.exists():
+        print(f"✅ Config already exists:\n{CONFIG_FILE}\n")
+    else:
+        if EXAMPLE_CONFIG_FILE.exists():
+            shutil.copy2(EXAMPLE_CONFIG_FILE, CONFIG_FILE)
+            print(f"✅ Created config from template:\n{CONFIG_FILE}\n")
+        else:
+            default_config = DEFAULT_CONFIG.copy()
+
+            CONFIG_FILE.write_text(
+                json.dumps(default_config, indent=2),
+                encoding="utf-8",
+            )
+            print(f"✅ Created default config:\n{CONFIG_FILE}\n")
+
+    if ENV_FILE.exists():
+        print(f"✅ .env already exists:\n{ENV_FILE}\n")
+    else:
+        ENV_FILE.write_text(
+            "MISTRAL_API_KEY=your_mistral_api_key_here\n",
+            encoding="utf-8",
+        )
+        print(f"✅ Created .env file:\n{ENV_FILE}\n")
+
+    print("Next steps:")
+    print(f"1. Open and edit config:\n   open '{CONFIG_FILE}'")
+    print(f"2. Open and edit Mistral API key:\n   open '{ENV_FILE}'")
+    print("3. Run diagnostics:")
+    print("   supernote-obsidian-sync --diagnose")
+    print("")
 
 def diagnose():
     """
@@ -416,7 +471,7 @@ def diagnose():
 
     checks = []
 
-    def add_check(name: str, ok: bool, detail: str = ""):
+    def add_check(name: str, ok: bool, detail: sr = ""):
         symbol = "✅" if ok else "❌"
         line = f"{symbol} {name}"
         if detail:
@@ -536,6 +591,12 @@ def main():
     )
 
     parser.add_argument(
+        "--setup",
+        action="store_true",
+        help="Create initial user settings files.",
+    )
+
+    parser.add_argument(
         "--diagnose",
         action="store_true",
         help="Check whether the local setup is configured correctly.",
@@ -549,7 +610,9 @@ def main():
 
     args = parser.parse_args()
 
-    if args.diagnose:
+    if args.setup:
+        setup()
+    elif args.diagnose:
         diagnose()
     elif args.once:
         scan_once()
