@@ -44,6 +44,13 @@ Never publish your:
 * `supernote-tool`
 * Mistral API key
 
+## Installation with Homebrew
+
+```bash
+brew tap Kulturban/supernote-obsidian-sync
+brew trust Kulturban/supernote-obsidian-sync
+brew install supernote-obsidian-sync
+
 ## Installation from source
 
 Clone the repository:
