@@ -422,45 +422,175 @@ def scan_once():
         except Exception as e:
             logging.exception(f"Error processing {note_file}")
             log(f"Error processing {note_file}: {e}")
+def ask(prompt: str, default: str = "") -> str:
+    """
+    Ask the user for input, with an optional default value.
+    """
+    if default:
+        answer = input(f"{prompt}\n[{default}]\n> ").strip()
+        return answer or default
+
+    return input(f"{prompt}\n> ").strip()
+
+
+def ask_bool(prompt: str, default: bool = True) -> bool:
+    """
+    Ask the user a yes/no question.
+    """
+    default_text = "Y/n" if default else "y/N"
+    answer = input(f"{prompt} [{default_text}]\n> ").strip().lower()
+
+    if not answer:
+        return default
+
+    return answer in ("y", "yes", "j", "ja", "true", "1")
+
+
 def setup():
     """
-    Create the user settings folder and starter config files.
-    Existing files will not be overwritten.
+    Interactive setup for user settings.
+    Existing files will not be overwritten unless the user confirms.
     """
     APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
 
     print("\nSupernote → Obsidian Sync setup\n")
     print(f"Settings folder:\n{APP_SUPPORT_DIR}\n")
 
+    existing_config = {}
     if CONFIG_FILE.exists():
-        print(f"✅ Config already exists:\n{CONFIG_FILE}\n")
-    else:
-        if EXAMPLE_CONFIG_FILE.exists():
-            shutil.copy2(EXAMPLE_CONFIG_FILE, CONFIG_FILE)
-            print(f"✅ Created config from template:\n{CONFIG_FILE}\n")
+        try:
+            existing_config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            existing_config = {}
+
+        overwrite = ask_bool(
+            f"Config already exists:\n{CONFIG_FILE}\n\nDo you want to update it interactively?",
+            default=True,
+        )
+
+        if not overwrite:
+            print("Keeping existing config.")
+            print("")
         else:
-            default_config = DEFAULT_CONFIG.copy()
-
-            CONFIG_FILE.write_text(
-                json.dumps(default_config, indent=2),
-                encoding="utf-8",
-            )
-            print(f"✅ Created default config:\n{CONFIG_FILE}\n")
-
-    if ENV_FILE.exists():
-        print(f"✅ .env already exists:\n{ENV_FILE}\n")
+            existing_config = existing_config or DEFAULT_CONFIG.copy()
     else:
-        ENV_FILE.write_text(
-            "MISTRAL_API_KEY=your_mistral_api_key_here\n",
+        existing_config = DEFAULT_CONFIG.copy()
+
+    if not CONFIG_FILE.exists() or existing_config:
+        print("\nPlease enter your settings.\n")
+        print("Tip: You can drag folders/files from Finder into Terminal to paste their path.\n")
+
+        source_dir = ask(
+            "Supernote source folder",
+            existing_config.get("source_dir", DEFAULT_CONFIG["source_dir"]),
+        )
+
+        vault_dir = ask(
+            "Obsidian vault folder",
+            existing_config.get("vault_dir", DEFAULT_CONFIG["vault_dir"]),
+        )
+
+        obsidian_note_folder = ask(
+            "Folder inside your Obsidian vault for Markdown notes",
+            existing_config.get("obsidian_note_folder", "Supernote"),
+        )
+
+        attachment_folder = ask(
+            "Folder inside your Obsidian vault for PDFs/images",
+            existing_config.get("attachment_folder", "Attachments/Supernote"),
+        )
+
+        state_file = ask(
+            "Processed state file name",
+            existing_config.get("state_file", "processed_notes.json"),
+        )
+
+        check_interval_seconds = ask(
+            "Check interval in seconds",
+            str(existing_config.get("check_interval_seconds", 60)),
+        )
+
+        file_stability_wait_seconds = ask(
+            "Wait time in seconds to make sure a .note file is stable",
+            str(existing_config.get("file_stability_wait_seconds", 10)),
+        )
+
+        supernote_tool_path = ask(
+            "Path to supernote-tool",
+            existing_config.get("supernote_tool_path", DEFAULT_CONFIG["supernote_tool_path"]),
+        )
+
+        task_marker = ask(
+            "Handwritten task marker",
+            existing_config.get("task_marker", "#"),
+        )
+
+        task_tag = ask(
+            "Obsidian task tag",
+            existing_config.get("task_tag", "#task"),
+        )
+
+        open_requires_obsidian_running = ask_bool(
+            "Should syncing only run when Obsidian is open?",
+            bool(existing_config.get("open_requires_obsidian_running", True)),
+        )
+
+        new_config = {
+            "source_dir": source_dir,
+            "vault_dir": vault_dir,
+            "obsidian_note_folder": obsidian_note_folder,
+            "attachment_folder": attachment_folder,
+            "state_file": state_file,
+            "check_interval_seconds": int(check_interval_seconds),
+            "file_stability_wait_seconds": int(file_stability_wait_seconds),
+            "supernote_tool_path": supernote_tool_path,
+            "task_marker": task_marker,
+            "task_tag": task_tag,
+            "open_requires_obsidian_running": open_requires_obsidian_running,
+        }
+
+        CONFIG_FILE.write_text(
+            json.dumps(new_config, indent=2),
             encoding="utf-8",
         )
-        print(f"✅ Created .env file:\n{ENV_FILE}\n")
 
+        print(f"\n✅ Config written:\n{CONFIG_FILE}\n")
+
+    if ENV_FILE.exists():
+        update_env = ask_bool(
+            f".env already exists:\n{ENV_FILE}\n\nDo you want to update your Mistral API key?",
+            default=False,
+        )
+    else:
+        update_env = True
+
+    if update_env:
+        current_key = os.environ.get("MISTRAL_API_KEY", "")
+        default_display = "keep existing key" if current_key else "your_mistral_api_key_here"
+
+        api_key = ask(
+            "Mistral API key",
+            default_display,
+        )
+
+        if api_key == "keep existing key":
+            print("Keeping existing Mistral API key.")
+        else:
+            ENV_FILE.write_text(
+                f"MISTRAL_API_KEY={api_key}\n",
+                encoding="utf-8",
+            )
+            print(f"✅ .env written:\n{ENV_FILE}\n")
+    else:
+        print("Keeping existing .env file.\n")
+
+    print("Setup complete.")
+    print("")
     print("Next steps:")
-    print(f"1. Open and edit config:\n   open '{CONFIG_FILE}'")
-    print(f"2. Open and edit Mistral API key:\n   open '{ENV_FILE}'")
-    print("3. Run diagnostics:")
+    print("1. Run diagnostics:")
     print("   supernote-obsidian-sync --diagnose")
+    print("2. Run one sync:")
+    print("   supernote-obsidian-sync --once")
     print("")
 
 def diagnose():
