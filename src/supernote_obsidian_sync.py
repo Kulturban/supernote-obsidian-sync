@@ -97,19 +97,89 @@ def load_config() -> dict:
 
 config = load_config()
 
-SOURCE_DIR = expand_path(config["source_dir"])
-VAULT_DIR = expand_path(config["vault_dir"])
 
-OBSIDIAN_NOTE_DIR = VAULT_DIR / config["obsidian_note_folder"]
-PDF_DIR = VAULT_DIR / config["attachment_folder"]
+def slugify(value: str) -> str:
+    """
+    Create a safe lowercase name for generated state files.
+    """
+    safe = "".join(
+        c.lower() if c.isalnum() else "_"
+        for c in value.strip()
+    )
+    safe = "_".join(part for part in safe.split("_") if part)
+    return safe or "notebook"
 
-state_file_config = config.get("state_file", "processed_notes.json")
-state_file_path = Path(state_file_config).expanduser()
 
-if state_file_path.is_absolute():
-    STATE_FILE = state_file_path
-else:
-    STATE_FILE = APP_SUPPORT_DIR / state_file_path
+def normalize_notebooks(raw_config: dict) -> list[dict]:
+    """
+    Convert old single-folder config and new multi-folder config
+    into one internal notebook list.
+
+    Old config:
+      source_dir, obsidian_note_folder, attachment_folder, state_file
+
+    New config:
+      notebooks: [
+        {
+          name,
+          source_dir,
+          obsidian_note_folder,
+          attachment_folder,
+          state_file
+        }
+      ]
+    """
+    configured_notebooks = raw_config.get("notebooks")
+
+    if isinstance(configured_notebooks, list) and configured_notebooks:
+        notebooks = configured_notebooks
+    else:
+        source_dir = raw_config.get("source_dir", DEFAULT_CONFIG["source_dir"])
+        fallback_name = Path(source_dir).expanduser().name or "Supernote"
+
+        notebooks = [
+            {
+                "name": fallback_name,
+                "source_dir": source_dir,
+                "obsidian_note_folder": raw_config.get(
+                    "obsidian_note_folder",
+                    DEFAULT_CONFIG["obsidian_note_folder"],
+                ),
+                "attachment_folder": raw_config.get(
+                    "attachment_folder",
+                    DEFAULT_CONFIG["attachment_folder"],
+                ),
+                "state_file": raw_config.get(
+                    "state_file",
+                    DEFAULT_CONFIG["state_file"],
+                ),
+            }
+        ]
+
+    normalized = []
+
+    for index, notebook in enumerate(notebooks, start=1):
+        source_dir = notebook.get("source_dir", "").strip()
+        name = notebook.get("name") or Path(source_dir).expanduser().name or f"Notebook {index}"
+
+        obsidian_note_folder = notebook.get("obsidian_note_folder") or name
+        attachment_folder = notebook.get("attachment_folder") or f"Attachments/Supernote/{name}"
+        state_file = notebook.get("state_file") or f"processed_{slugify(name)}.json"
+
+        normalized.append(
+            {
+                "name": name,
+                "source_dir": source_dir,
+                "obsidian_note_folder": obsidian_note_folder,
+                "attachment_folder": attachment_folder,
+                "state_file": state_file,
+            }
+        )
+
+    return normalized
+
+
+NOTEBOOKS = normalize_notebooks(config)
 
 CHECK_INTERVAL_SECONDS = int(config.get("check_interval_seconds", 60))
 FILE_STABILITY_WAIT_SECONDS = int(config.get("file_stability_wait_seconds", 10))
@@ -120,6 +190,46 @@ TASK_MARKER = config.get("task_marker", "#")
 TASK_TAG = config.get("task_tag", "#task")
 
 OPEN_REQUIRES_OBSIDIAN_RUNNING = bool(config.get("open_requires_obsidian_running", True))
+
+ACTIVE_NOTEBOOK = {}
+ACTIVE_ATTACHMENT_FOLDER = ""
+
+SOURCE_DIR = Path.home()
+VAULT_DIR = expand_path(config["vault_dir"])
+OBSIDIAN_NOTE_DIR = VAULT_DIR
+PDF_DIR = VAULT_DIR
+STATE_FILE = APP_SUPPORT_DIR / "processed_notes.json"
+
+
+def use_notebook(notebook: dict) -> None:
+    """
+    Set active paths for the notebook currently being scanned.
+    This keeps the existing processing functions simple while allowing
+    multiple Supernote source folders.
+    """
+    global ACTIVE_NOTEBOOK
+    global ACTIVE_ATTACHMENT_FOLDER
+    global SOURCE_DIR
+    global OBSIDIAN_NOTE_DIR
+    global PDF_DIR
+    global STATE_FILE
+
+    ACTIVE_NOTEBOOK = notebook
+
+    SOURCE_DIR = expand_path(notebook["source_dir"])
+    OBSIDIAN_NOTE_DIR = VAULT_DIR / notebook["obsidian_note_folder"]
+    PDF_DIR = VAULT_DIR / notebook["attachment_folder"]
+    ACTIVE_ATTACHMENT_FOLDER = notebook["attachment_folder"]
+
+    state_file_path = Path(notebook["state_file"]).expanduser()
+
+    if state_file_path.is_absolute():
+        STATE_FILE = state_file_path
+    else:
+        STATE_FILE = APP_SUPPORT_DIR / state_file_path
+
+
+use_notebook(NOTEBOOKS[0])
 
 load_dotenv(ENV_FILE)
 
@@ -364,7 +474,7 @@ def process_note(note_file: Path) -> None:
     md_file = OBSIDIAN_NOTE_DIR / f"{name}.md"
 
     note_attachment_dir = PDF_DIR / name
-    obsidian_image_folder = f"{config['attachment_folder']}/{name}"
+    obsidian_image_folder = f"{ACTIVE_ATTACHMENT_FOLDER}/{name}"
     pdf_file = note_attachment_dir / f"{name}.pdf"
 
     log(f"Processing note: {note_file}")
@@ -389,7 +499,7 @@ def process_note(note_file: Path) -> None:
 
 ## Original PDF
 
-![[{config['attachment_folder']}/{name}/{name}.pdf]]
+![[{ACTIVE_ATTACHMENT_FOLDER}/{name}/{name}.pdf]]
 """
 
         md_file.write_text(final_markdown, encoding="utf-8")
@@ -403,7 +513,7 @@ def process_note(note_file: Path) -> None:
     log(f"Done: {md_file}")
 
 
-def scan_once() -> None:
+def scan_active_notebook_once() -> None:
     """
     Scan the Supernote source folder once.
     """
@@ -437,6 +547,17 @@ def scan_once() -> None:
         except Exception as exc:
             logging.exception("Error processing %s", note_file)
             log(f"Error processing {note_file}: {exc}")
+
+
+
+def scan_once() -> None:
+    """
+    Scan all configured Supernote notebooks once.
+    """
+    for notebook in NOTEBOOKS:
+        use_notebook(notebook)
+        log(f"Scanning notebook: {ACTIVE_NOTEBOOK.get('name', 'Unnamed notebook')}")
+        scan_active_notebook_once()
 
 
 # ------------------------------------------------------------
@@ -826,39 +947,9 @@ def diagnose() -> None:
     )
 
     add_check(
-        "Supernote source folder exists",
-        SOURCE_DIR.exists(),
-        str(SOURCE_DIR),
-    )
-
-    add_check(
         "Obsidian vault exists",
         VAULT_DIR.exists(),
         str(VAULT_DIR),
-    )
-
-    try:
-        OBSIDIAN_NOTE_DIR.mkdir(parents=True, exist_ok=True)
-        output_ok = OBSIDIAN_NOTE_DIR.exists()
-    except Exception:
-        output_ok = False
-
-    add_check(
-        "Obsidian output note folder exists or can be created",
-        output_ok,
-        str(OBSIDIAN_NOTE_DIR),
-    )
-
-    try:
-        PDF_DIR.mkdir(parents=True, exist_ok=True)
-        attachments_ok = PDF_DIR.exists()
-    except Exception:
-        attachments_ok = False
-
-    add_check(
-        "Attachment folder exists or can be created",
-        attachments_ok,
-        str(PDF_DIR),
     )
 
     add_check(
@@ -866,6 +957,13 @@ def diagnose() -> None:
         SUPERNOTE_TOOL_PATH.exists(),
         str(SUPERNOTE_TOOL_PATH),
     )
+
+    if ".venv" in str(SUPERNOTE_TOOL_PATH):
+        add_check(
+            "supernote-tool path is usable but should be cleaned up later",
+            True,
+            "currently inside a project .venv",
+        )
 
     obsidian_running = is_obsidian_running()
 
@@ -877,24 +975,104 @@ def diagnose() -> None:
         else "not required by current config",
     )
 
+    add_check(
+        "At least one notebook is configured",
+        bool(NOTEBOOKS),
+        f"{len(NOTEBOOKS)} notebook(s)",
+    )
+
+    print("Global checks:\n")
     print("\n".join(line for _, line in checks))
 
-    failed = [line for ok, line in checks if not ok]
+    notebook_checks = []
 
-    print("\nResult:")
-    if failed:
-        print(f"❌ {len(failed)} check(s) failed.")
+    def add_notebook_check(notebook_name: str, name: str, ok: bool, detail: str = "") -> None:
+        symbol = "✅" if ok else "❌"
+        line = f"{symbol} {name}"
+        if detail:
+            line += f" — {detail}"
+        notebook_checks.append((ok, notebook_name, line))
+
+    print("\nNotebook checks:\n")
+
+    for index, notebook in enumerate(NOTEBOOKS, start=1):
+        use_notebook(notebook)
+        notebook_name = ACTIVE_NOTEBOOK.get("name", f"Notebook {index}")
+
+        print(f"{index}. {notebook_name}")
+
+        source_ok = SOURCE_DIR.exists()
+        add_notebook_check(
+            notebook_name,
+            "Supernote source folder exists",
+            source_ok,
+            str(SOURCE_DIR),
+        )
+
+        try:
+            OBSIDIAN_NOTE_DIR.mkdir(parents=True, exist_ok=True)
+            note_folder_ok = OBSIDIAN_NOTE_DIR.exists()
+        except Exception:
+            note_folder_ok = False
+
+        add_notebook_check(
+            notebook_name,
+            "Obsidian output note folder exists or can be created",
+            note_folder_ok,
+            str(OBSIDIAN_NOTE_DIR),
+        )
+
+        try:
+            PDF_DIR.mkdir(parents=True, exist_ok=True)
+            attachment_folder_ok = PDF_DIR.exists()
+        except Exception:
+            attachment_folder_ok = False
+
+        add_notebook_check(
+            notebook_name,
+            "Attachment folder exists or can be created",
+            attachment_folder_ok,
+            str(PDF_DIR),
+        )
+
+        state_parent_ok = STATE_FILE.parent.exists()
+
+        if not state_parent_ok:
+            try:
+                STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                state_parent_ok = STATE_FILE.parent.exists()
+            except Exception:
+                state_parent_ok = False
+
+        add_notebook_check(
+            notebook_name,
+            "State file folder exists or can be created",
+            state_parent_ok,
+            str(STATE_FILE),
+        )
+
+        print(f"   {'✅' if source_ok else '❌'} Supernote folder:   {SOURCE_DIR}")
+        print(f"   {'✅' if note_folder_ok else '❌'} Obsidian folder:    {OBSIDIAN_NOTE_DIR}")
+        print(f"   {'✅' if attachment_folder_ok else '❌'} Attachment folder:  {PDF_DIR}")
+        print(f"   {'✅' if state_parent_ok else '❌'} State file:         {STATE_FILE}")
+        print("")
+
+    failed_global = [line for ok, line in checks if not ok]
+    failed_notebooks = [line for ok, _, line in notebook_checks if not ok]
+
+    print("Result:")
+    if failed_global or failed_notebooks:
+        print(f"❌ {len(failed_global) + len(failed_notebooks)} check(s) failed.")
         print("Fix the failed items above before syncing.")
     else:
         print("✅ All checks passed.")
 
     print("")
 
-
 def show_status() -> None:
     """
     Show a short machine- and human-readable status summary.
-    Useful for a future menu-bar app.
+    Useful for the menu-bar app.
     """
     print("\nSupernote → Obsidian Sync status\n")
 
@@ -902,19 +1080,27 @@ def show_status() -> None:
     print(f"Config file:     {CONFIG_FILE}")
     print(f"Env file:        {ENV_FILE}")
     print(f"Log file:        {LOG_FILE}")
-    print(f"State file:      {STATE_FILE}")
     print("")
 
-    print(f"Source folder:   {SOURCE_DIR}")
     print(f"Obsidian vault:  {VAULT_DIR}")
-    print(f"Note folder:     {OBSIDIAN_NOTE_DIR}")
-    print(f"PDF folder:      {PDF_DIR}")
-    print("")
-
     print(f"Check interval:  {CHECK_INTERVAL_SECONDS} seconds")
     print(f"Obsidian running: {'yes' if is_obsidian_running() else 'no'}")
     print(f"API key set:      {'yes' if os.environ.get('MISTRAL_API_KEY') else 'no'}")
+    print(f"supernote-tool:   {SUPERNOTE_TOOL_PATH}")
     print("")
+
+    print("Configured notebook mappings:")
+    print("")
+
+    for index, notebook in enumerate(NOTEBOOKS, start=1):
+        use_notebook(notebook)
+
+        print(f"{index}. {ACTIVE_NOTEBOOK.get('name', 'Unnamed notebook')}")
+        print(f"   Supernote folder:   {SOURCE_DIR}")
+        print(f"   Obsidian folder:    {OBSIDIAN_NOTE_DIR}")
+        print(f"   Attachment folder:  {PDF_DIR}")
+        print(f"   State file:         {STATE_FILE}")
+        print("")
 
 
 def open_settings() -> None:
