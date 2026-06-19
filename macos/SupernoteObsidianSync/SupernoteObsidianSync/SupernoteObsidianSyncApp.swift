@@ -45,11 +45,8 @@ struct SupernoteObsidianSyncApp: App {
 final class CommandRunner {
     static let shared = CommandRunner()
 
-    // Direct Homebrew Cellar path for now.
-    // Later we can make this auto-detect /opt/homebrew/bin, /usr/local/bin, etc.
-    private let cliPath = "/opt/homebrew/Cellar/supernote-obsidian-sync/0.5.0/bin/supernote-obsidian-sync"
-
-    private var outputWindow: NSWindow?
+    private let cliPath = "/opt/homebrew/bin/supernote-obsidian-sync"
+    private var windowControllers: [OutputWindowController] = []
 
     private init() {}
 
@@ -64,10 +61,11 @@ final class CommandRunner {
 
     private func runCommand(_ arguments: [String]) -> String {
         let task = Process()
-
-        // Run through zsh so macOS can execute the Homebrew CLI more reliably.
         task.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        task.arguments = ["-lc", "\(cliPath) \(arguments.joined(separator: " "))"]
+
+        let quotedCLI = shellQuote(cliPath)
+        let quotedArguments = arguments.map { shellQuote($0) }.joined(separator: " ")
+        task.arguments = ["-lc", "\(quotedCLI) \(quotedArguments)"]
 
         let outputPipe = Pipe()
         let errorPipe = Pipe()
@@ -117,16 +115,48 @@ final class CommandRunner {
     }
 
     private func showWindow(title: String, text: String) {
-        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 760, height: 520))
+        let controller = OutputWindowController(title: title, text: text)
+        windowControllers.append(controller)
+
+        controller.onClose = { [weak self, weak controller] in
+            guard let controller else { return }
+            self?.windowControllers.removeAll { $0 === controller }
+        }
+
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
+        controller.window?.display()
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        return "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+}
+
+final class OutputWindowController: NSWindowController, NSWindowDelegate {
+    var onClose: (() -> Void)?
+
+    private let textView: NSTextView
+
+    init(title: String, text: String) {
+        let scrollView = NSTextView.scrollableTextView()
+
+        guard let textView = scrollView.documentView as? NSTextView else {
+            fatalError("Could not create text view")
+        }
+
+        self.textView = textView
+
         textView.string = text
         textView.isEditable = false
+        textView.isSelectable = true
         textView.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         textView.textContainerInset = NSSize(width: 16, height: 16)
 
-        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 760, height: 520))
-        scrollView.documentView = textView
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = true
+        scrollView.autohidesScrollers = false
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 760, height: 520),
@@ -138,10 +168,27 @@ final class CommandRunner {
         window.title = title
         window.contentView = scrollView
         window.center()
-        window.makeKeyAndOrderFront(nil)
 
-        NSApp.activate(ignoringOtherApps: true)
+        super.init(window: window)
 
-        self.outputWindow = window
+        window.delegate = self
+
+        DispatchQueue.main.async {
+            self.textView.string = text
+            self.textView.needsDisplay = true
+            scrollView.needsDisplay = true
+            window.contentView?.needsDisplay = true
+            window.makeKeyAndOrderFront(nil)
+            window.display()
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        onClose?()
     }
 }
