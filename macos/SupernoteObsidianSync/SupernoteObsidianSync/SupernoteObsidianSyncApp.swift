@@ -10,12 +10,12 @@ import AppKit
 struct SupernoteObsidianSyncApp: App {
     var body: some Scene {
         MenuBarExtra("Supernote Sync", systemImage: "note.text") {
-            Button("Status") {
-                CommandRunner.shared.runAndShow(["--status"], title: "Status")
-            }
-
             Button("Run Sync Now") {
                 CommandRunner.shared.runAndShow(["--once"], title: "Sync Result")
+            }
+
+            Button("Status") {
+                CommandRunner.shared.runAndShow(["--status"], title: "Status")
             }
 
             Button("Diagnose") {
@@ -24,12 +24,40 @@ struct SupernoteObsidianSyncApp: App {
 
             Divider()
 
+            Button("Agent Status") {
+                CommandRunner.shared.runAndShow(["--is-running"], title: "LaunchAgent Status")
+            }
+
+            Button("Start Watching") {
+                CommandRunner.shared.runAndShow(["--start"], title: "Start Watching")
+            }
+
+            Button("Stop Watching") {
+                CommandRunner.shared.runAndShow(["--stop"], title: "Stop Watching")
+            }
+
+            Button("Restart Watching") {
+                CommandRunner.shared.runAndShow(["--restart"], title: "Restart Watching")
+            }
+
+            Divider()
+
+            Button("Install Start at Login") {
+                CommandRunner.shared.runAndShow(["--install-agent"], title: "Install Start at Login")
+            }
+
+            Button("Remove Start at Login") {
+                CommandRunner.shared.runAndShow(["--uninstall-agent"], title: "Remove Start at Login")
+            }
+
+            Divider()
+
             Button("Open Settings") {
-                CommandRunner.shared.runSilently(["--open-settings"])
+                CommandRunner.shared.runSilently(["--open-settings"], title: "Open Settings")
             }
 
             Button("Open Log") {
-                CommandRunner.shared.runSilently(["--open-log"])
+                CommandRunner.shared.runSilently(["--open-log"], title: "Open Log")
             }
 
             Divider()
@@ -50,71 +78,41 @@ final class CommandRunner {
 
     private init() {}
 
-    func runSilently(_ arguments: [String]) {
-        _ = runCommand(arguments)
-    }
-
     func runAndShow(_ arguments: [String], title: String) {
-        let output = runCommand(arguments)
-        showWindow(title: title, text: output)
-    }
+        let controller = showWindow(
+            title: title,
+            text: """
+            Running command…
 
-    private func runCommand(_ arguments: [String]) -> String {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/zsh")
-
-        let quotedCLI = shellQuote(cliPath)
-        let quotedArguments = arguments.map { shellQuote($0) }.joined(separator: " ")
-        task.arguments = ["-lc", "\(quotedCLI) \(quotedArguments)"]
-
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-
-        task.standardOutput = outputPipe
-        task.standardError = errorPipe
-
-        do {
-            try task.run()
-            task.waitUntilExit()
-
-            let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-
-            let output = String(data: outputData, encoding: .utf8) ?? ""
-            let error = String(data: errorData, encoding: .utf8) ?? ""
-
-            if task.terminationStatus == 0 {
-                return output.isEmpty ? "Done." : output
-            } else {
-                return """
-                Command failed.
-
-                Exit code: \(task.terminationStatus)
-
-                Command:
-                \(cliPath) \(arguments.joined(separator: " "))
-
-                Output:
-                \(output)
-
-                Error:
-                \(error)
-                """
-            }
-        } catch {
-            return """
-            Failed to run command.
-
-            Command:
-            \(cliPath) \(arguments.joined(separator: " "))
-
-            Error:
-            \(error)
+            \(commandDescription(arguments))
             """
+        )
+
+        Task {
+            let result = await CommandRunner.runCommand(
+                executablePath: cliPath,
+                arguments: arguments
+            )
+
+            controller.updateText(result.displayText)
         }
     }
 
-    private func showWindow(title: String, text: String) {
+    func runSilently(_ arguments: [String], title: String) {
+        Task {
+            let result = await CommandRunner.runCommand(
+                executablePath: cliPath,
+                arguments: arguments
+            )
+
+            if !result.succeeded {
+                showWindow(title: title, text: result.displayText)
+            }
+        }
+    }
+
+    @discardableResult
+    private func showWindow(title: String, text: String) -> OutputWindowController {
         let controller = OutputWindowController(title: title, text: text)
         windowControllers.append(controller)
 
@@ -123,17 +121,109 @@ final class CommandRunner {
             self?.windowControllers.removeAll { $0 === controller }
         }
 
-        controller.showWindow(nil)
-        controller.window?.makeKeyAndOrderFront(nil)
-        controller.window?.display()
+        controller.show()
         NSApp.activate(ignoringOtherApps: true)
+
+        return controller
     }
 
-    private func shellQuote(_ value: String) -> String {
-        return "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    private func commandDescription(_ arguments: [String]) -> String {
+        "\(cliPath) \(arguments.joined(separator: " "))"
+    }
+
+    private nonisolated static func runCommand(
+        executablePath: String,
+        arguments: [String]
+    ) async -> CommandResult {
+        await Task.detached(priority: .userInitiated) {
+            let executableURL = URL(fileURLWithPath: executablePath)
+
+            guard FileManager.default.isExecutableFile(atPath: executablePath) else {
+                return CommandResult(
+                    succeeded: false,
+                    displayText: """
+                    Command not found or not executable.
+
+                    Expected CLI path:
+                    \(executablePath)
+
+                    Try reinstalling with Homebrew:
+                    brew reinstall kulturban/supernote-obsidian-sync/supernote-obsidian-sync
+                    """
+                )
+            }
+
+            let task = Process()
+            task.executableURL = executableURL
+            task.arguments = arguments
+
+            let outputPipe = Pipe()
+            let errorPipe = Pipe()
+
+            task.standardOutput = outputPipe
+            task.standardError = errorPipe
+
+            do {
+                try task.run()
+                task.waitUntilExit()
+
+                let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+                let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+
+                let output = String(data: outputData, encoding: .utf8) ?? ""
+                let error = String(data: errorData, encoding: .utf8) ?? ""
+
+                if task.terminationStatus == 0 {
+                    let text = output.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                    return CommandResult(
+                        succeeded: true,
+                        displayText: text.isEmpty ? "Done." : output
+                    )
+                }
+
+                return CommandResult(
+                    succeeded: false,
+                    displayText: """
+                    Command failed.
+
+                    Exit code:
+                    \(task.terminationStatus)
+
+                    Command:
+                    \(executablePath) \(arguments.joined(separator: " "))
+
+                    Output:
+                    \(output)
+
+                    Error:
+                    \(error)
+                    """
+                )
+            } catch {
+                return CommandResult(
+                    succeeded: false,
+                    displayText: """
+                    Failed to run command.
+
+                    Command:
+                    \(executablePath) \(arguments.joined(separator: " "))
+
+                    Error:
+                    \(error.localizedDescription)
+                    """
+                )
+            }
+        }.value
     }
 }
 
+struct CommandResult {
+    let succeeded: Bool
+    let displayText: String
+}
+
+@MainActor
 final class OutputWindowController: NSWindowController, NSWindowDelegate {
     var onClose: (() -> Void)?
 
@@ -172,20 +262,28 @@ final class OutputWindowController: NSWindowController, NSWindowDelegate {
         super.init(window: window)
 
         window.delegate = self
-
-        DispatchQueue.main.async {
-            self.textView.string = text
-            self.textView.needsDisplay = true
-            scrollView.needsDisplay = true
-            window.contentView?.needsDisplay = true
-            window.makeKeyAndOrderFront(nil)
-            window.display()
-            NSApp.activate(ignoringOtherApps: true)
-        }
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    func show() {
+        showWindow(nil)
+        window?.makeKeyAndOrderFront(nil)
+        window?.display()
+    }
+
+    func updateText(_ text: String) {
+        textView.string = text
+        textView.scrollToBeginningOfDocument(nil)
+        textView.needsDisplay = true
+
+        window?.contentView?.needsDisplay = true
+        window?.display()
+        window?.makeKeyAndOrderFront(nil)
+
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     func windowWillClose(_ notification: Notification) {
