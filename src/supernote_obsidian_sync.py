@@ -632,11 +632,6 @@ def diagnose():
         str(PROJECT_DIR),
     )
 
-    add_check(
-        "Local folder exists",
-        LOCAL_DIR.exists(),
-        str(LOCAL_DIR),
-    )
 
     add_check(
         "Config file exists",
