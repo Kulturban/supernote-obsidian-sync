@@ -6,13 +6,76 @@
 import SwiftUI
 import AppKit
 
+
+struct MenuSetupStatusView: View {
+    @StateObject private var model = SettingsViewModel()
+
+    var body: some View {
+        Group {
+            if model.setupReady {
+                Button("✅ Ready to sync") {
+                    SettingsWindowController.shared.showSetup()
+                }
+            } else {
+                Button("⚠️ Not ready to sync — Open Setup…") {
+                    SettingsWindowController.shared.showSetup()
+                }
+
+                if let step = model.nextSetupStep {
+                    Text("Next: \(step.title)")
+                }
+            }
+        }
+        .onAppear {
+            model.load()
+        }
+    }
+}
+
 @main
 struct SupernoteObsidianSyncApp: App {
     var body: some Scene {
         MenuBarExtra("Supernote Sync", systemImage: "note.text") {
+            MenuSetupStatusView()
+
+            Divider()
+
             Button("Run Sync Now") {
-                CommandRunner.shared.runAndShow(["--once"], title: "Sync Result")
+                let model = SettingsViewModel()
+
+                if model.setupReady {
+                    CommandRunner.shared.runAndShow(["--once"], title: "Run Sync Now")
+                } else {
+                    SettingsWindowController.shared.showSetup()
+                }
             }
+
+            Divider()
+
+            Button("Start Watching") {
+                let model = SettingsViewModel()
+
+                if model.setupReady {
+                    CommandRunner.shared.runAndShow(["--start"], title: "Start Watching")
+                } else {
+                    SettingsWindowController.shared.showSetup()
+                }
+            }
+
+            Button("Stop Watching") {
+                CommandRunner.shared.runAndShow(["--stop"], title: "Stop Watching")
+            }
+
+            Divider()
+
+            Divider()
+
+            Button("Settings…") {
+                SettingsWindowController.shared.show()
+            }
+
+            Divider()
+            Divider()
 
             Button("Status") {
                 CommandRunner.shared.runAndShow(["--status"], title: "Status")
@@ -22,45 +85,13 @@ struct SupernoteObsidianSyncApp: App {
                 CommandRunner.shared.runAndShow(["--diagnose"], title: "Diagnostics")
             }
 
-            Divider()
-
-            Button("Agent Status") {
-                CommandRunner.shared.runAndShow(["--is-running"], title: "LaunchAgent Status")
-            }
-
-            Button("Start Watching") {
-                CommandRunner.shared.runAndShow(["--start"], title: "Start Watching")
-            }
-
-            Button("Stop Watching") {
-                CommandRunner.shared.runAndShow(["--stop"], title: "Stop Watching")
-            }
-
-            Button("Restart Watching") {
-                CommandRunner.shared.runAndShow(["--restart"], title: "Restart Watching")
-            }
-
-            Divider()
-
-            Button("Install Start at Login") {
-                CommandRunner.shared.runAndShow(["--install-agent"], title: "Install Start at Login")
-            }
-
-            Button("Remove Start at Login") {
-                CommandRunner.shared.runAndShow(["--uninstall-agent"], title: "Remove Start at Login")
-            }
-
-            Divider()
-
-            Button("Open Settings") {
-                CommandRunner.shared.runSilently(["--open-settings"], title: "Open Settings")
-            }
-
-            Button("Open Log") {
+            Button("Log") {
                 CommandRunner.shared.runSilently(["--open-log"], title: "Open Log")
             }
 
             Divider()
+
+
 
             Button("Quit") {
                 NSApplication.shared.terminate(nil)
