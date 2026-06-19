@@ -4,11 +4,13 @@
 //
 
 import SwiftUI
+import Combine
 import AppKit
 
 
 struct MenuSetupStatusView: View {
     @StateObject private var model = SettingsViewModel()
+    private let refreshTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
     var body: some View {
         Group {
@@ -29,6 +31,9 @@ struct MenuSetupStatusView: View {
         .onAppear {
             model.load()
         }
+        .onReceive(refreshTimer) { _ in
+            model.load()
+        }
     }
 }
 
@@ -40,32 +45,17 @@ struct SupernoteObsidianSyncApp: App {
 
             Divider()
 
-            Button("Run Sync Now") {
+            Button("Sync Now") {
                 let model = SettingsViewModel()
 
                 if model.setupReady {
-                    CommandRunner.shared.runAndShow(["--once"], title: "Run Sync Now")
+                    CommandRunner.shared.runAndShow(["--once"], title: "Sync Now")
                 } else {
                     SettingsWindowController.shared.showSetup()
                 }
             }
 
             Divider()
-
-            Button("Start Watching") {
-                let model = SettingsViewModel()
-
-                if model.setupReady {
-                    CommandRunner.shared.runAndShow(["--start"], title: "Start Watching")
-                } else {
-                    SettingsWindowController.shared.showSetup()
-                }
-            }
-
-            Button("Stop Watching") {
-                CommandRunner.shared.runAndShow(["--stop"], title: "Stop Watching")
-            }
-
             Divider()
 
             Divider()
@@ -104,19 +94,63 @@ struct SupernoteObsidianSyncApp: App {
 final class CommandRunner {
     static let shared = CommandRunner()
 
-    private let cliPath = "/opt/homebrew/bin/supernote-obsidian-sync"
+    private let cliPath = "/Users/david/supernote-obsidian-sync/.venv/bin/supernote-obsidian-sync"
     private var windowControllers: [OutputWindowController] = []
 
     private init() {}
 
-    func runAndShow(_ arguments: [String], title: String) {
-        let controller = showWindow(
-            title: title,
-            text: """
-            Running command…
+    private func initialOutput(for arguments: [String], title: String) -> String {
+        let command = "\(cliPath) \(arguments.joined(separator: " "))"
 
-            \(commandDescription(arguments))
+        if arguments.contains("--once") {
+            return """
+            Sync Now
+
+            Looking for changed Supernote notes…
+            This can take a moment if OCR is needed.
+
+            Please wait until the result appears.
+
+            Command:
+            \(command)
             """
+        }
+
+        if arguments.contains("--diagnose") {
+            return """
+            Diagnostics
+
+            Checking your setup…
+            Please wait.
+
+            Command:
+            \(command)
+            """
+        }
+
+        if arguments.contains("--status") {
+            return """
+            Status
+
+            Checking current sync status…
+            Please wait.
+
+            Command:
+            \(command)
+            """
+        }
+
+        return """
+        Running command…
+
+        \(command)
+        """
+    }
+
+    func runAndShow(_ arguments: [String], title: String) {
+        let outputWindow = OutputWindowController.show(
+            title: title,
+            output: initialOutput(for: arguments, title: title)
         )
 
         Task {
@@ -125,7 +159,9 @@ final class CommandRunner {
                 arguments: arguments
             )
 
-            controller.updateText(result.displayText)
+            await MainActor.run {
+                outputWindow.update(text: result.displayText)
+            }
         }
     }
 
@@ -256,9 +292,31 @@ struct CommandResult {
 
 @MainActor
 final class OutputWindowController: NSWindowController, NSWindowDelegate {
+    private static var openControllers: [OutputWindowController] = []
+
+    static func show(title: String, output: String) -> OutputWindowController {
+        let controller = OutputWindowController(title: title, text: output)
+
+        openControllers.append(controller)
+
+        controller.onClose = { [weak controller] in
+            guard let controller else { return }
+            openControllers.removeAll { $0 === controller }
+        }
+
+        controller.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        return controller
+    }
+
     var onClose: (() -> Void)?
 
     private let textView: NSTextView
+
+    func update(text: String) {
+        textView.string = text
+    }
 
     init(title: String, text: String) {
         let scrollView = NSTextView.scrollableTextView()

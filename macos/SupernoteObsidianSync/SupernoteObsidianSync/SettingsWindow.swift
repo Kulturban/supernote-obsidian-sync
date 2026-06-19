@@ -202,6 +202,14 @@ enum SetupStep: String, CaseIterable, Identifiable {
 
 @MainActor
 final class SettingsViewModel: ObservableObject {
+    var savedSettingsExist: Bool {
+        let configURL = FileManager.default
+            .homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Supernote Obsidian Sync/config.json")
+
+        return FileManager.default.fileExists(atPath: configURL.path)
+    }
+
     @Published var vaultDir = ""
     @Published var supernoteToolPath = ""
     @Published var checkIntervalSeconds = "60"
@@ -268,13 +276,6 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func save() {
-        let validationErrors = validateSettings()
-
-        if !validationErrors.isEmpty {
-            statusMessage = "❌ Cannot save:\n" + validationErrors.map { "• \($0)" }.joined(separator: "\n")
-            return
-        }
-
         do {
             try FileManager.default.createDirectory(
                 at: appSupportDir,
@@ -302,7 +303,7 @@ final class SettingsViewModel: ObservableObject {
             try envText.write(to: envURL, atomically: true, encoding: .utf8)
 
             if let nextStep = nextSetupStep {
-                statusMessage = "✅ Settings saved. Next setup step: \(nextStep.title)."
+                statusMessage = "✅ Settings saved. Continue setup: \(nextStep.title)."
             } else {
                 statusMessage = "✅ Settings saved. Sync is ready."
             }
@@ -474,6 +475,11 @@ final class SettingsViewModel: ObservableObject {
 
     func chooseVaultFolder() {
         chooseFolder(title: "Choose Obsidian Vault") { url in
+            if self.isInsideSupernotePartnerFolder(url.path) {
+                self.statusMessage = "❌ This looks like the Supernote Partner folder. Please choose your Obsidian vault instead."
+                return
+            }
+
             self.vaultDir = url.path
         }
     }
@@ -485,7 +491,10 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func addNotebook() {
-        chooseFolder(title: "Choose Supernote Folder") { url in
+        chooseFolder(
+            title: "Choose Supernote Folder",
+            initialDirectory: suggestedSupernotePartnerFolderURL()
+        ) { url in
             let folderName = url.lastPathComponent
             let safeName = folderName.isEmpty ? "Supernote" : folderName
             let stateName = "processed_\(Self.slugify(safeName)).json"
@@ -513,7 +522,10 @@ final class SettingsViewModel: ObservableObject {
             return
         }
 
-        chooseFolder(title: "Choose Supernote Folder") { url in
+        chooseFolder(
+            title: "Choose Supernote Folder",
+            initialDirectory: suggestedSupernotePartnerFolderURL()
+        ) { url in
             self.notebooks[index].source_dir = url.path
 
             if self.notebooks[index].name.isEmpty {
@@ -527,7 +539,10 @@ final class SettingsViewModel: ObservableObject {
             return
         }
 
-        chooseFolder(title: "Choose Obsidian Folder inside Vault") { url in
+        chooseFolder(
+            title: "Choose Obsidian Folder inside Vault",
+            initialDirectory: obsidianVaultURL()
+        ) { url in
             self.notebooks[index].obsidian_note_folder = self.relativeToVault(url: url)
         }
     }
@@ -537,25 +552,120 @@ final class SettingsViewModel: ObservableObject {
             return
         }
 
-        chooseFolder(title: "Choose Attachment Folder inside Vault") { url in
+        chooseFolder(
+            title: "Choose Attachment Folder inside Vault",
+            initialDirectory: obsidianVaultURL()
+        ) { url in
             self.notebooks[index].attachment_folder = self.relativeToVault(url: url)
         }
     }
 
-    private func chooseFolder(title: String, completion: (URL) -> Void) {
+    private func chooseFolder(
+        title: String,
+        initialDirectory: URL? = nil,
+        completion: (URL) -> Void
+    ) {
         let panel = NSOpenPanel()
         panel.title = title
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
-
-        if !vaultDir.isEmpty {
-            panel.directoryURL = URL(fileURLWithPath: vaultDir)
-        }
+        panel.directoryURL = initialDirectory
 
         if panel.runModal() == .OK, let url = panel.url {
-            completion(url)
+            completion(normalizeSupernoteFolder(url))
         }
+    }
+
+    private func obsidianVaultURL() -> URL? {
+        guard !vaultDir.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        return URL(fileURLWithPath: vaultDir)
+    }
+
+    private func suggestedSupernotePartnerFolderURL() -> URL {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+
+        let candidates = [
+            home
+                .appendingPathComponent("Library")
+                .appendingPathComponent("Containers")
+                .appendingPathComponent("com.ratta.supernote")
+                .appendingPathComponent("Data")
+                .appendingPathComponent("Documents"),
+
+            home
+                .appendingPathComponent("Library")
+                .appendingPathComponent("Containers")
+                .appendingPathComponent("com.ratta.supernote.mac")
+                .appendingPathComponent("Data")
+                .appendingPathComponent("Documents"),
+
+            home
+                .appendingPathComponent("Library")
+                .appendingPathComponent("Containers")
+                .appendingPathComponent("Supernote Partner")
+                .appendingPathComponent("Data")
+                .appendingPathComponent("Documents"),
+
+            home
+                .appendingPathComponent("Library")
+                .appendingPathComponent("Application Support")
+                .appendingPathComponent("Supernote Partner"),
+
+            home
+                .appendingPathComponent("Library")
+                .appendingPathComponent("Application Support")
+                .appendingPathComponent("com.ratta.supernote")
+        ]
+
+        for candidate in candidates {
+            if containsSupernoteNotes(candidate) {
+                return candidate
+            }
+        }
+
+        for candidate in candidates {
+            if isDirectory(candidate) {
+                return candidate
+            }
+        }
+
+        return home
+    }
+
+    private func containsSupernoteNotes(_ url: URL) -> Bool {
+        guard isDirectory(url) else {
+            return false
+        }
+
+        guard let enumerator = FileManager.default.enumerator(
+            at: url,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return false
+        }
+
+        for case let fileURL as URL in enumerator {
+            if fileURL.pathExtension.lowercased() == "note" {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func isDirectory(_ url: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        let exists = FileManager.default.fileExists(
+            atPath: url.path,
+            isDirectory: &isDirectory
+        )
+
+        return exists && isDirectory.boolValue
     }
 
     private func chooseFile(title: String, completion: (URL) -> Void) {
@@ -587,6 +697,86 @@ final class SettingsViewModel: ObservableObject {
         }
 
         return chosenPath
+    }
+
+
+
+    private func isInsideSupernotePartnerFolder(_ path: String) -> Bool {
+        path.contains("/Library/Containers/com.ratta.supernote/")
+    }
+
+    private func normalizeSupernoteFolder(_ url: URL) -> URL {
+        // If the user chooses .../Supernote, use .../Supernote/Note automatically.
+        if url.lastPathComponent == "Supernote" {
+            let noteURL = url.appendingPathComponent("Note")
+            var isDirectory: ObjCBool = false
+
+            if FileManager.default.fileExists(atPath: noteURL.path, isDirectory: &isDirectory),
+               isDirectory.boolValue {
+                return noteURL
+            }
+        }
+
+        return url
+    }
+
+    var suggestedSupernoteFolderPath: String {
+        if let url = findDefaultSupernoteNoteFolder() {
+            return url.path
+        }
+
+        return "Default Supernote Partner folder not found yet. Open Supernote Partner and sync once."
+    }
+
+    private func findDefaultSupernoteNoteFolder() -> URL? {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+
+        let supernoteBase = home
+            .appendingPathComponent("Library")
+            .appendingPathComponent("Containers")
+            .appendingPathComponent("com.ratta.supernote")
+            .appendingPathComponent("Data")
+            .appendingPathComponent("Library")
+            .appendingPathComponent("Application Support")
+            .appendingPathComponent("com.ratta.supernote")
+
+        guard let userFolders = try? FileManager.default.contentsOfDirectory(
+            at: supernoteBase,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+
+        let candidates = userFolders
+            .map {
+                $0
+                    .appendingPathComponent("Supernote")
+                    .appendingPathComponent("Note")
+            }
+            .filter { url in
+                var isDirectory: ObjCBool = false
+                return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
+                    && isDirectory.boolValue
+            }
+
+        return candidates.sorted { $0.path < $1.path }.first
+    }
+
+    private func chooseSupernoteFolder(title: String, completion: (URL) -> Void) {
+        let panel = NSOpenPanel()
+        panel.title = title
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+
+        if let defaultFolder = findDefaultSupernoteNoteFolder() {
+            panel.directoryURL = defaultFolder
+        }
+
+        if panel.runModal() == .OK, let url = panel.url {
+            completion(url)
+        }
     }
 
     // MARK: External Help
@@ -829,37 +1019,174 @@ struct SettingsView: View {
     private var setupPage: some View {
         VStack(alignment: .leading, spacing: 18) {
             SettingsCard(
-                title: model.setupReady ? "Setup Complete" : "Setup Progress",
+                title: model.setupReady ? "Setup Complete" : "First-Time Setup",
                 description: model.setupReady
-                    ? "Everything required is configured. You are ready to sync Supernote notes to Obsidian."
-                    : "\(model.completedSetupCount) of \(SetupStep.allCases.count) required steps completed."
+                    ? "Everything required is configured. Future changes can be made in the other settings sections."
+                    : "Complete one step at a time. When a step is finished, the next card appears automatically."
             ) {
-                VStack(alignment: .leading, spacing: 14) {
-                    ForEach(SetupStep.allCases) { step in
-                        SetupStepRow(
-                            step: step,
-                            done: model.isSetupStepComplete(step),
-                            isCurrent: model.nextSetupStep == step
-                        ) {
-                            model.selectedSection = step.targetSection
-                        }
-                    }
+                VStack(alignment: .leading, spacing: 16) {
+                    setupStepDots
 
-                    if model.setupReady {
-                        Divider()
+                    if let step = model.nextSetupStep {
+                        HStack(spacing: 10) {
+                            Image(systemName: step.icon)
+                                .foregroundColor(.accentColor)
 
-                        HStack {
-                            Label("Ready to sync", systemImage: "checkmark.circle.fill")
-                                .foregroundColor(.green)
+                            Text("Step \(step.number) of \(SetupStep.allCases.count)")
+                                .font(.headline)
 
                             Spacer()
+                        }
 
-                            Button("Run Diagnose") {
+                        Text(step.title)
+                            .font(.title2)
+                            .bold()
+
+                        Text(step.description)
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        HStack(spacing: 10) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+
+                            Text("Ready to sync")
+                                .font(.title2)
+                                .bold()
+                        }
+
+                        Text("All required setup steps are complete. You can now run sync or start the watcher from the menu bar.")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+
+                        Button("Run Diagnose") {
+                            if model.savedSettingsExist {
                                 CommandRunner.shared.runAndShow(["--diagnose"], title: "Diagnostics")
+                            } else {
+                                model.statusMessage = "Save settings first to enable diagnostics."
                             }
                         }
+                        .disabled(!model.savedSettingsExist)
                     }
                 }
+            }
+
+            if let step = model.nextSetupStep {
+                setupStepCard(step)
+            }
+        }
+    }
+
+    private var setupStepDots: some View {
+        HStack(spacing: 8) {
+            ForEach(SetupStep.allCases) { step in
+                Circle()
+                    .fill(model.isSetupStepComplete(step) ? Color.green : (model.nextSetupStep == step ? Color.accentColor : Color.secondary.opacity(0.25)))
+                    .frame(width: model.nextSetupStep == step ? 11 : 8, height: model.nextSetupStep == step ? 11 : 8)
+                    .animation(.easeInOut(duration: 0.18), value: model.nextSetupStep?.id)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func setupStepCard(_ step: SetupStep) -> some View {
+        switch step {
+        case .obsidianVault:
+            SettingsCard(
+                title: "Choose your Obsidian vault",
+                description: "Select the root folder of your Obsidian vault. Synced Markdown files and attachments will be saved inside this vault."
+            ) {
+                SettingField(
+                    title: "Vault folder",
+                    text: $model.vaultDir,
+                    buttonTitle: "Choose…",
+                    action: model.chooseVaultFolder
+                )
+
+                Text("After choosing a valid vault folder, the next setup step will appear automatically.")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+            }
+
+        case .supernoteTool:
+            SettingsCard(
+                title: "Connect supernote-tool",
+                description: "supernote-tool converts Supernote .note files into PDFs before OCR. The app cannot process notes without it."
+            ) {
+                SettingField(
+                    title: "supernote-tool path",
+                    text: $model.supernoteToolPath,
+                    buttonTitle: "Choose…",
+                    action: model.chooseSupernoteTool
+                )
+
+                HStack {
+                    Button("Auto-detect") {
+                        model.autoDetectSupernoteTool()
+                    }
+
+                    Button("Get supernote-tool for Obsidian") {
+                        model.openSupernoteToolHelp()
+                    }
+                }
+
+                Text("After a valid executable path is found, the next setup step will appear automatically.")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+            }
+
+        case .mistralApiKey:
+            SettingsCard(
+                title: "Add your Mistral API key",
+                description: "Mistral OCR turns your handwritten Supernote notes into searchable Markdown text."
+            ) {
+                SecureField("API key", text: $model.mistralApiKey)
+                    .textFieldStyle(.roundedBorder)
+
+                Button("Get a Mistral API key") {
+                    model.openMistralApiKeyPage()
+                }
+
+                Text("After entering an API key, the final setup step will appear automatically.")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+            }
+
+        case .folders:
+            SettingsCard(
+                title: "Add a Supernote folder",
+                description: "Choose which Supernote folder should sync, and where it should appear in Obsidian."
+            ) {
+                if model.notebooks.isEmpty {
+                    EmptyStateView(
+                        icon: "folder.badge.plus",
+                        title: "No folders configured",
+                        message: "Add at least one Supernote folder to finish setup."
+                    )
+                }
+
+                ForEach(model.notebooks) { notebook in
+                    notebookCard(notebook)
+                }
+
+                Text("Suggested Supernote Partner folder:")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+
+                Text(model.suggestedSupernoteFolderPath)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+
+                Button("+ Add Supernote Folder") {
+                    model.addNotebook()
+                }
+
+                Text("After adding at least one folder, setup is complete.")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
             }
         }
     }
@@ -990,58 +1317,58 @@ struct SettingsView: View {
     private var advancedPage: some View {
         VStack(alignment: .leading, spacing: 18) {
             SettingsCard(
-                title: "Sync Behaviour",
-                description: "Control when the watcher should process Supernote files."
+                title: "Advanced",
+                description: "Optional safety settings for manual syncing."
             ) {
-                Toggle("Only sync when Obsidian is running", isOn: $model.openRequiresObsidianRunning)
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack(alignment: .center) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("File stability wait")
+                                .font(.headline)
 
-                Text("When enabled, the watcher only processes Supernote files while Obsidian is open.")
-                    .font(.footnote)
-                    .foregroundColor(.secondary)
-            }
-
-            SettingsCard(
-                title: "Startup",
-                description: "Start the background watcher automatically when you log in to macOS."
-            ) {
-                Toggle(
-                    "Start watcher at login",
-                    isOn: Binding(
-                        get: {
-                            model.startAtLoginEnabled
-                        },
-                        set: { newValue in
-                            model.setStartAtLogin(newValue)
+                            Text("Wait a few seconds before processing files so Supernote Partner has time to finish syncing.")
+                                .font(.footnote)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
-                    )
-                )
 
-                Button("Check Watcher Status") {
-                    CommandRunner.shared.runAndShow(["--is-running"], title: "Watcher Status")
+                        Spacer()
+
+                        HStack(spacing: 8) {
+                            TextField("10", text: $model.fileStabilityWaitSeconds)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 70)
+
+                            Text("seconds")
+                                .foregroundColor(.secondary)
+                        }
+                        .frame(width: 170, alignment: .trailing)
+                    }
+
+                    Divider()
+
+                    Toggle(
+                        "Require Obsidian to be running before syncing",
+                        isOn: $model.openRequiresObsidianRunning
+                    )
+
+                    Text("Recommended: keep this enabled, so notes are only written while Obsidian is available.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
             SettingsCard(
-                title: "Sync Timing",
-                description: "Most users can leave these values unchanged."
+                title: "Manual Sync Mode",
+                description: "This app now syncs only when you choose Sync Now from the menu bar."
             ) {
-                SettingField(
-                    title: "Check interval seconds",
-                    text: $model.checkIntervalSeconds
-                )
-
-                Text("How often the app checks your configured Supernote folders for new or changed notes. Default: 60 seconds.")
-                    .font(.footnote)
-                    .foregroundColor(.secondary)
-
-                SettingField(
-                    title: "File stability wait seconds",
-                    text: $model.fileStabilityWaitSeconds
-                )
-
-                Text("After a .note file changes, the app waits before processing it. This prevents syncing while Supernote Partner is still writing the file. Default: 10 seconds.")
-                    .font(.footnote)
-                    .foregroundColor(.secondary)
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("No background watcher is shown in the release UI.", systemImage: "checkmark.circle")
+                    Label("No start-at-login setup is needed.", systemImage: "checkmark.circle")
+                    Label("Check interval is hidden because it is only used for background watching.", systemImage: "checkmark.circle")
+                }
+                .foregroundColor(.secondary)
             }
         }
     }
@@ -1054,7 +1381,11 @@ struct SettingsView: View {
             ) {
                 HStack {
                     Button("Run Diagnose") {
-                        CommandRunner.shared.runAndShow(["--diagnose"], title: "Diagnostics")
+                        if model.savedSettingsExist {
+                                CommandRunner.shared.runAndShow(["--diagnose"], title: "Diagnostics")
+                            } else {
+                                model.statusMessage = "Save settings first to enable diagnostics."
+                            }
                     }
 
                     Button("Open Settings Folder") {
