@@ -14,7 +14,7 @@ authors = [
 ]
 dependencies = [
   "python-dotenv",
-   "requests"
+  "requests"
 ]
 
 [project.urls]
