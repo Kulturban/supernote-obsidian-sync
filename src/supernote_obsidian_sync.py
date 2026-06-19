@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from mistralai import Mistral
+import requests
 
 
 # ------------------------------------------------------------
@@ -203,61 +203,79 @@ def mistral_ocr_pdf(pdf_file: Path, image_dir: Path, obsidian_image_folder: str)
             f"MISTRAL_API_KEY not found. Check your env file: {ENV_FILE}"
         )
 
-    client = Mistral(api_key=api_key)
-
     image_dir.mkdir(parents=True, exist_ok=True)
 
     log(f"Starting Mistral OCR: {pdf_file}")
 
     encoded_pdf = base64.b64encode(pdf_file.read_bytes()).decode("utf-8")
 
-    response = client.ocr.process(
-        model="mistral-ocr-latest",
-        document={
+    payload = {
+        "model": "mistral-ocr-latest",
+        "document": {
             "type": "document_url",
             "document_url": f"data:application/pdf;base64,{encoded_pdf}",
         },
-        include_image_base64=True,
+        "include_image_base64": True,
+    }
+
+    response = requests.post(
+        "https://api.mistral.ai/v1/ocr",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=120,
     )
 
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise RuntimeError(
+            f"Mistral OCR request failed: {response.status_code} {response.text}"
+        ) from exc
+
+    data = response.json()
     markdown_parts = []
 
-    for page in response.pages:
-        page_number = page.index + 1
-        page_markdown = page.markdown
+    for page in data.get("pages", []):
+        page_number = int(page.get("index", 0)) + 1
+        page_markdown = page.get("markdown", "")
 
         # Save Mistral-extracted images into this note's own image folder
-        if hasattr(page, "images") and page.images:
-            for image in page.images:
-                image_id = image.id
-                image_base64 = image.image_base64
+        for image in page.get("images", []) or []:
+            image_id = image.get("id")
+            image_base64 = image.get("image_base64")
 
-                # Remove data URL prefix if present
-                if "," in image_base64:
-                    image_base64 = image_base64.split(",", 1)[1]
+            if not image_id or not image_base64:
+                continue
 
-                image_bytes = base64.b64decode(image_base64)
-                image_filename = f"page-{page_number}-{image_id}.png"
-                image_path = image_dir / image_filename
-                image_path.write_bytes(image_bytes)
+            # Remove data URL prefix if present
+            if "," in image_base64:
+                image_base64 = image_base64.split(",", 1)[1]
 
-                # Replace Mistral's local image reference with an Obsidian embed
-                page_markdown = page_markdown.replace(
-                    f"![{image_id}]({image_id})",
-                    f"![[{obsidian_image_folder}/{image_filename}]]"
-                )
-                page_markdown = page_markdown.replace(
-                    f"![{image_id}]({image_id}.png)",
-                    f"![[{obsidian_image_folder}/{image_filename}]]"
-                )
-                page_markdown = page_markdown.replace(
-                    f"![{image_id}]({image_id}.jpg)",
-                    f"![[{obsidian_image_folder}/{image_filename}]]"
-                )
-                page_markdown = page_markdown.replace(
-                    f"![{image_id}]({image_id}.jpeg)",
-                    f"![[{obsidian_image_folder}/{image_filename}]]"
-                )
+            image_bytes = base64.b64decode(image_base64)
+            image_filename = f"page-{page_number}-{image_id}.png"
+            image_path = image_dir / image_filename
+            image_path.write_bytes(image_bytes)
+
+            # Replace Mistral's local image reference with an Obsidian embed
+            page_markdown = page_markdown.replace(
+                f"![{image_id}]({image_id})",
+                f"![[{obsidian_image_folder}/{image_filename}]]"
+            )
+            page_markdown = page_markdown.replace(
+                f"![{image_id}]({image_id}.png)",
+                f"![[{obsidian_image_folder}/{image_filename}]]"
+            )
+            page_markdown = page_markdown.replace(
+                f"![{image_id}]({image_id}.jpg)",
+                f"![[{obsidian_image_folder}/{image_filename}]]"
+            )
+            page_markdown = page_markdown.replace(
+                f"![{image_id}]({image_id}.jpeg)",
+                f"![[{obsidian_image_folder}/{image_filename}]]"
+            )
 
         # Do not start the whole note with "---",
         # because Obsidian would interpret that as YAML/frontmatter.
