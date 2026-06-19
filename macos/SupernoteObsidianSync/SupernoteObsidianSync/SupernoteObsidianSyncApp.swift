@@ -94,7 +94,7 @@ struct SupernoteObsidianSyncApp: App {
 final class CommandRunner {
     static let shared = CommandRunner()
 
-    private let cliPath = "/Users/david/supernote-obsidian-sync/.venv/bin/supernote-obsidian-sync"
+    private let cliPath = "/opt/homebrew/bin/supernote-obsidian-sync"
     private var windowControllers: [OutputWindowController] = []
 
     private init() {}
