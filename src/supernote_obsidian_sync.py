@@ -601,7 +601,7 @@ def diagnose():
 
     checks = []
 
-    def add_check(name: str, ok: bool, detail: sr = ""):
+    def add_check(name: str, ok: bool, detail: str = ""):
         symbol = "✅" if ok else "❌"
         line = f"{symbol} {name}"
         if detail:
@@ -700,6 +700,68 @@ def diagnose():
     print("")
 
 
+def show_status():
+    """
+    Show a short machine- and human-readable status summary.
+    Useful for a future menu-bar app.
+    """
+    print("\nSupernote → Obsidian Sync status\n")
+
+    print(f"Settings folder: {APP_SUPPORT_DIR}")
+    print(f"Config file:     {CONFIG_FILE}")
+    print(f"Env file:        {ENV_FILE}")
+    print(f"Log file:        {LOG_FILE}")
+    print(f"State file:      {STATE_FILE}")
+    print("")
+
+    print(f"Source folder:   {SOURCE_DIR}")
+    print(f"Obsidian vault:  {VAULT_DIR}")
+    print(f"Note folder:     {OBSIDIAN_NOTE_DIR}")
+    print(f"PDF folder:      {PDF_DIR}")
+    print("")
+
+    print(f"Check interval:  {CHECK_INTERVAL_SECONDS} seconds")
+    print(f"Obsidian running: {'yes' if is_obsidian_running() else 'no'}")
+    print(f"API key set:      {'yes' if os.environ.get('MISTRAL_API_KEY') else 'no'}")
+    print("")
+
+
+def open_settings():
+    """
+    Open the macOS Application Support settings folder in Finder.
+    """
+    APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["open", str(APP_SUPPORT_DIR)], check=False)
+    print(f"Opened settings folder:\n{APP_SUPPORT_DIR}")
+
+
+def open_log():
+    """
+    Open the log file in the default macOS app.
+    If the log file does not exist yet, create an empty one.
+    """
+    APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_FILE.touch(exist_ok=True)
+    subprocess.run(["open", str(LOG_FILE)], check=False)
+    print(f"Opened log file:\n{LOG_FILE}")
+
+
+def reset_state():
+    """
+    Delete the processed state file.
+    This makes the next sync treat notes as unprocessed again.
+    """
+    if STATE_FILE.exists():
+        STATE_FILE.unlink()
+        print(f"Deleted state file:\n{STATE_FILE}")
+        print("")
+        print("Next sync will re-check notes.")
+    else:
+        print("No state file found.")
+        print(f"Expected location:\n{STATE_FILE}")
+    print("")
+
+
 def watch_loop():
     """
     Keep scanning every CHECK_INTERVAL_SECONDS.
@@ -738,6 +800,30 @@ def main():
         help="Run one sync scan and exit.",
     )
 
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Show current sync status and important paths.",
+    )
+
+    parser.add_argument(
+        "--open-settings",
+        action="store_true",
+        help="Open the settings folder in Finder.",
+    )
+
+    parser.add_argument(
+        "--open-log",
+        action="store_true",
+        help="Open the log file.",
+    )
+
+    parser.add_argument(
+        "--reset-state",
+        action="store_true",
+        help="Delete the processed state file so notes can be re-checked.",
+    )
+
     args = parser.parse_args()
 
     if args.setup:
@@ -746,6 +832,14 @@ def main():
         diagnose()
     elif args.once:
         scan_once()
+    elif args.status:
+        show_status()
+    elif args.open_settings:
+        open_settings()
+    elif args.open_log:
+        open_log()
+    elif args.reset_state:
+        reset_state()
     else:
         watch_loop()
 
