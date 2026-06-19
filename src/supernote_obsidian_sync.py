@@ -8,15 +8,13 @@ import subprocess
 import time
 from pathlib import Path
 
-from dotenv import load_dotenv
 import requests
+from dotenv import load_dotenv
 
 
 # ------------------------------------------------------------
-# PROJECT PATHS
+# SETTINGS PATHS
 # ------------------------------------------------------------
-
-PROJECT_DIR = Path(__file__).resolve().parents[1]
 
 APP_SUPPORT_DIR = (
     Path.home()
@@ -25,13 +23,16 @@ APP_SUPPORT_DIR = (
     / "Supernote Obsidian Sync"
 )
 
-# Backwards-compatible local folder for development.
-LOCAL_DIR = PROJECT_DIR / "local"
-
 CONFIG_FILE = APP_SUPPORT_DIR / "config.json"
 ENV_FILE = APP_SUPPORT_DIR / ".env"
 LOG_FILE = APP_SUPPORT_DIR / "supernote_obsidian_sync.log"
-EXAMPLE_CONFIG_FILE = PROJECT_DIR / "config.example.json"
+
+LAUNCH_AGENT_LABEL = "com.kulturban.supernote-obsidian-sync"
+LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
+LAUNCH_AGENT_FILE = LAUNCH_AGENTS_DIR / f"{LAUNCH_AGENT_LABEL}.plist"
+HOMEBREW_CLI_PATH = "/opt/homebrew/bin/supernote-obsidian-sync"
+LAUNCH_AGENT_OUT_LOG = APP_SUPPORT_DIR / "launchagent.out.log"
+LAUNCH_AGENT_ERR_LOG = APP_SUPPORT_DIR / "launchagent.err.log"
 
 DEFAULT_CONFIG = {
     "source_dir": "/Users/YOUR_USERNAME/Library/Containers/com.ratta.supernote/Data/Library/Application Support/com.ratta.supernote/YOUR_SUPERNOTE_ID/Supernote/Note/YOUR_NOTEBOOK_OR_FOLDER",
@@ -56,7 +57,7 @@ logging.basicConfig(
 )
 
 
-def log(message: str):
+def log(message: str) -> None:
     print(message)
     logging.info(message)
 
@@ -82,7 +83,16 @@ def load_config() -> dict:
     if not CONFIG_FILE.exists():
         return DEFAULT_CONFIG.copy()
 
-    return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    try:
+        loaded_config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            f"Config file is invalid JSON:\n{CONFIG_FILE}\n\n{exc}"
+        ) from exc
+
+    config = DEFAULT_CONFIG.copy()
+    config.update(loaded_config)
+    return config
 
 
 config = load_config()
@@ -94,7 +104,6 @@ OBSIDIAN_NOTE_DIR = VAULT_DIR / config["obsidian_note_folder"]
 PDF_DIR = VAULT_DIR / config["attachment_folder"]
 
 state_file_config = config.get("state_file", "processed_notes.json")
-
 state_file_path = Path(state_file_config).expanduser()
 
 if state_file_path.is_absolute():
@@ -119,11 +128,12 @@ load_dotenv(ENV_FILE)
 # APP CHECKS
 # ------------------------------------------------------------
 
-def is_obsidian_running():
+def is_obsidian_running() -> bool:
     result = subprocess.run(
         ["pgrep", "-x", "Obsidian"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        check=False,
     )
     return result.returncode == 0
 
@@ -132,13 +142,19 @@ def is_obsidian_running():
 # STATE
 # ------------------------------------------------------------
 
-def load_state():
-    if STATE_FILE.exists():
+def load_state() -> dict:
+    if not STATE_FILE.exists():
+        return {}
+
+    try:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    return {}
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            f"State file is invalid JSON:\n{STATE_FILE}\n\n{exc}"
+        ) from exc
 
 
-def save_state(state):
+def save_state(state: dict) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
@@ -147,7 +163,7 @@ def save_state(state):
 # HELPERS
 # ------------------------------------------------------------
 
-def is_file_stable(path: Path, wait_seconds: int):
+def is_file_stable(path: Path, wait_seconds: int) -> bool:
     first_size = path.stat().st_size
     time.sleep(wait_seconds)
     second_size = path.stat().st_size
@@ -167,7 +183,7 @@ def safe_name(note_file: Path) -> str:
     return name or "Untitled Supernote"
 
 
-def convert_note_to_pdf(note_file: Path, pdf_file: Path):
+def convert_note_to_pdf(note_file: Path, pdf_file: Path) -> None:
     pdf_file.parent.mkdir(parents=True, exist_ok=True)
 
     if not SUPERNOTE_TOOL_PATH.exists():
@@ -242,7 +258,6 @@ def mistral_ocr_pdf(pdf_file: Path, image_dir: Path, obsidian_image_folder: str)
         page_number = int(page.get("index", 0)) + 1
         page_markdown = page.get("markdown", "")
 
-        # Save Mistral-extracted images into this note's own image folder
         for image in page.get("images", []) or []:
             image_id = image.get("id")
             image_base64 = image.get("image_base64")
@@ -250,7 +265,6 @@ def mistral_ocr_pdf(pdf_file: Path, image_dir: Path, obsidian_image_folder: str)
             if not image_id or not image_base64:
                 continue
 
-            # Remove data URL prefix if present
             if "," in image_base64:
                 image_base64 = image_base64.split(",", 1)[1]
 
@@ -259,26 +273,23 @@ def mistral_ocr_pdf(pdf_file: Path, image_dir: Path, obsidian_image_folder: str)
             image_path = image_dir / image_filename
             image_path.write_bytes(image_bytes)
 
-            # Replace Mistral's local image reference with an Obsidian embed
             page_markdown = page_markdown.replace(
                 f"![{image_id}]({image_id})",
-                f"![[{obsidian_image_folder}/{image_filename}]]"
+                f"![[{obsidian_image_folder}/{image_filename}]]",
             )
             page_markdown = page_markdown.replace(
                 f"![{image_id}]({image_id}.png)",
-                f"![[{obsidian_image_folder}/{image_filename}]]"
+                f"![[{obsidian_image_folder}/{image_filename}]]",
             )
             page_markdown = page_markdown.replace(
                 f"![{image_id}]({image_id}.jpg)",
-                f"![[{obsidian_image_folder}/{image_filename}]]"
+                f"![[{obsidian_image_folder}/{image_filename}]]",
             )
             page_markdown = page_markdown.replace(
                 f"![{image_id}]({image_id}.jpeg)",
-                f"![[{obsidian_image_folder}/{image_filename}]]"
+                f"![[{obsidian_image_folder}/{image_filename}]]",
             )
 
-        # Do not start the whole note with "---",
-        # because Obsidian would interpret that as YAML/frontmatter.
         if page_number == 1:
             markdown_parts.append(f"## Page {page_number}\n\n")
         else:
@@ -306,35 +317,26 @@ def convert_hash_lines_to_tasks(ocr_text: str) -> str:
     becomes:
     - [ ] #task call my mum
     - [ ] #task be proud
-
-    The marker and tag are configurable in local/config.json:
-    task_marker = "#"
-    task_tag = "#task"
     """
-
     converted_lines = []
 
     for line in ocr_text.splitlines():
         clean = line.strip()
 
-        # Keep empty lines
         if not clean:
             converted_lines.append(line)
             continue
 
-        # Keep generated page headings unchanged
         if clean.startswith("## Page"):
             converted_lines.append(line)
             continue
 
-        # Keep horizontal separators unchanged
         if clean == "---":
             converted_lines.append(line)
             continue
 
-        # Convert lines that start with the task marker into tasks
-        if clean.startswith(TASK_MARKER):
-            task_text = clean.lstrip(TASK_MARKER).strip()
+        if TASK_MARKER and clean.startswith(TASK_MARKER):
+            task_text = clean[len(TASK_MARKER):].strip()
 
             if task_text:
                 converted_lines.append(f"- [ ] {TASK_TAG} {task_text}")
@@ -343,7 +345,6 @@ def convert_hash_lines_to_tasks(ocr_text: str) -> str:
 
             continue
 
-        # Keep all other OCR text unchanged
         converted_lines.append(line)
 
     return "\n".join(converted_lines)
@@ -353,7 +354,7 @@ def convert_hash_lines_to_tasks(ocr_text: str) -> str:
 # PROCESSING
 # ------------------------------------------------------------
 
-def process_note(note_file: Path):
+def process_note(note_file: Path) -> None:
     name = safe_name(note_file)
 
     OBSIDIAN_NOTE_DIR.mkdir(parents=True, exist_ok=True)
@@ -363,29 +364,26 @@ def process_note(note_file: Path):
     md_file = OBSIDIAN_NOTE_DIR / f"{name}.md"
 
     note_attachment_dir = PDF_DIR / name
-
-    # This is the path Obsidian uses inside wiki links.
     obsidian_image_folder = f"{config['attachment_folder']}/{name}"
-
     pdf_file = note_attachment_dir / f"{name}.pdf"
 
     log(f"Processing note: {note_file}")
 
-    # Copy the .note file temporarily into the Obsidian vault
     shutil.copy2(note_file, obsidian_note_copy)
     log(f"Copied .note temporarily to Obsidian: {obsidian_note_copy}")
 
-    # Convert the original Supernote .note file to PDF
-    convert_note_to_pdf(note_file, pdf_file)
+    try:
+        convert_note_to_pdf(note_file, pdf_file)
 
-    # Send the PDF to Mistral OCR and get Markdown transcription
-    ocr_markdown = mistral_ocr_pdf(pdf_file, note_attachment_dir, obsidian_image_folder)
+        ocr_markdown = mistral_ocr_pdf(
+            pdf_file,
+            note_attachment_dir,
+            obsidian_image_folder,
+        )
 
-    # Convert handwritten task marker lines directly into Obsidian tasks
-    ocr_markdown = convert_hash_lines_to_tasks(ocr_markdown)
+        ocr_markdown = convert_hash_lines_to_tasks(ocr_markdown)
 
-    # Markdown: OCR with inline tasks first, then original PDF
-    final_markdown = f"""{ocr_markdown}
+        final_markdown = f"""{ocr_markdown}
 
 ---
 
@@ -394,19 +392,18 @@ def process_note(note_file: Path):
 ![[{config['attachment_folder']}/{name}/{name}.pdf]]
 """
 
-    md_file.write_text(final_markdown, encoding="utf-8")
-    log(f"Markdown written: {md_file}")
+        md_file.write_text(final_markdown, encoding="utf-8")
+        log(f"Markdown written: {md_file}")
 
-    # Delete only the copied .note file inside the Obsidian vault.
-    # This does NOT delete the original Supernote sync file.
-    if obsidian_note_copy.exists():
-        obsidian_note_copy.unlink()
-        log(f"Deleted copied .note file: {obsidian_note_copy}")
+    finally:
+        if obsidian_note_copy.exists():
+            obsidian_note_copy.unlink()
+            log(f"Deleted copied .note file: {obsidian_note_copy}")
 
     log(f"Done: {md_file}")
 
 
-def scan_once():
+def scan_once() -> None:
     """
     Scan the Supernote source folder once.
     """
@@ -437,9 +434,15 @@ def scan_once():
             process_note(note_file)
             state[key] = current_signature
             save_state(state)
-        except Exception as e:
-            logging.exception(f"Error processing {note_file}")
-            log(f"Error processing {note_file}: {e}")
+        except Exception as exc:
+            logging.exception("Error processing %s", note_file)
+            log(f"Error processing {note_file}: {exc}")
+
+
+# ------------------------------------------------------------
+# SETUP
+# ------------------------------------------------------------
+
 def ask(prompt: str, default: str = "") -> str:
     """
     Ask the user for input, with an optional default value.
@@ -464,7 +467,21 @@ def ask_bool(prompt: str, default: bool = True) -> bool:
     return answer in ("y", "yes", "j", "ja", "true", "1")
 
 
-def setup():
+def read_existing_config_for_setup() -> dict:
+    if not CONFIG_FILE.exists():
+        return DEFAULT_CONFIG.copy()
+
+    try:
+        existing_config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        existing_config = {}
+
+    config_for_setup = DEFAULT_CONFIG.copy()
+    config_for_setup.update(existing_config)
+    return config_for_setup
+
+
+def setup() -> None:
     """
     Interactive setup for user settings.
     Existing files will not be overwritten unless the user confirms.
@@ -474,27 +491,17 @@ def setup():
     print("\nSupernote → Obsidian Sync setup\n")
     print(f"Settings folder:\n{APP_SUPPORT_DIR}\n")
 
-    existing_config = {}
-    if CONFIG_FILE.exists():
-        try:
-            existing_config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            existing_config = {}
+    should_update_config = True
 
-        overwrite = ask_bool(
+    if CONFIG_FILE.exists():
+        should_update_config = ask_bool(
             f"Config already exists:\n{CONFIG_FILE}\n\nDo you want to update it interactively?",
             default=True,
         )
 
-        if not overwrite:
-            print("Keeping existing config.")
-            print("")
-        else:
-            existing_config = existing_config or DEFAULT_CONFIG.copy()
-    else:
-        existing_config = DEFAULT_CONFIG.copy()
+    if should_update_config:
+        existing_config = read_existing_config_for_setup()
 
-    if not CONFIG_FILE.exists() or existing_config:
         print("\nPlease enter your settings.\n")
         print("Tip: You can drag folders/files from Finder into Terminal to paste their path.\n")
 
@@ -535,7 +542,10 @@ def setup():
 
         supernote_tool_path = ask(
             "Path to supernote-tool",
-            existing_config.get("supernote_tool_path", DEFAULT_CONFIG["supernote_tool_path"]),
+            existing_config.get(
+                "supernote_tool_path",
+                DEFAULT_CONFIG["supernote_tool_path"],
+            ),
         )
 
         task_marker = ask(
@@ -573,6 +583,8 @@ def setup():
         )
 
         print(f"\n✅ Config written:\n{CONFIG_FILE}\n")
+    else:
+        print("Keeping existing config.\n")
 
     if ENV_FILE.exists():
         update_env = ask_bool(
@@ -611,7 +623,170 @@ def setup():
     print("   supernote-obsidian-sync --once")
     print("")
 
-def diagnose():
+
+
+# ------------------------------------------------------------
+# LAUNCHAGENT CONTROL
+# ------------------------------------------------------------
+
+def launchctl_domain() -> str:
+    return f"gui/{os.getuid()}"
+
+
+def launchctl_service() -> str:
+    return f"{launchctl_domain()}/{LAUNCH_AGENT_LABEL}"
+
+
+def run_launchctl(arguments: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["launchctl", *arguments],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def is_agent_loaded() -> bool:
+    result = run_launchctl(["print", launchctl_service()])
+    return result.returncode == 0
+
+
+def launch_agent_plist() -> str:
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>{LAUNCH_AGENT_LABEL}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>{HOMEBREW_CLI_PATH}</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>{LAUNCH_AGENT_OUT_LOG}</string>
+
+    <key>StandardErrorPath</key>
+    <string>{LAUNCH_AGENT_ERR_LOG}</string>
+  </dict>
+</plist>
+"""
+
+
+def install_agent() -> None:
+    APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
+    LAUNCH_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    LAUNCH_AGENT_FILE.write_text(launch_agent_plist(), encoding="utf-8")
+    print(f"LaunchAgent written:\n{LAUNCH_AGENT_FILE}\n")
+
+    if is_agent_loaded():
+        print("LaunchAgent is already loaded. Restarting it.")
+        run_launchctl(["bootout", launchctl_domain(), str(LAUNCH_AGENT_FILE)])
+
+    result = run_launchctl(["bootstrap", launchctl_domain(), str(LAUNCH_AGENT_FILE)])
+
+    if result.returncode != 0:
+        print("Could not load LaunchAgent.")
+        print(result.stderr.strip() or result.stdout.strip())
+        raise SystemExit(result.returncode)
+
+    start_agent()
+    print("✅ LaunchAgent installed and started.")
+
+
+def uninstall_agent() -> None:
+    if is_agent_loaded():
+        result = run_launchctl(["bootout", launchctl_domain(), str(LAUNCH_AGENT_FILE)])
+
+        if result.returncode != 0:
+            print("Could not stop LaunchAgent.")
+            print(result.stderr.strip() or result.stdout.strip())
+            raise SystemExit(result.returncode)
+
+    if LAUNCH_AGENT_FILE.exists():
+        LAUNCH_AGENT_FILE.unlink()
+        print(f"Deleted LaunchAgent:\n{LAUNCH_AGENT_FILE}")
+    else:
+        print("No LaunchAgent file found.")
+
+    print("✅ LaunchAgent uninstalled.")
+
+
+def start_agent() -> None:
+    if not LAUNCH_AGENT_FILE.exists():
+        print("LaunchAgent is not installed yet.")
+        print("Run:")
+        print("  supernote-obsidian-sync --install-agent")
+        raise SystemExit(1)
+
+    if not is_agent_loaded():
+        result = run_launchctl(["bootstrap", launchctl_domain(), str(LAUNCH_AGENT_FILE)])
+
+        if result.returncode != 0:
+            print("Could not load LaunchAgent.")
+            print(result.stderr.strip() or result.stdout.strip())
+            raise SystemExit(result.returncode)
+
+    result = run_launchctl(["kickstart", "-k", launchctl_service()])
+
+    if result.returncode != 0:
+        print("Could not start LaunchAgent.")
+        print(result.stderr.strip() or result.stdout.strip())
+        raise SystemExit(result.returncode)
+
+    print("✅ LaunchAgent started.")
+
+
+def stop_agent() -> None:
+    if not is_agent_loaded():
+        print("LaunchAgent is not running.")
+        return
+
+    result = run_launchctl(["bootout", launchctl_domain(), str(LAUNCH_AGENT_FILE)])
+
+    if result.returncode != 0:
+        print("Could not stop LaunchAgent.")
+        print(result.stderr.strip() or result.stdout.strip())
+        raise SystemExit(result.returncode)
+
+    print("✅ LaunchAgent stopped.")
+
+
+def restart_agent() -> None:
+    if is_agent_loaded():
+        run_launchctl(["bootout", launchctl_domain(), str(LAUNCH_AGENT_FILE)])
+
+    start_agent()
+    print("✅ LaunchAgent restarted.")
+
+
+def show_agent_status() -> None:
+    installed = LAUNCH_AGENT_FILE.exists()
+    loaded = is_agent_loaded()
+
+    print("\nSupernote → Obsidian Sync LaunchAgent status\n")
+    print(f"Label:     {LAUNCH_AGENT_LABEL}")
+    print(f"Plist:     {LAUNCH_AGENT_FILE}")
+    print(f"Installed: {'yes' if installed else 'no'}")
+    print(f"Loaded:    {'yes' if loaded else 'no'}")
+    print(f"Out log:   {LAUNCH_AGENT_OUT_LOG}")
+    print(f"Err log:   {LAUNCH_AGENT_ERR_LOG}")
+    print("")
+
+# ------------------------------------------------------------
+# CLI COMMANDS
+# ------------------------------------------------------------
+
+def diagnose() -> None:
     """
     Check whether the local setup looks correct.
     """
@@ -619,7 +794,7 @@ def diagnose():
 
     checks = []
 
-    def add_check(name: str, ok: bool, detail: str = ""):
+    def add_check(name: str, ok: bool, detail: str = "") -> None:
         symbol = "✅" if ok else "❌"
         line = f"{symbol} {name}"
         if detail:
@@ -627,11 +802,10 @@ def diagnose():
         checks.append((ok, line))
 
     add_check(
-        "Project folder exists",
-        PROJECT_DIR.exists(),
-        str(PROJECT_DIR),
+        "Settings folder exists",
+        APP_SUPPORT_DIR.exists(),
+        str(APP_SUPPORT_DIR),
     )
-
 
     add_check(
         "Config file exists",
@@ -648,7 +822,7 @@ def diagnose():
     add_check(
         "MISTRAL_API_KEY is set",
         bool(os.environ.get("MISTRAL_API_KEY")),
-        "loaded from local/.env" if os.environ.get("MISTRAL_API_KEY") else "missing",
+        f"loaded from {ENV_FILE}" if os.environ.get("MISTRAL_API_KEY") else "missing",
     )
 
     add_check(
@@ -693,10 +867,14 @@ def diagnose():
         str(SUPERNOTE_TOOL_PATH),
     )
 
+    obsidian_running = is_obsidian_running()
+
     add_check(
         "Obsidian is running",
-        is_obsidian_running(),
-        "required by current config" if OPEN_REQUIRES_OBSIDIAN_RUNNING else "not required by current config",
+        obsidian_running if OPEN_REQUIRES_OBSIDIAN_RUNNING else True,
+        "required by current config"
+        if OPEN_REQUIRES_OBSIDIAN_RUNNING
+        else "not required by current config",
     )
 
     print("\n".join(line for _, line in checks))
@@ -713,7 +891,7 @@ def diagnose():
     print("")
 
 
-def show_status():
+def show_status() -> None:
     """
     Show a short machine- and human-readable status summary.
     Useful for a future menu-bar app.
@@ -739,7 +917,7 @@ def show_status():
     print("")
 
 
-def open_settings():
+def open_settings() -> None:
     """
     Open the macOS Application Support settings folder in Finder.
     """
@@ -748,7 +926,7 @@ def open_settings():
     print(f"Opened settings folder:\n{APP_SUPPORT_DIR}")
 
 
-def open_log():
+def open_log() -> None:
     """
     Open the log file in the default macOS app.
     If the log file does not exist yet, create an empty one.
@@ -759,7 +937,7 @@ def open_log():
     print(f"Opened log file:\n{LOG_FILE}")
 
 
-def reset_state():
+def reset_state() -> None:
     """
     Delete the processed state file.
     This makes the next sync treat notes as unprocessed again.
@@ -772,15 +950,15 @@ def reset_state():
     else:
         print("No state file found.")
         print(f"Expected location:\n{STATE_FILE}")
+
     print("")
 
 
-def watch_loop():
+def watch_loop() -> None:
     """
     Keep scanning every CHECK_INTERVAL_SECONDS.
     """
     log("Supernote → Obsidian Sync started")
-    log(f"Project folder: {PROJECT_DIR}")
     log(f"Watching source folder: {SOURCE_DIR}")
     log(f"Obsidian vault: {VAULT_DIR}")
     log(f"Check interval: {CHECK_INTERVAL_SECONDS} seconds")
@@ -790,7 +968,8 @@ def watch_loop():
         scan_once()
         time.sleep(CHECK_INTERVAL_SECONDS)
 
-def main():
+
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Supernote → Obsidian Sync"
     )
@@ -798,7 +977,7 @@ def main():
     parser.add_argument(
         "--setup",
         action="store_true",
-        help="Create initial user settings files.",
+        help="Create or update user settings files.",
     )
 
     parser.add_argument(
@@ -837,6 +1016,42 @@ def main():
         help="Delete the processed state file so notes can be re-checked.",
     )
 
+    parser.add_argument(
+        "--install-agent",
+        action="store_true",
+        help="Install and start the macOS LaunchAgent.",
+    )
+
+    parser.add_argument(
+        "--uninstall-agent",
+        action="store_true",
+        help="Stop and remove the macOS LaunchAgent.",
+    )
+
+    parser.add_argument(
+        "--start",
+        action="store_true",
+        help="Start the macOS LaunchAgent.",
+    )
+
+    parser.add_argument(
+        "--stop",
+        action="store_true",
+        help="Stop the macOS LaunchAgent.",
+    )
+
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="Restart the macOS LaunchAgent.",
+    )
+
+    parser.add_argument(
+        "--is-running",
+        action="store_true",
+        help="Show whether the macOS LaunchAgent is installed and loaded.",
+    )
+
     args = parser.parse_args()
 
     if args.setup:
@@ -853,6 +1068,18 @@ def main():
         open_log()
     elif args.reset_state:
         reset_state()
+    elif args.install_agent:
+        install_agent()
+    elif args.uninstall_agent:
+        uninstall_agent()
+    elif args.start:
+        start_agent()
+    elif args.stop:
+        stop_agent()
+    elif args.restart:
+        restart_agent()
+    elif args.is_running:
+        show_agent_status()
     else:
         watch_loop()
 
