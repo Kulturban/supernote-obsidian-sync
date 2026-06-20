@@ -205,6 +205,7 @@ TASK_MARKER = config.get("task_marker", "#")
 TASK_TAG = config.get("task_tag", "#task")
 
 OPEN_REQUIRES_OBSIDIAN_RUNNING = bool(config.get("open_requires_obsidian_running", True))
+CUSTOM_OCR_INSTRUCTION = str(config.get("custom_ocr_instruction", "")).strip()
 
 ACTIVE_NOTEBOOK = {}
 ACTIVE_ATTACHMENT_FOLDER = ""
@@ -359,6 +360,10 @@ def mistral_ocr_pdf(pdf_file: Path, image_dir: Path, obsidian_image_folder: str)
         },
         "include_image_base64": True,
     }
+
+    if CUSTOM_OCR_INSTRUCTION:
+        payload["document_annotation_prompt"] = CUSTOM_OCR_INSTRUCTION
+        payload["document_annotation_format"] = {"type": "text"}
 
     response = requests.post(
         "https://api.mistral.ai/v1/ocr",

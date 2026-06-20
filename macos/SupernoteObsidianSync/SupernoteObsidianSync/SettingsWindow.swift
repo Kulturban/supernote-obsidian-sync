@@ -53,6 +53,7 @@ struct SyncConfig: Codable {
     var file_stability_wait_seconds: Int
     var task_marker: String
     var task_tag: String
+    var custom_ocr_instruction: String?
     var open_requires_obsidian_running: Bool
     var notebooks: [NotebookConfig]
 
@@ -63,6 +64,7 @@ struct SyncConfig: Codable {
         file_stability_wait_seconds: 10,
         task_marker: "#",
         task_tag: "#task",
+        custom_ocr_instruction: "",
         open_requires_obsidian_running: true,
         notebooks: []
     )
@@ -216,6 +218,7 @@ final class SettingsViewModel: ObservableObject {
     @Published var fileStabilityWaitSeconds = "10"
     @Published var taskMarker = "#"
     @Published var taskTag = "#task"
+    @Published var customOcrInstruction = ""
     @Published var openRequiresObsidianRunning = true
     @Published var mistralApiKey = ""
     @Published var notebooks: [NotebookConfig] = []
@@ -289,6 +292,7 @@ final class SettingsViewModel: ObservableObject {
                 file_stability_wait_seconds: Int(fileStabilityWaitSeconds) ?? 10,
                 task_marker: taskMarker,
                 task_tag: taskTag,
+                custom_ocr_instruction: customOcrInstruction,
                 open_requires_obsidian_running: openRequiresObsidianRunning,
                 notebooks: notebooks
             )
@@ -319,6 +323,7 @@ final class SettingsViewModel: ObservableObject {
         fileStabilityWaitSeconds = String(config.file_stability_wait_seconds)
         taskMarker = config.task_marker
         taskTag = config.task_tag
+        customOcrInstruction = config.custom_ocr_instruction ?? ""
         openRequiresObsidianRunning = config.open_requires_obsidian_running
         notebooks = config.notebooks
     }
@@ -1265,6 +1270,30 @@ struct SettingsView: View {
 
                 Button("Get a Mistral API key") {
                     model.openMistralApiKeyPage()
+                }
+            }
+
+            SettingsCard(
+                title: "Custom OCR Instruction",
+                description: "Optional. Add a short instruction for how Mistral should render your notes."
+            ) {
+                VStack(alignment: .leading, spacing: 8) {
+                    TextEditor(text: $model.customOcrInstruction)
+                        .font(.system(.body, design: .default))
+                        .frame(minHeight: 110)
+                        .padding(6)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.secondary.opacity(0.25))
+                        )
+
+                    Text("Leave empty for the default faithful OCR behavior. Bad instructions can reduce OCR quality.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+
+                    Text("Example: Preserve headings and bullet lists. Keep diagrams as images. Do not summarize. Keep the original wording as faithfully as possible.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
             }
 
