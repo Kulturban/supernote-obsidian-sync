@@ -1,280 +1,295 @@
-# Supernote → Obsidian Sync
+# Supsidian
 
-A macOS menu bar app and command-line tool for syncing handwritten Supernote notes into an Obsidian vault.
+**Supernote → Obsidian Sync**
 
-It converts Supernote `.note` files to PDF, sends them to Mistral OCR, saves the OCR result as searchable Markdown, embeds the original PDF, extracts OCR images, and can convert handwritten task markers into Obsidian Tasks.
+Supsidian is a macOS menu bar app and command-line tool for syncing handwritten Supernote notes into an Obsidian vault.
+
+It converts Supernote `.note` files into PDFs, sends them to Mistral OCR, saves the recognized text as Markdown, preserves extracted images, and can turn handwritten task markers into Obsidian tasks.
 
 ## Features
 
-- macOS menu bar app
-- Guided first-time setup
-- Manual **Sync Now** workflow
-- Convert Supernote `.note` files to PDF
-- Run OCR with Mistral
-- Save OCR text as Markdown in Obsidian
-- Save original PDFs as Obsidian attachments
-- Extract images detected by Mistral OCR
-- Convert handwritten task markers into Obsidian tasks
-- Support for multiple Supernote folders
-- Each Supernote folder can sync to a different Obsidian folder
-- Local settings stored in `config.json`
-- Private API key stored in local `.env`
-- Diagnostics and status checks
-- Installable with Homebrew
+* macOS menu bar app
+* Manual **Sync Now** action
+* Multi-folder Supernote → Obsidian mappings
+* Mistral OCR integration
+* Optional **Custom OCR Instruction**
+* PDF attachments saved into your vault
+* Extracted OCR images embedded in Markdown
+* Task conversion for handwritten task markers
+* First-time setup flow
+* Diagnostics and log access
+* Runs as a menu-bar-only app and stays hidden from the Dock
 
-## Privacy warning
+## Installation
 
-This tool reads local Supernote files and sends PDF data to Mistral OCR.
+### 1. Install the command-line tool
 
-Do not use it with sensitive notes unless you are comfortable sending the note content to Mistral.
+```
+brew install kulturban/supernote-obsidian-sync/supernote-obsidian-sync
+```
 
-Never publish your:
+### 2. Install Supsidian
 
-- Mistral API key
-- `.env`
-- `config.json`
-- processed state files
-- logs
-- personal notes
-- real Supernote user ID
-- personal file paths
+```
+brew install --cask kulturban/supernote-obsidian-sync/supsidian
+```
 
-## Requirements
+### 3. Open Supsidian
 
-- macOS
-- Homebrew
-- Obsidian
-- Supernote Partner app
-- Mistral API key
-- `supernote-tool`
+```
+open -a Supsidian
+```
 
-## Installation with Homebrew
+Supsidian runs as a menu bar app. It does not appear in the Dock.
 
-First install the tap:
+## First setup
 
-    brew tap Kulturban/supernote-obsidian-sync
-    brew trust Kulturban/supernote-obsidian-sync
+After opening Supsidian, open **Settings** from the menu bar icon.
 
-Install the command-line tool:
-
-    brew install supernote-obsidian-sync
-
-Install the macOS menu bar app:
-
-    brew install --cask kulturban/supernote-obsidian-sync/supernote-obsidian-sync-app
-
-Open the app:
-
-    open -a SupernoteObsidianSync
-
-The app appears in the macOS menu bar.
-
-## First-time setup
-
-Open the menu bar app and choose **Settings**.
-
-The setup assistant will guide you through:
+The setup will guide you through:
 
 1. Choosing your Obsidian vault
-2. Connecting `supernote-tool`
+2. Choosing the `supernote-tool` path
 3. Adding your Mistral API key
-4. Choosing one or more Supernote Partner folders
+4. Adding one or more Supernote folders
 
-After setup is complete, choose **Sync Now** from the menu bar app.
+After setup, use **Sync Now** from the menu bar.
 
-## Recommended Supernote folder
+## Configuration folder
 
-Supernote Partner usually stores notes here:
+Supsidian currently stores settings here:
 
-    ~/Library/Containers/com.ratta.supernote/Data/Library/Application Support/com.ratta.supernote/<YOUR_SUPERNOTE_ID>/Supernote/Note
+```
+~/Library/Application Support/Supernote Obsidian Sync/
+```
 
-The app tries to suggest this folder automatically during setup.
-
-## Usage
-
-### Menu bar app
-
-Use the menu bar app for normal use:
-
-- **Sync Now** — run one sync
-- **Settings** — edit setup and folder mappings
-- **Status** — show current configuration status
-- **Diagnose** — check whether setup is valid
-- **Log** — open the log file
-
-The app currently uses manual sync. Background watching is not shown in the release UI.
-
-### Command line
-
-Run diagnostics:
-
-    supernote-obsidian-sync --diagnose
-
-Run one sync:
-
-    supernote-obsidian-sync --once
-
-Show status:
-
-    supernote-obsidian-sync --status
-
-Open the settings folder:
-
-    supernote-obsidian-sync --open-settings
-
-Open the log file:
-
-    supernote-obsidian-sync --open-log
-
-Show help:
-
-    supernote-obsidian-sync --help
-
-## Configuration
-
-Settings are stored locally here:
-
-    ~/Library/Application Support/Supernote Obsidian Sync/
+This folder name is kept for compatibility with earlier versions.
 
 Important files:
 
-    config.json
-    .env
-    supernote_obsidian_sync.log
-    processed_*.json
+```
+config.json
+.env
+supernote_obsidian_sync.log
+```
 
-Most users should configure the app through the GUI.
+## Mistral API key
 
-Advanced users can edit `config.json` manually.
+Supsidian uses Mistral OCR. You need a Mistral API key.
 
-Example multi-folder config:
+The key is stored locally in:
 
-    {
-      "vault_dir": "/Users/YOUR_USERNAME/Documents/Obsidian Vault",
-      "supernote_tool_path": "/opt/homebrew/bin/supernote-tool",
-      "check_interval_seconds": 60,
-      "file_stability_wait_seconds": 10,
-      "task_marker": "#",
-      "task_tag": "#task",
-      "open_requires_obsidian_running": true,
-      "notebooks": [
-        {
-          "name": "Supernote",
-          "source_dir": "/Users/YOUR_USERNAME/Library/Containers/com.ratta.supernote/Data/Library/Application Support/com.ratta.supernote/YOUR_SUPERNOTE_ID/Supernote/Note",
-          "obsidian_note_folder": "Supernote",
-          "attachment_folder": "Attachments/Supernote/Supernote",
-          "state_file": "processed_supernote.json"
-        }
-      ]
-    }
+```
+~/Library/Application Support/Supernote Obsidian Sync/.env
+```
+
+Example:
+
+```
+MISTRAL_API_KEY=your_key_here
+```
+
+## Custom OCR Instruction
+
+The **Custom OCR Instruction** field is optional.
+
+You can use it to guide how OCR output should be rendered.
+
+Example:
+
+```
+Preserve headings and bullet lists. Keep diagrams as images. Do not summarize. Keep the original wording as faithfully as possible.
+```
+
+Leave it empty for the default faithful OCR behavior.
+
+Bad instructions can reduce OCR quality, so keep the prompt short and clear.
 
 ## Task conversion
 
-If your handwritten OCR result contains:
+Supsidian can convert OCR lines into Obsidian tasks.
 
-    #call my mum
-    #buy apples
+Default handwritten/OCR line:
 
-the app converts it to:
+```
+# Buy milk
+```
 
-    - [ ] #task call my mum
-    - [ ] #task buy apples
+Becomes:
 
-The marker and tag can be changed in Settings or in `config.json`:
+```
+- [ ] #task Buy milk
+```
 
-    {
-      "task_marker": "#",
-      "task_tag": "#task"
-    }
+The default task settings are:
 
-## macOS permissions
+```
+task_marker: #
+task_tag: #task
+```
 
-macOS may ask for permission to let the app, Terminal, Python, Obsidian, or Supernote Partner access files.
+You can change these in **Settings → OCR & Tasks**.
 
-If syncing fails, check permissions in:
+## Multi-folder sync
 
-    System Settings → Privacy & Security → Full Disk Access
+Supsidian supports multiple Supernote folders.
 
-You may need to allow:
+Each folder can be mapped to its own Obsidian note folder and attachment folder.
 
-- Supernote Obsidian Sync
-- Terminal
-- Obsidian
-- Supernote Partner
-- the Python executable used by Homebrew
+Example:
 
-Then run:
+```
+Supernote/Psychomotorik
+→ Obsidian/Psychomotorik
+→ Attachments/Supernote/Psychomotorik
+```
 
-    supernote-obsidian-sync --diagnose
+Configure folders in:
 
-## Troubleshooting
+```
+Settings → Folders
+```
 
-Run diagnostics:
+## Manual sync
 
-    supernote-obsidian-sync --diagnose
+Supsidian is currently designed around manual syncing.
 
-Open the log file:
+Use:
 
-    supernote-obsidian-sync --open-log
+```
+Sync Now
+```
 
-Open the settings folder:
+from the menu bar.
 
-    supernote-obsidian-sync --open-settings
+The command-line equivalent is:
 
-Show recent log lines:
+```
+supernote-obsidian-sync --once
+```
 
-    tail -n 50 "$HOME/Library/Application Support/Supernote Obsidian Sync/supernote_obsidian_sync.log"
+## Diagnostics
 
-Reset processed state for one folder:
+Run diagnostics from the menu bar:
 
-    rm "$HOME/Library/Application Support/Supernote Obsidian Sync/processed_supernote.json"
+```
+Settings → Diagnostics
+```
 
-This forces the app to process notes again.
+Or from Terminal:
 
-## Installation from source
+```
+supernote-obsidian-sync --diagnose
+```
+
+Show status:
+
+```
+supernote-obsidian-sync --status
+```
+
+Open settings folder:
+
+```
+supernote-obsidian-sync --open-settings
+```
+
+Open log:
+
+```
+supernote-obsidian-sync --open-log
+```
+
+## Command-line tool
+
+The command-line tool is still called:
+
+```
+supernote-obsidian-sync
+```
+
+This is intentional for compatibility.
+
+Useful commands:
+
+```
+supernote-obsidian-sync --once
+supernote-obsidian-sync --diagnose
+supernote-obsidian-sync --status
+supernote-obsidian-sync --open-settings
+supernote-obsidian-sync --open-log
+```
+
+## Development
 
 Clone the repository:
 
-    git clone https://github.com/Kulturban/supernote-obsidian-sync.git
-    cd supernote-obsidian-sync
+```
+git clone https://github.com/Kulturban/supernote-obsidian-sync.git
+cd supernote-obsidian-sync
+```
 
-Create a virtual environment:
+Install in editable mode:
 
-    python3 -m venv .venv
-    source .venv/bin/activate
-    pip install -r requirements.txt
-    pip install -e .
+```
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
 
-Run diagnostics:
+Build the macOS app:
 
-    supernote-obsidian-sync --diagnose
+```
+xcodebuild \
+  -project macos/SupernoteObsidianSync/SupernoteObsidianSync.xcodeproj \
+  -scheme SupernoteObsidianSync \
+  -configuration Release \
+  -derivedDataPath /tmp/supsidian-build \
+  clean build
+```
 
-Run one sync:
+Find the app:
 
-    supernote-obsidian-sync --once
+```
+find /tmp/supsidian-build -name "*.app" -type d
+```
 
-To build the macOS app from source, open this file in Xcode:
+## Current naming
 
-    macos/SupernoteObsidianSync/SupernoteObsidianSync.xcodeproj
+Public app name:
 
-## Roadmap
+```
+Supsidian
+```
 
-- [x] Basic Python sync script
-- [x] Config file
-- [x] Logging
-- [x] Diagnostics
-- [x] Command-line entry point
-- [x] Homebrew formula
-- [x] Multi-folder configuration
-- [x] macOS menu bar app
-- [x] GUI settings window
-- [x] Guided first-time setup
-- [x] Manual Sync Now workflow
-- [x] Homebrew cask for menu bar app
-- [ ] Code signing and notarization
-- [ ] Automatic updates
-- [ ] Optional background watcher UI
+Command-line tool:
+
+```
+supernote-obsidian-sync
+```
+
+Python package:
+
+```
+supernote_obsidian_sync
+```
+
+Settings folder:
+
+```
+~/Library/Application Support/Supernote Obsidian Sync/
+```
+
+This avoids breaking existing installations.
+
+## Notes
+
+Supsidian is currently unsigned and not notarized.
+
+If macOS blocks the app, right-click the app and choose **Open**.
+
+Code signing and notarization are planned for a future release.
 
 ## License
 
-MIT
+MIT License
