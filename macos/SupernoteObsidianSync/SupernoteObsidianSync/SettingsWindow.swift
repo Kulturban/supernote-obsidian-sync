@@ -1328,7 +1328,7 @@ struct SettingsView: View {
                 )
 
                 Text("The marker that tells the sync app: this line should become a task. Default: #")
-                    .font(.footnote)
+                    .font(.footnote)    
                     .foregroundColor(.secondary)
 
                 SettingField(
