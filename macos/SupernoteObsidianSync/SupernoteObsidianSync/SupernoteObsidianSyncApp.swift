@@ -40,7 +40,7 @@ struct MenuSetupStatusView: View {
 @main
 struct SupernoteObsidianSyncApp: App {
     var body: some Scene {
-        MenuBarExtra("Supernote Sync", systemImage: "long.text.page.and.pencil") {
+        MenuBarExtra("Supsidian", systemImage: "long.text.page.and.pencil") {
             MenuSetupStatusView()
 
             Divider()

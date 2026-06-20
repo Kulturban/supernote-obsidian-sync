@@ -630,7 +630,7 @@ def setup() -> None:
     """
     APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("\nSupernote → Obsidian Sync setup\n")
+    print("\nSupsidian setup\n")
     print(f"Settings folder:\n{APP_SUPPORT_DIR}\n")
 
     should_update_config = True
@@ -915,7 +915,7 @@ def show_agent_status() -> None:
     installed = LAUNCH_AGENT_FILE.exists()
     loaded = is_agent_loaded()
 
-    print("\nSupernote → Obsidian Sync LaunchAgent status\n")
+    print("\nSupsidian LaunchAgent status\n")
     print(f"Label:     {LAUNCH_AGENT_LABEL}")
     print(f"Plist:     {LAUNCH_AGENT_FILE}")
     print(f"Installed: {'yes' if installed else 'no'}")
@@ -937,7 +937,7 @@ def diagnose() -> None:
     - does not check fake Supernote folders
     - explains missing setup clearly
     """
-    print("\nSupernote → Obsidian Sync diagnostics\n")
+    print("\nSupsidian diagnostics\n")
 
     checks = []
 
@@ -1102,7 +1102,7 @@ def show_status() -> None:
     Show a short machine- and human-readable status summary.
     Useful for the menu-bar app.
     """
-    print("\nSupernote → Obsidian Sync status\n")
+    print("\nSupsidian status\n")
 
     print(f"Settings folder: {APP_SUPPORT_DIR}")
     print(f"Config file:     {CONFIG_FILE}")
@@ -1172,7 +1172,7 @@ def watch_loop() -> None:
     """
     Keep scanning every CHECK_INTERVAL_SECONDS.
     """
-    log("Supernote → Obsidian Sync started")
+    log("Supsidian started")
     log(f"Watching source folder: {SOURCE_DIR}")
     log(f"Obsidian vault: {VAULT_DIR}")
     log(f"Check interval: {CHECK_INTERVAL_SECONDS} seconds")
@@ -1252,7 +1252,7 @@ def sync_now_with_summary() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Supernote → Obsidian Sync"
+        description="Supsidian — Supernote to Obsidian sync"
     )
 
     parser.add_argument(

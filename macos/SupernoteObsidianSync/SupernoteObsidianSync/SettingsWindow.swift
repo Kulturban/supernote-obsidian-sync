@@ -899,7 +899,7 @@ struct SettingsView: View {
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Supernote Sync")
+                Text("Supsidian")
                     .font(.title2)
                     .bold()
 
@@ -1764,7 +1764,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             defer: false
         )
 
-        window.title = "Supernote Obsidian Sync Settings"
+        window.title = "Supsidian Settings"
         window.contentView = hostingView
         window.center()
 
