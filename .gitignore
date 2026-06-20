@@ -12,3 +12,4 @@ dist/
 *.spec
 *.egg-info/
 src/*.egg-info/
+*.xcuserstate
