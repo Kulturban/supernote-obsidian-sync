@@ -76,7 +76,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     case folders = "Folders"
     case ocrTasks = "OCR & Tasks"
     case advanced = "Advanced"
-    case diagnostics = "Diagnostics"
+    case diagnostics = "About & Diagnose"
 
     var id: String { rawValue }
 
@@ -1375,6 +1375,12 @@ struct SettingsView: View {
         }
     }
 
+    private var appVersionString: String {
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown"
+        return "Version \(version) (Build \(build))"
+    }
+
     private var advancedPage: some View {
         VStack(alignment: .leading, spacing: 18) {
             SettingsCard(
@@ -1455,6 +1461,24 @@ struct SettingsView: View {
 
     private var diagnosticsPage: some View {
         VStack(alignment: .leading, spacing: 18) {
+            SettingsCard(
+                title: "Supsidian",
+                description: appVersionString
+            ) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Supernote → Obsidian Sync")
+                        .font(.headline)
+
+                    Text("Menu bar app for syncing Supernote notes to Obsidian.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+
+                    Text("Command-line tool: supernote-obsidian-sync")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+
             SettingsCard(
                 title: "Diagnostics",
                 description: "Run checks, open logs, and troubleshoot your setup."
