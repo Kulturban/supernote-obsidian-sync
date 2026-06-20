@@ -234,7 +234,7 @@ final class SettingsViewModel: ObservableObject {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library")
             .appendingPathComponent("LaunchAgents")
-            .appendingPathComponent("com.kulturban.supernote-obsidian-sync.plist")
+            .appendingPathComponent("com.kulturban.supsidian.login.plist")
     }
 
     init() {
@@ -461,18 +461,50 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func setStartAtLogin(_ enabled: Bool) {
-        startAtLoginEnabled = enabled
+        do {
+            let launchAgentsDir = launchAgentURL.deletingLastPathComponent()
 
-        if enabled {
-            CommandRunner.shared.runAndShow(["--install-agent"], title: "Install Start at Login")
-            statusMessage = "Installing Start at Login…"
-        } else {
-            CommandRunner.shared.runAndShow(["--uninstall-agent"], title: "Remove Start at Login")
-            statusMessage = "Removing Start at Login…"
-        }
+            try FileManager.default.createDirectory(
+                at: launchAgentsDir,
+                withIntermediateDirectories: true
+            )
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            self.refreshStartAtLoginStatus()
+            if enabled {
+                let plist = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                <plist version="1.0">
+                <dict>
+                    <key>Label</key>
+                    <string>com.kulturban.supsidian.login</string>
+
+                    <key>ProgramArguments</key>
+                    <array>
+                        <string>/usr/bin/open</string>
+                        <string>-a</string>
+                        <string>Supsidian</string>
+                    </array>
+
+                    <key>RunAtLoad</key>
+                    <true/>
+                </dict>
+                </plist>
+                """
+
+                try plist.write(to: launchAgentURL, atomically: true, encoding: .utf8)
+                startAtLoginEnabled = true
+                statusMessage = "✅ Supsidian will open at login."
+            } else {
+                if FileManager.default.fileExists(atPath: launchAgentURL.path) {
+                    try FileManager.default.removeItem(at: launchAgentURL)
+                }
+
+                startAtLoginEnabled = false
+                statusMessage = "✅ Supsidian will not open at login."
+            }
+        } catch {
+            startAtLoginEnabled = FileManager.default.fileExists(atPath: launchAgentURL.path)
+            statusMessage = "❌ Failed to update login setting: \(error.localizedDescription)"
         }
     }
 
@@ -1345,6 +1377,25 @@ struct SettingsView: View {
 
     private var advancedPage: some View {
         VStack(alignment: .leading, spacing: 18) {
+            SettingsCard(
+                title: "Open Supsidian at login",
+                description: "Supsidian will appear in the menu bar after login. Syncing still happens manually with Sync Now."
+            ) {
+                HStack {
+                    Spacer()
+
+                    Toggle(
+                        "",
+                        isOn: Binding(
+                            get: { model.startAtLoginEnabled },
+                            set: { model.setStartAtLogin($0) }
+                        )
+                    )
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                }
+            }
+
             SettingsCard(
                 title: "Advanced",
                 description: "Optional safety settings for manual syncing."
