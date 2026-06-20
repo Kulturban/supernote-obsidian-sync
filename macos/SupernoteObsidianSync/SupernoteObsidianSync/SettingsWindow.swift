@@ -1,4 +1,5 @@
 import SwiftUI
+import ServiceManagement
 import AppKit
 import Combine
 
@@ -457,10 +458,34 @@ final class SettingsViewModel: ObservableObject {
     // MARK: Startup
 
     func refreshStartAtLoginStatus() {
-        startAtLoginEnabled = FileManager.default.fileExists(atPath: launchAgentURL.path)
+        if #available(macOS 13.0, *) {
+            startAtLoginEnabled = SMAppService.mainApp.status == .enabled
+        } else {
+            startAtLoginEnabled = FileManager.default.fileExists(atPath: launchAgentURL.path)
+        }
     }
 
     func setStartAtLogin(_ enabled: Bool) {
+        if #available(macOS 13.0, *) {
+            do {
+                if enabled {
+                    try SMAppService.mainApp.register()
+                    startAtLoginEnabled = true
+                    statusMessage = "✅ Supsidian will open at login."
+                } else {
+                    try SMAppService.mainApp.unregister()
+                    startAtLoginEnabled = false
+                    statusMessage = "✅ Supsidian will not open at login."
+                }
+            } catch {
+                refreshStartAtLoginStatus()
+                statusMessage = "❌ Failed to update login setting: \(error.localizedDescription)"
+            }
+
+            return
+        }
+
+        // Fallback for older macOS versions.
         do {
             let launchAgentsDir = launchAgentURL.deletingLastPathComponent()
 
@@ -480,9 +505,7 @@ final class SettingsViewModel: ObservableObject {
 
                     <key>ProgramArguments</key>
                     <array>
-                        <string>/usr/bin/open</string>
-                        <string>-a</string>
-                        <string>Supsidian</string>
+                        <string>/Applications/Supsidian.app/Contents/MacOS/Supsidian</string>
                     </array>
 
                     <key>RunAtLoad</key>
@@ -503,7 +526,7 @@ final class SettingsViewModel: ObservableObject {
                 statusMessage = "✅ Supsidian will not open at login."
             }
         } catch {
-            startAtLoginEnabled = FileManager.default.fileExists(atPath: launchAgentURL.path)
+            refreshStartAtLoginStatus()
             statusMessage = "❌ Failed to update login setting: \(error.localizedDescription)"
         }
     }
@@ -960,32 +983,36 @@ struct SettingsView: View {
     }
 
     private func sidebarItem(_ section: SettingsSection) -> some View {
-        Button {
-            model.selectedSection = section
-        } label: {
-            HStack(spacing: 10) {
-                Image(systemName: section.icon)
-                    .frame(width: 20)
+        let isSelected = model.selectedSection == section
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(section.rawValue)
-                        .font(.headline)
+        return HStack(spacing: 10) {
+            Image(systemName: section.icon)
+                .frame(width: 20)
+                .foregroundColor(isSelected ? .accentColor : .primary)
 
-                    Text(section.subtitle)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(section.rawValue)
+                    .font(.headline)
+                    .foregroundColor(.primary)
 
-                Spacer()
+                Text(section.subtitle)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 9)
-            .background(
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(model.selectedSection == section ? Color.accentColor.opacity(0.16) : Color.clear)
-            )
+
+            Spacer()
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(isSelected ? Color.accentColor.opacity(0.16) : Color.clear)
+        )
+        .onTapGesture {
+            model.selectedSection = section
+        }
     }
 
     private var setupMiniStatus: some View {
