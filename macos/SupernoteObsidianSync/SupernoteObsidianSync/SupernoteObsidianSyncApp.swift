@@ -55,16 +55,18 @@ struct SupernoteObsidianSyncApp: App {
                 }
             }
 
-            Divider()
-            Divider()
-
-            Divider()
-
             Button("Settings…") {
                 SettingsWindowController.shared.show()
             }
 
             Divider()
+
+            Button("Check for Updates…") {
+                if let url = URL(string: "https://github.com/Kulturban/supernote-obsidian-sync/releases") {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+
             Divider()
 
             Button("Status") {
@@ -80,8 +82,6 @@ struct SupernoteObsidianSyncApp: App {
             }
 
             Divider()
-
-
 
             Button("Quit") {
                 NSApplication.shared.terminate(nil)
