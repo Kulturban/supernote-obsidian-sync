@@ -69,8 +69,16 @@ PROMPTS = {
 IMAGE_LINK_PATTERN = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
 PAGE_HEADING_PATTERN = re.compile(r"^#{1,6}\s+.*?\bpage\s+(\d+)\b", re.IGNORECASE)
 PAGE_FILENAME_PATTERN = re.compile(r"(?:^|[-_ ])page[-_ ]?0*(\d+)(?:[-_ ].*)?$", re.IGNORECASE)
+PAGE_IMAGE_EMBED_PATTERN = re.compile(
+    r"!\[[^\]]*\]\((?:[^)]*/)?pages/page-\d+\.png\)",
+    re.IGNORECASE,
+)
 SUSPICIOUS_FULL_PAGE_PATTERN = re.compile(
     r"(?:^|[-_ ])(?:full[-_ ]?page|page[-_ ]?render|rendered[-_ ]?page)(?:[-_ ]|$)",
+    re.IGNORECASE,
+)
+GENERATED_VISUAL_FILENAME_PATTERN = re.compile(
+    r"(?:page-\d+-visual-\d+|marker-visual-\d+)\.(?:png|jpg|jpeg|webp|gif)$",
     re.IGNORECASE,
 )
 
@@ -238,9 +246,25 @@ def is_inside(path: Path, directory: Path) -> bool:
         return False
 
 
-def page_from_filename(path: Path) -> int | None:
+def marker_page_index_from_filename(path: Path) -> int | None:
     match = PAGE_FILENAME_PATTERN.match(path.stem)
     return int(match.group(1)) if match else None
+
+
+def clear_previous_visual_outputs(visuals_dir: Path) -> None:
+    """Remove only files this prototype generated during a prior run."""
+    stale_files = [
+        path
+        for path in visuals_dir.iterdir()
+        if path.is_file() and (
+            GENERATED_VISUAL_FILENAME_PATTERN.fullmatch(path.name)
+            or path.name in {"manifest.json", "opencv_unavailable.txt", "opencv_placeholder.txt"}
+        )
+    ]
+    for path in stale_files:
+        path.unlink()
+    if stale_files:
+        print(f"Cleared {len(stale_files)} previous generated visual artifact(s).")
 
 
 def copy_marker_visuals(marker_dir: Path, visuals_dir: Path) -> list[dict]:
@@ -248,6 +272,8 @@ def copy_marker_visuals(marker_dir: Path, visuals_dir: Path) -> list[dict]:
     print("Looking for Marker-declared image assets...")
     manifest: list[dict] = []
     copied_sources: dict[Path, dict] = {}
+    page_visual_counts: dict[int, int] = {}
+    unassigned_visual_count = 0
     marker_markdown_files = sorted(marker_dir.rglob("*.md"))
 
     for markdown_file in marker_markdown_files:
@@ -269,6 +295,7 @@ def copy_marker_visuals(marker_dir: Path, visuals_dir: Path) -> list[dict]:
                     "original_marker_path": raw_link,
                     "source_marker_markdown_file": str(markdown_file.relative_to(marker_dir)),
                     "assigned_page": current_page,
+                    "marker_page_index": None,
                     "reason": "",
                     "status": "rejected",
                 }
@@ -296,10 +323,14 @@ def copy_marker_visuals(marker_dir: Path, visuals_dir: Path) -> list[dict]:
                     manifest.append(entry)
                     continue
 
-                filename_page = page_from_filename(linked_path)
-                if filename_page is not None:
-                    entry["assigned_page"] = filename_page
-                    assignment_reason = "Assigned from image filename page number."
+                marker_page_index = marker_page_index_from_filename(linked_path)
+                if marker_page_index is not None:
+                    entry["marker_page_index"] = marker_page_index
+                    entry["assigned_page"] = marker_page_index + 1
+                    assignment_reason = (
+                        "Assigned from zero-based Marker filename page index "
+                        f"{marker_page_index}."
+                    )
                 elif current_page is not None:
                     assignment_reason = "Assigned from Marker Markdown page heading."
                 else:
@@ -310,25 +341,38 @@ def copy_marker_visuals(marker_dir: Path, visuals_dir: Path) -> list[dict]:
                     entry.update(
                         copied_filename=prior["copied_filename"],
                         assigned_page=prior["assigned_page"],
+                        marker_page_index=prior["marker_page_index"],
                         reason="Duplicate Marker reference; reused existing copied asset.",
                         status="copied",
                     )
                     manifest.append(entry)
                     continue
 
-                visual_index = sum(item["status"] == "copied" for item in manifest) + 1
                 if entry["assigned_page"] is not None:
+                    page_number = entry["assigned_page"]
+                    page_visual_counts[page_number] = page_visual_counts.get(page_number, 0) + 1
+                    visual_index = page_visual_counts[page_number]
                     destination_name = (
-                        f"page-{entry['assigned_page']:03d}-visual-{visual_index:03d}"
+                        f"page-{page_number:03d}-visual-{visual_index:03d}"
                         f"{linked_path.suffix.lower()}"
                     )
                 else:
+                    unassigned_visual_count += 1
+                    visual_index = unassigned_visual_count
                     destination_name = f"marker-visual-{visual_index:03d}{linked_path.suffix.lower()}"
 
                 destination = visuals_dir / destination_name
                 while destination.exists():
                     visual_index += 1
-                    destination = visuals_dir / f"marker-visual-{visual_index:03d}{linked_path.suffix.lower()}"
+                    if entry["assigned_page"] is not None:
+                        page_visual_counts[entry["assigned_page"]] = visual_index
+                        destination = visuals_dir / (
+                            f"page-{entry['assigned_page']:03d}-visual-{visual_index:03d}"
+                            f"{linked_path.suffix.lower()}"
+                        )
+                    else:
+                        unassigned_visual_count = visual_index
+                        destination = visuals_dir / f"marker-visual-{visual_index:03d}{linked_path.suffix.lower()}"
 
                 shutil.copy2(linked_path, destination)
                 entry.update(
@@ -471,7 +515,12 @@ def write_combined_markdown(
             )
 
     combined_path = output_dir / "combined.md"
-    combined_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    markdown = "\n".join(lines) + "\n"
+    if embed_page_images == "never" and PAGE_IMAGE_EMBED_PATTERN.search(markdown):
+        raise RuntimeError(
+            "Refusing to write combined.md: default mode must not embed full-page images."
+        )
+    combined_path.write_text(markdown, encoding="utf-8")
     return combined_path
 
 
@@ -511,6 +560,7 @@ def main() -> int:
 
     for directory in (pages_dir, olmocr_dir, visuals_dir, marker_dir):
         directory.mkdir(parents=True, exist_ok=True)
+    clear_previous_visual_outputs(visuals_dir)
 
     try:
         page_paths = render_pages(pdf_path, pages_dir)
@@ -565,9 +615,17 @@ def main() -> int:
         return 1
 
     copied_visual_count = sum(item["status"] == "copied" for item in visual_manifest)
+    assigned_visual_count = sum(
+        item["status"] == "copied" and item["assigned_page"] is not None
+        for item in visual_manifest
+    )
+    unassigned_visual_count = copied_visual_count - assigned_visual_count
     print(f"Done. combined.md: {combined_path}")
     print(f"Saved {len(page_paths)} full-page render(s) in: {pages_dir}")
-    print(f"Copied {copied_visual_count} extracted visual asset(s) to: {visuals_dir}")
+    print(f"Embedded full page images: {'yes' if args.embed_page_images != 'never' else 'no'}")
+    print(f"Extracted visuals copied: {copied_visual_count}")
+    print(f"Extracted visuals assigned to pages: {assigned_visual_count}")
+    print(f"Unassigned visuals: {unassigned_visual_count}")
     print(
         "Page images are not embedded by default. Use --embed-page-images debug or always "
         "to inspect the full-page renders."
