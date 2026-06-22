@@ -13,3 +13,4 @@ dist/
 *.egg-info/
 src/*.egg-info/
 *.xcuserstate
+local_ocr_test_output/
