@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+from html.parser import HTMLParser
 from pathlib import Path
 
 try:
@@ -66,6 +67,13 @@ PROMPTS = {
     "raw": RAW_PROMPT,
 }
 
+TABLE_PROMPT_SUFFIX = """For every clear table, return GitHub-flavored Markdown pipe syntax:
+| Column 1 | Column 2 |
+| --- | --- |
+| value | value |
+
+Never output HTML tags or HTML entities for a table. Before returning, replace any intended HTML table with a Markdown table."""
+
 IMAGE_LINK_PATTERN = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
 PAGE_HEADING_PATTERN = re.compile(r"^#{1,6}\s+.*?\bpage\s+(\d+)\b", re.IGNORECASE)
 PAGE_FILENAME_PATTERN = re.compile(r"(?:^|[-_ ])page[-_ ]?0*(\d+)(?:[-_ ].*)?$", re.IGNORECASE)
@@ -81,6 +89,7 @@ GENERATED_VISUAL_FILENAME_PATTERN = re.compile(
     r"(?:page-\d+-visual-\d+|marker-visual-\d+)\.(?:png|jpg|jpeg|webp|gif)$",
     re.IGNORECASE,
 )
+HTML_TABLE_PATTERN = re.compile(r"<table\b[^>]*>.*?</table\s*>", re.IGNORECASE | re.DOTALL)
 
 
 def parse_args() -> argparse.Namespace:
@@ -99,6 +108,16 @@ def parse_args() -> argparse.Namespace:
         help="OCR prompt style (default: safe)",
     )
     parser.add_argument(
+        "--table-mode",
+        choices=("raw", "prefer-markdown", "convert-html", "convert-html-forgiving"),
+        default="prefer-markdown",
+        help=(
+            "Table handling: raw preserves model output, prefer-markdown strengthens the prompt, "
+            "convert-html converts conservative simple HTML tables, convert-html-forgiving pads "
+            "irregular HTML rows (default: prefer-markdown)"
+        ),
+    )
+    parser.add_argument(
         "--absolute-image-links",
         action="store_true",
         help="Use absolute paths for any images embedded in combined.md",
@@ -110,12 +129,189 @@ def parse_args() -> argparse.Namespace:
         help="Visual extraction method (default: auto)",
     )
     parser.add_argument(
+        "--visual-placement",
+        choices=("bottom", "marker-order"),
+        default="bottom",
+        help="Place extracted visuals at the page bottom or by Marker Markdown order (default: bottom)",
+    )
+    parser.add_argument(
         "--embed-page-images",
         choices=("never", "debug", "always"),
         default="never",
         help="Embed full-page renders in combined.md (default: never)",
     )
     return parser.parse_args()
+
+
+def prompt_for_options(prompt_mode: str, table_mode: str) -> str:
+    """Keep --prompt-mode raw minimal; otherwise optionally reinforce table output."""
+    prompt = PROMPTS[prompt_mode]
+    if prompt_mode == "raw" or table_mode == "raw":
+        return prompt
+    return f"{prompt}\n\n{TABLE_PROMPT_SUFFIX}"
+
+
+class SimpleHTMLTableParser(HTMLParser):
+    """Parse only ordinary, flat HTML tables that can be converted without guessing."""
+
+    def __init__(self, forgiving: bool = False) -> None:
+        super().__init__(convert_charrefs=True)
+        self.forgiving = forgiving
+        self.rows: list[list[tuple[str, list[str]]]] = []
+        self.current_row: list[tuple[str, list[str]]] | None = None
+        self.current_cell: list[str] | None = None
+        self.formatting_tags: list[str] = []
+        self.table_depth = 0
+        self.valid = True
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        attribute_names = {name.lower() for name, _ in attrs}
+
+        if tag == "table":
+            self.table_depth += 1
+            if self.table_depth != 1:
+                self.valid = False
+            return
+        if tag in {"thead", "tbody", "tfoot"}:
+            return
+        if tag == "tr":
+            if self.current_row is not None or self.table_depth != 1:
+                self.valid = False
+            self.current_row = []
+            return
+        if tag in {"th", "td"}:
+            if self.current_row is None or self.current_cell is not None:
+                self.valid = False
+                return
+            if {"rowspan", "colspan"} & attribute_names:
+                self.valid = False
+                return
+            self.current_cell = []
+            self.current_row.append((tag, self.current_cell))
+            return
+        if tag == "br" and self.current_cell is not None:
+            self.current_cell.append("\n")
+            return
+        if self.forgiving and tag in {"i", "em", "b", "strong"} and self.current_cell is not None:
+            self.formatting_tags.append(tag)
+            return
+        if self.forgiving and tag == "sup" and self.current_cell is not None:
+            self.current_cell.append("^")
+            self.formatting_tags.append(tag)
+            return
+
+        # Nested formatting, lists, or nested tables need more interpretation than this
+        # deliberately conservative converter performs.
+        self.valid = False
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag == "table":
+            self.table_depth -= 1
+            if self.table_depth < 0:
+                self.valid = False
+            return
+        if tag in {"thead", "tbody", "tfoot"}:
+            return
+        if tag in {"th", "td"}:
+            if self.current_cell is None:
+                self.valid = False
+            self.current_cell = None
+            return
+        if tag == "tr":
+            if self.current_row is None or self.current_cell is not None:
+                self.valid = False
+                return
+            self.rows.append(self.current_row)
+            self.current_row = None
+            return
+        if self.forgiving and tag in {"i", "em", "b", "strong", "sup"}:
+            if not self.formatting_tags or self.formatting_tags.pop() != tag:
+                self.valid = False
+            return
+        if tag != "br":
+            self.valid = False
+
+    def handle_data(self, data: str) -> None:
+        if self.current_cell is not None:
+            self.current_cell.append(data)
+        elif data.strip():
+            self.valid = False
+
+    def close(self) -> None:
+        super().close()
+        if (
+            self.table_depth != 0
+            or self.current_row is not None
+            or self.current_cell is not None
+            or self.formatting_tags
+        ):
+            self.valid = False
+
+
+def markdown_cell(cell_parts: list[str]) -> str:
+    """Normalize a simple HTML cell without creating HTML inside the Markdown table."""
+    lines = [" ".join(part.split()) for part in "".join(cell_parts).splitlines()]
+    value = " / ".join(part for part in lines if part)
+    return value.replace("|", "\\|")
+
+
+def html_table_to_markdown(html_table: str, forgiving: bool = False) -> str | None:
+    parser = SimpleHTMLTableParser(forgiving=forgiving)
+    try:
+        parser.feed(html_table)
+        parser.close()
+    except Exception:
+        return None
+
+    if not parser.valid or not parser.rows:
+        return None
+
+    column_count = max(len(row) for row in parser.rows)
+    if column_count == 0:
+        return None
+    if not forgiving and any(len(row) != column_count for row in parser.rows):
+        return None
+
+    header_index = next(
+        (index for index, row in enumerate(parser.rows) if all(tag == "th" for tag, _ in row)),
+        None,
+    )
+    if forgiving:
+        for index, row in enumerate(parser.rows):
+            padding_tag = "th" if index == header_index else "td"
+            row.extend((padding_tag, []) for _ in range(column_count - len(row)))
+    if header_index is None:
+        header = [""] * column_count
+        body_rows = parser.rows
+    else:
+        header = [markdown_cell(cell) for _, cell in parser.rows[header_index]]
+        body_rows = parser.rows[:header_index] + parser.rows[header_index + 1 :]
+
+    markdown_lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join("---" for _ in range(column_count)) + " |",
+    ]
+    for row in body_rows:
+        markdown_lines.append("| " + " | ".join(markdown_cell(cell) for _, cell in row) + " |")
+    return "\n".join(markdown_lines)
+
+
+def convert_html_tables(text: str, forgiving: bool = False) -> tuple[str, int, int]:
+    converted_count = 0
+    unchanged_count = 0
+
+    def replace_table(match: re.Match[str]) -> str:
+        nonlocal converted_count, unchanged_count
+        markdown_table = html_table_to_markdown(match.group(0), forgiving=forgiving)
+        if markdown_table is None:
+            unchanged_count += 1
+            return match.group(0)
+        converted_count += 1
+        return markdown_table
+
+    return HTML_TABLE_PATTERN.sub(replace_table, text), converted_count, unchanged_count
 
 
 def render_pages(pdf_path: Path, pages_dir: Path) -> list[Path]:
@@ -267,6 +463,17 @@ def clear_previous_visual_outputs(visuals_dir: Path) -> None:
         print(f"Cleared {len(stale_files)} previous generated visual artifact(s).")
 
 
+def nearby_marker_text(lines: list[str], image_line_index: int, step: int) -> str | None:
+    """Return the nearest non-image Marker line before or after an asset link."""
+    index = image_line_index + step
+    while 0 <= index < len(lines):
+        candidate = lines[index].strip()
+        if candidate and not IMAGE_LINK_PATTERN.search(candidate):
+            return candidate
+        index += step
+    return None
+
+
 def copy_marker_visuals(marker_dir: Path, visuals_dir: Path) -> list[dict]:
     """Copy only local image assets explicitly referenced by Marker Markdown."""
     print("Looking for Marker-declared image assets...")
@@ -282,8 +489,9 @@ def copy_marker_visuals(marker_dir: Path, visuals_dir: Path) -> list[dict]:
         except UnicodeDecodeError:
             markdown_text = markdown_file.read_text(encoding="utf-8", errors="replace")
 
+        markdown_lines = markdown_text.splitlines()
         current_page: int | None = None
-        for line_number, line in enumerate(markdown_text.splitlines(), start=1):
+        for line_number, line in enumerate(markdown_lines, start=1):
             heading_match = PAGE_HEADING_PATTERN.match(line.strip())
             if heading_match:
                 current_page = int(heading_match.group(1))
@@ -293,7 +501,11 @@ def copy_marker_visuals(marker_dir: Path, visuals_dir: Path) -> list[dict]:
                 entry = {
                     "copied_filename": None,
                     "original_marker_path": raw_link,
+                    "original_marker_link": raw_link,
                     "source_marker_markdown_file": str(markdown_file.relative_to(marker_dir)),
+                    "source_marker_line_number": line_number,
+                    "marker_text_before": nearby_marker_text(markdown_lines, line_number - 1, -1),
+                    "marker_text_after": nearby_marker_text(markdown_lines, line_number - 1, 1),
                     "assigned_page": current_page,
                     "marker_page_index": None,
                     "reason": "",
@@ -431,6 +643,53 @@ def marker_summary(marker_dir: Path, marker_succeeded: bool, marker_message: str
     return lines
 
 
+def normalize_anchor(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+def unique_anchor_line_index(lines: list[str], anchor: str | None) -> int | None:
+    if not anchor:
+        return None
+    normalized_anchor = normalize_anchor(anchor)
+    if not normalized_anchor:
+        return None
+    matches = [
+        index for index, line in enumerate(lines) if normalize_anchor(line) == normalized_anchor
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def insert_markdown_image(lines: list[str], position: int, image_markdown: str) -> list[str]:
+    insertion = [image_markdown]
+    if position > 0 and lines[position - 1].strip():
+        insertion.insert(0, "")
+    if position < len(lines) and lines[position].strip():
+        insertion.append("")
+    return lines[:position] + insertion + lines[position:]
+
+
+def place_visual_by_marker_order(
+    transcription: str,
+    visual: dict,
+    output_dir: Path,
+    absolute_image_links: bool,
+) -> tuple[str, bool]:
+    """Insert a visual only when a Marker neighbor matches one unique OCR line."""
+    lines = transcription.splitlines()
+    visual_path = output_dir / "extracted_visuals" / visual["copied_filename"]
+    image_markdown = f"![]({link_for_markdown(visual_path, output_dir, absolute_image_links)})"
+
+    following_index = unique_anchor_line_index(lines, visual.get("marker_text_after"))
+    if following_index is not None:
+        return "\n".join(insert_markdown_image(lines, following_index, image_markdown)), True
+
+    previous_index = unique_anchor_line_index(lines, visual.get("marker_text_before"))
+    if previous_index is not None:
+        return "\n".join(insert_markdown_image(lines, previous_index + 1, image_markdown)), True
+
+    return transcription, False
+
+
 def write_combined_markdown(
     pdf_path: Path,
     output_dir: Path,
@@ -440,6 +699,7 @@ def write_combined_markdown(
     absolute_image_links: bool,
     embed_page_images: str,
     visual_manifest: list[dict],
+    bottom_visual_filenames: set[str],
 ) -> Path:
     print("Writing combined Markdown...")
     copied_visuals = [item for item in visual_manifest if item["status"] == "copied"]
@@ -496,7 +756,11 @@ def write_combined_markdown(
 
         lines.extend(["### olmOCR transcription", "", text or "[No transcription returned.]", ""])
 
-        if page_visuals := visuals_by_page.get(index):
+        if page_visuals := [
+            visual
+            for visual in visuals_by_page.get(index, [])
+            if visual["copied_filename"] in bottom_visual_filenames
+        ]:
             lines.extend(["### Extracted visuals", ""])
             for visual in page_visuals:
                 visual_path = output_dir / "extracted_visuals" / visual["copied_filename"]
@@ -564,6 +828,7 @@ def main() -> int:
 
     try:
         page_paths = render_pages(pdf_path, pages_dir)
+        ocr_prompt = prompt_for_options(args.prompt_mode, args.table_mode)
 
         marker_succeeded = False
         marker_message = "Marker was not run for the selected visual extraction mode."
@@ -592,13 +857,64 @@ def main() -> int:
         page_texts: list[str] = []
         for index, page_path in enumerate(page_paths, start=1):
             print(f"Sending page {index}/{len(page_paths)} to Ollama...")
-            text, raw_data = ocr_page(page_path, PROMPTS[args.prompt_mode])
+            text, raw_data = ocr_page(page_path, ocr_prompt)
+            if args.table_mode in {"convert-html", "convert-html-forgiving"}:
+                forgiving_tables = args.table_mode == "convert-html-forgiving"
+                text, converted_table_count, unchanged_table_count = convert_html_tables(
+                    text,
+                    forgiving=forgiving_tables,
+                )
+                print(
+                    f"  Table mode: {args.table_mode}; tables converted: {converted_table_count}; "
+                    f"tables left unchanged: {unchanged_table_count}."
+                )
             (olmocr_dir / f"page-{index:03d}.txt").write_text(text + "\n", encoding="utf-8")
             (olmocr_dir / f"page-{index:03d}.json").write_text(
                 json.dumps(raw_data, indent=2, ensure_ascii=False) + "\n",
                 encoding="utf-8",
             )
             page_texts.append(text)
+
+        assigned_visuals = [
+            visual
+            for visual in visual_manifest
+            if visual["status"] == "copied" and visual["assigned_page"] is not None
+        ]
+        bottom_visual_filenames: set[str] = set()
+        visuals_placed_by_marker_order = 0
+        visuals_placed_by_bottom_fallback = 0
+
+        if args.visual_placement == "marker-order":
+            visuals_by_page: dict[int, list[dict]] = {}
+            for visual in assigned_visuals:
+                visuals_by_page.setdefault(visual["assigned_page"], []).append(visual)
+
+            for page_number, page_visuals in visuals_by_page.items():
+                if not 1 <= page_number <= len(page_texts):
+                    for visual in page_visuals:
+                        bottom_visual_filenames.add(visual["copied_filename"])
+                        visuals_placed_by_bottom_fallback += 1
+                    continue
+
+                updated_text = page_texts[page_number - 1]
+                for visual in page_visuals:
+                    updated_text, was_placed = place_visual_by_marker_order(
+                        updated_text,
+                        visual,
+                        output_dir,
+                        args.absolute_image_links,
+                    )
+                    if was_placed:
+                        visuals_placed_by_marker_order += 1
+                    else:
+                        bottom_visual_filenames.add(visual["copied_filename"])
+                        visuals_placed_by_bottom_fallback += 1
+                page_texts[page_number - 1] = updated_text
+        else:
+            bottom_visual_filenames = {
+                visual["copied_filename"] for visual in assigned_visuals
+            }
+            visuals_placed_by_bottom_fallback = len(bottom_visual_filenames)
 
         combined_path = write_combined_markdown(
             pdf_path,
@@ -609,6 +925,7 @@ def main() -> int:
             args.absolute_image_links,
             args.embed_page_images,
             visual_manifest,
+            bottom_visual_filenames,
         )
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -626,6 +943,9 @@ def main() -> int:
     print(f"Extracted visuals copied: {copied_visual_count}")
     print(f"Extracted visuals assigned to pages: {assigned_visual_count}")
     print(f"Unassigned visuals: {unassigned_visual_count}")
+    print(f"Visual placement mode: {args.visual_placement}")
+    print(f"Visuals placed by marker-order: {visuals_placed_by_marker_order}")
+    print(f"Visuals placed by bottom fallback: {visuals_placed_by_bottom_fallback}")
     print(
         "Page images are not embedded by default. Use --embed-page-images debug or always "
         "to inspect the full-page renders."
