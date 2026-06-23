@@ -46,6 +46,7 @@ DEFAULT_CONFIG = {
     "task_marker": "#",
     "task_tag": "#task",
     "open_requires_obsidian_running": True,
+    "ocr_provider": "mistral",
 }
 
 APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -206,6 +207,12 @@ TASK_TAG = config.get("task_tag", "#task")
 
 OPEN_REQUIRES_OBSIDIAN_RUNNING = bool(config.get("open_requires_obsidian_running", True))
 CUSTOM_OCR_INSTRUCTION = str(config.get("custom_ocr_instruction", "")).strip()
+OCR_PROVIDER = str(config.get("ocr_provider", "mistral")).strip().lower() or "mistral"
+SUPPORTED_OCR_PROVIDERS = (
+    "mistral",
+    "local_ollama",
+    "hybrid_marker_olmocr",
+)
 
 ACTIVE_NOTEBOOK = {}
 ACTIVE_ATTACHMENT_FOLDER = ""
@@ -433,6 +440,44 @@ def mistral_ocr_pdf(pdf_file: Path, image_dir: Path, obsidian_image_folder: str)
     return "".join(markdown_parts).strip() + "\n"
 
 
+def local_ollama_ocr_pdf(
+    pdf_file: Path,
+    image_dir: Path,
+    obsidian_image_folder: str,
+) -> str:
+    raise RuntimeError(
+        "OCR provider 'local_ollama' is not implemented yet. Use 'mistral' or "
+        "continue testing with scripts/hybrid_marker_olmocr_test.py."
+    )
+
+
+def hybrid_marker_olmocr_pdf(
+    pdf_file: Path,
+    image_dir: Path,
+    obsidian_image_folder: str,
+) -> str:
+    raise RuntimeError(
+        "OCR provider 'hybrid_marker_olmocr' is not implemented yet. Use 'mistral' or "
+        "continue testing with scripts/hybrid_marker_olmocr_test.py."
+    )
+
+
+def ocr_pdf(pdf_file: Path, image_dir: Path, obsidian_image_folder: str) -> str:
+    provider = OCR_PROVIDER
+
+    if provider == "mistral":
+        return mistral_ocr_pdf(pdf_file, image_dir, obsidian_image_folder)
+    if provider == "local_ollama":
+        return local_ollama_ocr_pdf(pdf_file, image_dir, obsidian_image_folder)
+    if provider == "hybrid_marker_olmocr":
+        return hybrid_marker_olmocr_pdf(pdf_file, image_dir, obsidian_image_folder)
+
+    raise RuntimeError(
+        f"Unsupported OCR provider '{provider}'. Supported providers: "
+        f"{', '.join(SUPPORTED_OCR_PROVIDERS)}."
+    )
+
+
 # ------------------------------------------------------------
 # TASK CONVERSION
 # ------------------------------------------------------------
@@ -506,7 +551,7 @@ def process_note(note_file: Path) -> None:
     try:
         convert_note_to_pdf(note_file, pdf_file)
 
-        ocr_markdown = mistral_ocr_pdf(
+        ocr_markdown = ocr_pdf(
             pdf_file,
             note_attachment_dir,
             obsidian_image_folder,
@@ -705,6 +750,11 @@ def setup() -> None:
             bool(existing_config.get("open_requires_obsidian_running", True)),
         )
 
+        ocr_provider = (
+            str(existing_config.get("ocr_provider", "mistral")).strip().lower()
+            or "mistral"
+        )
+
         new_config = {
             "source_dir": source_dir,
             "vault_dir": vault_dir,
@@ -717,6 +767,7 @@ def setup() -> None:
             "task_marker": task_marker,
             "task_tag": task_tag,
             "open_requires_obsidian_running": open_requires_obsidian_running,
+            "ocr_provider": ocr_provider,
         }
 
         CONFIG_FILE.write_text(
@@ -951,6 +1002,7 @@ def diagnose() -> None:
     config_exists = CONFIG_FILE.exists()
     env_exists = ENV_FILE.exists()
     api_key_set = bool(os.environ.get("MISTRAL_API_KEY"))
+    provider_supported = OCR_PROVIDER in SUPPORTED_OCR_PROVIDERS
 
     vault_configured = config_exists and not is_placeholder_path(str(VAULT_DIR))
     vault_exists = vault_configured and VAULT_DIR.exists()
@@ -977,10 +1029,32 @@ def diagnose() -> None:
     )
 
     add_check(
-        "MISTRAL_API_KEY is set",
-        api_key_set,
-        f"loaded from {ENV_FILE}" if api_key_set else "missing",
+        "OCR provider",
+        provider_supported,
+        OCR_PROVIDER
+        if provider_supported
+        else f"unsupported; supported providers: {', '.join(SUPPORTED_OCR_PROVIDERS)}",
     )
+
+    if OCR_PROVIDER == "mistral":
+        add_check(
+            "MISTRAL_API_KEY is set",
+            api_key_set,
+            f"loaded from {ENV_FILE}" if api_key_set else "missing",
+        )
+    else:
+        add_check(
+            "MISTRAL_API_KEY is set",
+            True,
+            f"not required for OCR provider '{OCR_PROVIDER}'",
+        )
+
+    if provider_supported and OCR_PROVIDER != "mistral":
+        add_check(
+            "Selected OCR provider is available",
+            False,
+            f"'{OCR_PROVIDER}' is not implemented yet",
+        )
 
     add_check(
         "Obsidian vault is configured",
@@ -1113,7 +1187,11 @@ def show_status() -> None:
     print(f"Obsidian vault:  {VAULT_DIR}")
     print(f"Check interval:  {CHECK_INTERVAL_SECONDS} seconds")
     print(f"Obsidian running: {'yes' if is_obsidian_running() else 'no'}")
-    print(f"API key set:      {'yes' if os.environ.get('MISTRAL_API_KEY') else 'no'}")
+    print(f"OCR provider:     {OCR_PROVIDER}")
+    if OCR_PROVIDER == "mistral":
+        print(f"Mistral API key:  {'yes' if os.environ.get('MISTRAL_API_KEY') else 'no'}")
+    else:
+        print("Mistral API key:  not required")
     print(f"supernote-tool:   {SUPERNOTE_TOOL_PATH}")
     print("")
 
