@@ -98,7 +98,7 @@ ollama pull richardyoung/olmocr2:7b-q8
 
 `hybrid_marker_olmocr` is an **Experimental** backend option for advanced users. It combines local Ollama/olmOCR text recognition with Marker layout and visual extraction. When Marker identifies drawings or other visual assets, Supsidian copies the cropped asset into the note attachment folder and embeds it near its document position in Obsidian.
 
-It requires all `local_ollama` prerequisites plus `marker_single` on the runtime PATH. It is intentionally hidden from interactive setup for now, but advanced users can select it manually in `config.json`.
+It requires all `local_ollama` prerequisites plus `marker_single` on the runtime PATH. It is available in interactive setup as an **Experimental** option, and advanced users can also select it manually in `config.json`.
 
 If the app or LaunchAgent PATH does not include `marker_single`, set `hybrid_marker_command` to its absolute path:
 
@@ -115,7 +115,7 @@ If the app or LaunchAgent PATH does not include `marker_single`, set `hybrid_mar
 
 ### Selecting a provider in config.json
 
-Interactive setup offers `local_ollama` and `mistral`. You can also select a provider manually in:
+Interactive setup offers `local_ollama`, `mistral`, and `hybrid_marker_olmocr`. You can also select a provider manually in:
 
 ```
 ~/Library/Application Support/Supernote Obsidian Sync/config.json
