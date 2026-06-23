@@ -3,10 +3,12 @@ import base64
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import time
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -52,6 +54,7 @@ DEFAULT_CONFIG = {
     "local_ollama_url": "http://localhost:11434/api/generate",
     "local_ollama_model": "richardyoung/olmocr2:7b-q8",
     "local_ollama_num_ctx": 8192,
+    "hybrid_marker_command": "marker_single",
 }
 
 APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -230,6 +233,9 @@ LOCAL_OLLAMA_MODEL = (
     or "richardyoung/olmocr2:7b-q8"
 )
 LOCAL_OLLAMA_NUM_CTX = positive_int_or_default(config.get("local_ollama_num_ctx"), 8192)
+HYBRID_MARKER_COMMAND = (
+    str(config.get("hybrid_marker_command", "marker_single")).strip() or "marker_single"
+)
 SUPPORTED_OCR_PROVIDERS = (
     "mistral",
     "local_ollama",
@@ -489,11 +495,7 @@ def mistral_ocr_pdf(pdf_file: Path, image_dir: Path, obsidian_image_folder: str)
     return "".join(markdown_parts).strip() + "\n"
 
 
-def local_ollama_ocr_pdf(
-    pdf_file: Path,
-    image_dir: Path,
-    obsidian_image_folder: str,
-) -> str:
+def ollama_ocr_pdf_pages(pdf_file: Path) -> list[str]:
     try:
         import fitz  # PyMuPDF
     except ImportError as exc:
@@ -501,9 +503,8 @@ def local_ollama_ocr_pdf(
             "local_ollama requires PyMuPDF. Install it in the active Supsidian Python environment."
         ) from exc
 
-    log(f"Starting local Ollama OCR: {pdf_file}")
     render_scale = 200 / 72
-    markdown_parts = []
+    page_transcriptions = []
 
     try:
         document = fitz.open(pdf_file)
@@ -583,16 +584,378 @@ def local_ollama_ocr_pdf(
                         f"{json.dumps(response_data)}"
                     )
 
-                if page_number == 1:
-                    markdown_parts.append(f"## Page {page_number}\n\n")
-                else:
-                    markdown_parts.append(f"\n\n---\n\n## Page {page_number}\n\n")
-                markdown_parts.append(page_markdown.strip())
+                page_transcriptions.append(page_markdown.strip())
     finally:
         document.close()
 
-    log(f"Local Ollama OCR finished: {pdf_file}")
+    return page_transcriptions
+
+
+def format_ocr_pages(page_transcriptions: list[str]) -> str:
+    markdown_parts = []
+
+    for page_number, page_markdown in enumerate(page_transcriptions, start=1):
+        if page_number == 1:
+            markdown_parts.append(f"## Page {page_number}\n\n")
+        else:
+            markdown_parts.append(f"\n\n---\n\n## Page {page_number}\n\n")
+        markdown_parts.append(page_markdown)
+
     return "".join(markdown_parts).strip() + "\n"
+
+
+def local_ollama_ocr_pdf(
+    pdf_file: Path,
+    image_dir: Path,
+    obsidian_image_folder: str,
+) -> str:
+    log(f"Starting local Ollama OCR: {pdf_file}")
+    page_transcriptions = ollama_ocr_pdf_pages(pdf_file)
+    log(f"Local Ollama OCR finished: {pdf_file}")
+    return format_ocr_pages(page_transcriptions)
+
+
+HTML_TABLE_PATTERN = re.compile(r"<table\b[^>]*>.*?</table\s*>", re.IGNORECASE | re.DOTALL)
+MARKER_IMAGE_LINK_PATTERN = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+MARKER_PAGE_FILENAME_PATTERN = re.compile(
+    r"(?:^|[-_ ])page[-_ ]?0*(\d+)(?:[-_ ].*)?$",
+    re.IGNORECASE,
+)
+MARKER_PAGE_HEADING_PATTERN = re.compile(r"^#{1,6}\s+.*?\bpage\s+(\d+)\b", re.IGNORECASE)
+MARKER_SUSPICIOUS_FULL_PAGE_PATTERN = re.compile(
+    r"(?:^|[-_ ])(?:full[-_ ]?page|page[-_ ]?render|rendered[-_ ]?page)(?:[-_ ]|$)",
+    re.IGNORECASE,
+)
+MARKER_NUMBERED_PAGE_RENDER_PATTERN = re.compile(
+    r"^[-_ ]*page[-_ ]?0*\d+[-_ ]*$",
+    re.IGNORECASE,
+)
+
+
+class SimpleHTMLTableParser(HTMLParser):
+    """Parse flat HTML tables conservatively, with an optional forgiving mode."""
+
+    def __init__(self, forgiving: bool = False) -> None:
+        super().__init__(convert_charrefs=True)
+        self.forgiving = forgiving
+        self.rows: list[list[tuple[str, list[str]]]] = []
+        self.current_row: list[tuple[str, list[str]]] | None = None
+        self.current_cell: list[str] | None = None
+        self.formatting_tags: list[str] = []
+        self.table_depth = 0
+        self.valid = True
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        attribute_names = {name.lower() for name, _ in attrs}
+
+        if tag == "table":
+            self.table_depth += 1
+            if self.table_depth != 1:
+                self.valid = False
+            return
+        if tag in {"thead", "tbody", "tfoot"}:
+            return
+        if tag == "tr":
+            if self.current_row is not None or self.table_depth != 1:
+                self.valid = False
+            self.current_row = []
+            return
+        if tag in {"th", "td"}:
+            if self.current_row is None or self.current_cell is not None:
+                self.valid = False
+                return
+            if {"rowspan", "colspan"} & attribute_names:
+                self.valid = False
+                return
+            self.current_cell = []
+            self.current_row.append((tag, self.current_cell))
+            return
+        if tag == "br" and self.current_cell is not None:
+            self.current_cell.append("\n")
+            return
+        if self.forgiving and tag in {"i", "em", "b", "strong"} and self.current_cell is not None:
+            self.formatting_tags.append(tag)
+            return
+        if self.forgiving and tag == "sup" and self.current_cell is not None:
+            self.current_cell.append("^")
+            self.formatting_tags.append(tag)
+            return
+        self.valid = False
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag == "table":
+            self.table_depth -= 1
+            if self.table_depth < 0:
+                self.valid = False
+            return
+        if tag in {"thead", "tbody", "tfoot"}:
+            return
+        if tag in {"th", "td"}:
+            if self.current_cell is None:
+                self.valid = False
+            self.current_cell = None
+            return
+        if tag == "tr":
+            if self.current_row is None or self.current_cell is not None:
+                self.valid = False
+                return
+            self.rows.append(self.current_row)
+            self.current_row = None
+            return
+        if self.forgiving and tag in {"i", "em", "b", "strong", "sup"}:
+            if not self.formatting_tags or self.formatting_tags.pop() != tag:
+                self.valid = False
+            return
+        if tag != "br":
+            self.valid = False
+
+    def handle_data(self, data: str) -> None:
+        if self.current_cell is not None:
+            self.current_cell.append(data)
+        elif data.strip():
+            self.valid = False
+
+    def close(self) -> None:
+        super().close()
+        if (
+            self.table_depth != 0
+            or self.current_row is not None
+            or self.current_cell is not None
+            or self.formatting_tags
+        ):
+            self.valid = False
+
+
+def markdown_cell(cell_parts: list[str]) -> str:
+    lines = [" ".join(part.split()) for part in "".join(cell_parts).splitlines()]
+    value = " / ".join(part for part in lines if part)
+    return value.replace("|", "\\|")
+
+
+def html_table_to_markdown(html_table: str, forgiving: bool = False) -> str | None:
+    parser = SimpleHTMLTableParser(forgiving=forgiving)
+    try:
+        parser.feed(html_table)
+        parser.close()
+    except Exception:
+        return None
+
+    if not parser.valid or not parser.rows:
+        return None
+
+    column_count = max(len(row) for row in parser.rows)
+    if column_count == 0 or (not forgiving and any(len(row) != column_count for row in parser.rows)):
+        return None
+
+    header_index = next(
+        (index for index, row in enumerate(parser.rows) if all(tag == "th" for tag, _ in row)),
+        None,
+    )
+    if forgiving:
+        for index, row in enumerate(parser.rows):
+            padding_tag = "th" if index == header_index else "td"
+            row.extend((padding_tag, []) for _ in range(column_count - len(row)))
+
+    if header_index is None:
+        header = [""] * column_count
+        body_rows = parser.rows
+    else:
+        header = [markdown_cell(cell) for _, cell in parser.rows[header_index]]
+        body_rows = parser.rows[:header_index] + parser.rows[header_index + 1 :]
+
+    markdown_lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join("---" for _ in range(column_count)) + " |",
+    ]
+    for row in body_rows:
+        markdown_lines.append("| " + " | ".join(markdown_cell(cell) for _, cell in row) + " |")
+    return "\n".join(markdown_lines)
+
+
+def convert_html_tables(text: str, forgiving: bool = False) -> tuple[str, int, int]:
+    converted_count = 0
+    unchanged_count = 0
+
+    def replace_table(match: re.Match[str]) -> str:
+        nonlocal converted_count, unchanged_count
+        markdown_table = html_table_to_markdown(match.group(0), forgiving=forgiving)
+        if markdown_table is None:
+            unchanged_count += 1
+            return match.group(0)
+        converted_count += 1
+        return markdown_table
+
+    return HTML_TABLE_PATTERN.sub(replace_table, text), converted_count, unchanged_count
+
+
+def is_path_inside(path: Path, directory: Path) -> bool:
+    try:
+        path.relative_to(directory.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def marker_page_index_from_filename(path: Path) -> int | None:
+    match = MARKER_PAGE_FILENAME_PATTERN.match(path.stem)
+    return int(match.group(1)) if match else None
+
+
+def nearby_marker_text(lines: list[str], image_line_index: int, step: int) -> str | None:
+    index = image_line_index + step
+    while 0 <= index < len(lines):
+        candidate = lines[index].strip()
+        if candidate and not MARKER_IMAGE_LINK_PATTERN.search(candidate):
+            return candidate
+        index += step
+    return None
+
+
+def run_hybrid_marker(pdf_file: Path, marker_output_dir: Path) -> None:
+    marker_command = shutil.which(HYBRID_MARKER_COMMAND)
+    if not marker_command:
+        raise RuntimeError(
+            "hybrid_marker_olmocr requires marker_single. Install Marker and ensure "
+            "marker_single is on PATH."
+        )
+
+    marker_output_dir.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        [marker_command, str(pdf_file), "--output_dir", str(marker_output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().replace("\n", " ")
+        detail = detail[:1000] or "no output"
+        raise RuntimeError(f"Marker failed with exit status {result.returncode}: {detail}")
+
+
+def copy_marker_visuals(marker_dir: Path, extracted_visual_dir: Path) -> list[dict]:
+    """Copy only Marker-declared local image assets into the note attachment folder."""
+    visuals: list[dict] = []
+    copied_sources: set[Path] = set()
+    page_visual_counts: dict[int, int] = {}
+    unassigned_visual_count = 0
+    extracted_visual_dir.mkdir(parents=True, exist_ok=True)
+
+    for markdown_file in sorted(marker_dir.rglob("*.md")):
+        markdown_text = markdown_file.read_text(encoding="utf-8", errors="replace")
+        markdown_lines = markdown_text.splitlines()
+        current_page: int | None = None
+
+        for line_number, line in enumerate(markdown_lines, start=1):
+            heading_match = MARKER_PAGE_HEADING_PATTERN.match(line.strip())
+            if heading_match:
+                current_page = int(heading_match.group(1))
+
+            for link_match in MARKER_IMAGE_LINK_PATTERN.finditer(line):
+                raw_link = link_match.group(1).strip()
+                if raw_link.startswith(("http://", "https://", "data:", "#")):
+                    continue
+
+                source_path = (markdown_file.parent / raw_link).resolve()
+                if (
+                    not is_path_inside(source_path, marker_dir)
+                    or not source_path.is_file()
+                    or source_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+                    or MARKER_SUSPICIOUS_FULL_PAGE_PATTERN.search(source_path.stem)
+                    or MARKER_NUMBERED_PAGE_RENDER_PATTERN.match(source_path.stem)
+                    or source_path in copied_sources
+                ):
+                    continue
+
+                marker_page_index = marker_page_index_from_filename(source_path)
+                assigned_page = marker_page_index + 1 if marker_page_index is not None else current_page
+
+                if assigned_page is not None:
+                    page_visual_counts[assigned_page] = page_visual_counts.get(assigned_page, 0) + 1
+                    visual_index = page_visual_counts[assigned_page]
+                    destination_name = (
+                        f"page-{assigned_page:03d}-visual-{visual_index:03d}{source_path.suffix.lower()}"
+                    )
+                else:
+                    unassigned_visual_count += 1
+                    destination_name = (
+                        f"marker-visual-{unassigned_visual_count:03d}{source_path.suffix.lower()}"
+                    )
+
+                destination = extracted_visual_dir / destination_name
+                while destination.exists():
+                    visual_index = page_visual_counts.get(assigned_page, unassigned_visual_count) + 1
+                    if assigned_page is not None:
+                        page_visual_counts[assigned_page] = visual_index
+                        destination = extracted_visual_dir / (
+                            f"page-{assigned_page:03d}-visual-{visual_index:03d}"
+                            f"{source_path.suffix.lower()}"
+                        )
+                    else:
+                        unassigned_visual_count = visual_index
+                        destination = extracted_visual_dir / (
+                            f"marker-visual-{visual_index:03d}{source_path.suffix.lower()}"
+                        )
+
+                shutil.copy2(source_path, destination)
+                copied_sources.add(source_path)
+                visuals.append(
+                    {
+                        "copied_filename": destination.name,
+                        "assigned_page": assigned_page,
+                        "marker_page_index": marker_page_index,
+                        "marker_text_before": nearby_marker_text(markdown_lines, line_number - 1, -1),
+                        "marker_text_after": nearby_marker_text(markdown_lines, line_number - 1, 1),
+                    }
+                )
+
+    return visuals
+
+
+def normalize_anchor(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+def unique_anchor_line_index(lines: list[str], anchor: str | None) -> int | None:
+    if not anchor:
+        return None
+    normalized_anchor = normalize_anchor(anchor)
+    if not normalized_anchor:
+        return None
+    matches = [
+        index for index, line in enumerate(lines) if normalize_anchor(line) == normalized_anchor
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def insert_markdown_image(lines: list[str], position: int, image_embed: str) -> list[str]:
+    insertion = [image_embed]
+    if position > 0 and lines[position - 1].strip():
+        insertion.insert(0, "")
+    if position < len(lines) and lines[position].strip():
+        insertion.append("")
+    return lines[:position] + insertion + lines[position:]
+
+
+def place_visual_by_marker_order(page_text: str, visual: dict, image_embed: str) -> tuple[str, bool]:
+    lines = page_text.splitlines()
+
+    following_index = unique_anchor_line_index(lines, visual.get("marker_text_after"))
+    if following_index is not None:
+        return "\n".join(insert_markdown_image(lines, following_index, image_embed)), True
+
+    previous_index = unique_anchor_line_index(lines, visual.get("marker_text_before"))
+    if previous_index is not None:
+        return "\n".join(insert_markdown_image(lines, previous_index + 1, image_embed)), True
+
+    return page_text, False
+
+
+def append_extracted_visuals(page_text: str, image_embeds: list[str]) -> str:
+    if not image_embeds:
+        return page_text
+    return page_text.rstrip() + "\n\n### Extracted visuals\n\n" + "\n\n".join(image_embeds)
 
 
 def hybrid_marker_olmocr_pdf(
@@ -600,10 +963,60 @@ def hybrid_marker_olmocr_pdf(
     image_dir: Path,
     obsidian_image_folder: str,
 ) -> str:
-    raise RuntimeError(
-        "OCR provider 'hybrid_marker_olmocr' is not implemented yet. Use 'mistral' or "
-        "continue testing with scripts/hybrid_marker_olmocr_test.py."
+    log(f"Starting hybrid Marker + Ollama OCR: {pdf_file}")
+
+    with tempfile.TemporaryDirectory(prefix="supsidian-hybrid-marker-") as temporary_directory:
+        marker_dir = Path(temporary_directory) / "marker_output"
+        run_hybrid_marker(pdf_file, marker_dir)
+
+        page_transcriptions = ollama_ocr_pdf_pages(pdf_file)
+        page_transcriptions = [
+            convert_html_tables(page_text, forgiving=True)[0]
+            for page_text in page_transcriptions
+        ]
+
+        extracted_visual_dir = image_dir / "extracted_visuals"
+        visuals = copy_marker_visuals(marker_dir, extracted_visual_dir)
+        fallback_embeds: dict[int, list[str]] = {}
+        placed_count = 0
+
+        for visual in visuals:
+            assigned_page = visual["assigned_page"]
+            if assigned_page is None and len(page_transcriptions) == 1:
+                assigned_page = 1
+                visual["assigned_page"] = assigned_page
+
+            if assigned_page is None or not 1 <= assigned_page <= len(page_transcriptions):
+                log(f"Skipping unassigned Marker visual embed: {visual['copied_filename']}")
+                continue
+
+            image_embed = (
+                f"![[{obsidian_image_folder}/extracted_visuals/{visual['copied_filename']}]]"
+            )
+            page_index = assigned_page - 1
+            updated_text, was_placed = place_visual_by_marker_order(
+                page_transcriptions[page_index],
+                visual,
+                image_embed,
+            )
+            if was_placed:
+                page_transcriptions[page_index] = updated_text
+                placed_count += 1
+            else:
+                fallback_embeds.setdefault(assigned_page, []).append(image_embed)
+
+        for page_number, image_embeds in fallback_embeds.items():
+            page_index = page_number - 1
+            page_transcriptions[page_index] = append_extracted_visuals(
+                page_transcriptions[page_index],
+                image_embeds,
+            )
+
+    log(
+        f"Hybrid Marker + Ollama OCR finished: {pdf_file} "
+        f"({len(visuals)} visual(s), {placed_count} placed by Marker order)"
     )
+    return format_ocr_pages(page_transcriptions)
 
 
 def ocr_pdf(pdf_file: Path, image_dir: Path, obsidian_image_folder: str) -> str:
@@ -951,6 +1364,10 @@ def setup() -> None:
             existing_config.get("local_ollama_num_ctx"),
             DEFAULT_CONFIG["local_ollama_num_ctx"],
         )
+        hybrid_marker_command = (
+            str(existing_config.get("hybrid_marker_command", DEFAULT_CONFIG["hybrid_marker_command"])).strip()
+            or DEFAULT_CONFIG["hybrid_marker_command"]
+        )
 
         new_config = {
             "source_dir": source_dir,
@@ -968,6 +1385,7 @@ def setup() -> None:
             "local_ollama_url": local_ollama_url,
             "local_ollama_model": local_ollama_model,
             "local_ollama_num_ctx": local_ollama_num_ctx,
+            "hybrid_marker_command": hybrid_marker_command,
         }
 
         CONFIG_FILE.write_text(
@@ -1327,7 +1745,7 @@ def diagnose() -> None:
             f"not required for OCR provider '{OCR_PROVIDER}'",
         )
 
-    if OCR_PROVIDER == "local_ollama":
+    if OCR_PROVIDER in {"local_ollama", "hybrid_marker_olmocr"}:
         (
             pymupdf_ok,
             pymupdf_detail,
@@ -1343,6 +1761,23 @@ def diagnose() -> None:
             model_ok,
             model_detail,
         )
+        if OCR_PROVIDER == "hybrid_marker_olmocr":
+            marker_command_path = shutil.which(HYBRID_MARKER_COMMAND)
+            add_check(
+                "Marker command is configured",
+                bool(HYBRID_MARKER_COMMAND),
+                HYBRID_MARKER_COMMAND or "missing",
+            )
+            add_check(
+                "Marker command is available",
+                marker_command_path is not None,
+                str(marker_command_path)
+                if marker_command_path
+                else (
+                    f"'{HYBRID_MARKER_COMMAND}' not found; install Marker and ensure "
+                    "marker_single is on PATH"
+                ),
+            )
     elif provider_supported and OCR_PROVIDER != "mistral":
         add_check(
             "Selected OCR provider is available",
@@ -1486,10 +1921,14 @@ def show_status() -> None:
         print(f"Mistral API key:  {'yes' if os.environ.get('MISTRAL_API_KEY') else 'no'}")
     else:
         print("Mistral API key:  not required")
-    if OCR_PROVIDER == "local_ollama":
+    if OCR_PROVIDER in {"local_ollama", "hybrid_marker_olmocr"}:
         print(f"Ollama URL:       {LOCAL_OLLAMA_URL}")
         print(f"Ollama model:     {LOCAL_OLLAMA_MODEL}")
         print(f"Ollama num_ctx:   {LOCAL_OLLAMA_NUM_CTX}")
+    if OCR_PROVIDER == "hybrid_marker_olmocr":
+        marker_command_path = shutil.which(HYBRID_MARKER_COMMAND)
+        print(f"Marker command:   {HYBRID_MARKER_COMMAND}")
+        print(f"Marker path:      {marker_command_path or 'not found'}")
     print(f"supernote-tool:   {SUPERNOTE_TOOL_PATH}")
     print("")
 
