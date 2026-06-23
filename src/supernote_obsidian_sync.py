@@ -798,18 +798,58 @@ def ask_bool(prompt: str, default: bool = True) -> bool:
     return answer in ("y", "yes", "j", "ja", "true", "1")
 
 
-def read_existing_config_for_setup() -> dict:
+def read_raw_config_for_setup() -> dict:
     if not CONFIG_FILE.exists():
-        return DEFAULT_CONFIG.copy()
+        return {}
 
     try:
-        existing_config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        raw_config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        existing_config = {}
+        return {}
+
+    return raw_config if isinstance(raw_config, dict) else {}
+
+
+def read_existing_config_for_setup() -> dict:
+    existing_config = read_raw_config_for_setup()
 
     config_for_setup = DEFAULT_CONFIG.copy()
     config_for_setup.update(existing_config)
     return config_for_setup
+
+
+def choose_setup_ocr_provider(config_existed: bool, raw_config: dict) -> str:
+    explicit_provider = str(raw_config.get("ocr_provider", "")).strip().lower()
+
+    if explicit_provider in {"local_ollama", "mistral"}:
+        default_provider = explicit_provider
+    elif not config_existed:
+        default_provider = "local_ollama"
+    else:
+        default_provider = "mistral"
+        if explicit_provider:
+            print(
+                f"\nExisting OCR provider '{explicit_provider}' is not selectable in setup yet. "
+                "Choose local_ollama or mistral.\n"
+            )
+
+    default_choice = "1" if default_provider == "local_ollama" else "2"
+
+    while True:
+        choice = ask(
+            "OCR strategy:\n"
+            "1. local_ollama — local/private OCR; requires Ollama, PyMuPDF, and the model\n"
+            "2. mistral — cloud OCR; requires a Mistral API key\n"
+            "Choose OCR strategy (1 or 2)",
+            default_choice,
+        ).strip().lower()
+
+        if choice in {"1", "local_ollama"}:
+            return "local_ollama"
+        if choice in {"2", "mistral"}:
+            return "mistral"
+
+        print("Please choose 1 for local_ollama or 2 for mistral.")
 
 
 def setup() -> None:
@@ -823,14 +863,17 @@ def setup() -> None:
     print(f"Settings folder:\n{APP_SUPPORT_DIR}\n")
 
     should_update_config = True
+    config_existed = CONFIG_FILE.exists()
+    selected_ocr_provider = OCR_PROVIDER
 
-    if CONFIG_FILE.exists():
+    if config_existed:
         should_update_config = ask_bool(
             f"Config already exists:\n{CONFIG_FILE}\n\nDo you want to update it interactively?",
             default=True,
         )
 
     if should_update_config:
+        raw_existing_config = read_raw_config_for_setup()
         existing_config = read_existing_config_for_setup()
 
         print("\nPlease enter your settings.\n")
@@ -894,10 +937,8 @@ def setup() -> None:
             bool(existing_config.get("open_requires_obsidian_running", True)),
         )
 
-        ocr_provider = (
-            str(existing_config.get("ocr_provider", "mistral")).strip().lower()
-            or "mistral"
-        )
+        ocr_provider = choose_setup_ocr_provider(config_existed, raw_existing_config)
+        selected_ocr_provider = ocr_provider
         local_ollama_url = (
             str(existing_config.get("local_ollama_url", DEFAULT_CONFIG["local_ollama_url"])).strip()
             or DEFAULT_CONFIG["local_ollama_url"]
@@ -938,33 +979,55 @@ def setup() -> None:
     else:
         print("Keeping existing config.\n")
 
-    if ENV_FILE.exists():
-        update_env = ask_bool(
-            f".env already exists:\n{ENV_FILE}\n\nDo you want to update your Mistral API key?",
-            default=False,
-        )
-    else:
-        update_env = True
-
-    if update_env:
-        current_key = os.environ.get("MISTRAL_API_KEY", "")
-        default_display = "keep existing key" if current_key else "your_mistral_api_key_here"
-
-        api_key = ask(
-            "Mistral API key",
-            default_display,
-        )
-
-        if api_key == "keep existing key":
-            print("Keeping existing Mistral API key.")
-        else:
-            ENV_FILE.write_text(
-                f"MISTRAL_API_KEY={api_key}\n",
-                encoding="utf-8",
+    if selected_ocr_provider == "mistral":
+        if ENV_FILE.exists():
+            update_env = ask_bool(
+                f".env already exists:\n{ENV_FILE}\n\nDo you want to update your Mistral API key?",
+                default=False,
             )
-            print(f"✅ .env written:\n{ENV_FILE}\n")
+        else:
+            update_env = True
+
+        if update_env:
+            current_key = os.environ.get("MISTRAL_API_KEY", "")
+            default_display = "keep existing key" if current_key else "your_mistral_api_key_here"
+
+            api_key = ask(
+                "Mistral API key",
+                default_display,
+            )
+
+            if api_key == "keep existing key":
+                print("Keeping existing Mistral API key.")
+            else:
+                ENV_FILE.write_text(
+                    f"MISTRAL_API_KEY={api_key}\n",
+                    encoding="utf-8",
+                )
+                print(f"✅ .env written:\n{ENV_FILE}\n")
+        else:
+            print("Keeping existing .env file.\n")
+    elif selected_ocr_provider == "local_ollama":
+        print("Mistral API key is not required for local_ollama. Leaving .env unchanged.\n")
+
+        (
+            pymupdf_ok,
+            pymupdf_detail,
+            ollama_ok,
+            ollama_detail,
+            model_ok,
+            model_detail,
+        ) = local_ollama_diagnostics()
+        print("Local Ollama setup checks (non-blocking):")
+        print(f"{'✅' if pymupdf_ok else '⚠️'} PyMuPDF — {pymupdf_detail}")
+        print(f"{'✅' if ollama_ok else '⚠️'} Ollama — {ollama_detail}")
+        print(f"{'✅' if model_ok else '⚠️'} Model '{LOCAL_OLLAMA_MODEL}' — {model_detail}")
+        print("")
     else:
-        print("Keeping existing .env file.\n")
+        print(
+            f"Mistral API key is not required for OCR provider '{selected_ocr_provider}'. "
+            "Leaving .env unchanged.\n"
+        )
 
     print("Setup complete.")
     print("")
