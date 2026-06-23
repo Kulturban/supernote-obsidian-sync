@@ -1234,7 +1234,7 @@ def read_existing_config_for_setup() -> dict:
 def choose_setup_ocr_provider(config_existed: bool, raw_config: dict) -> str:
     explicit_provider = str(raw_config.get("ocr_provider", "")).strip().lower()
 
-    if explicit_provider in {"local_ollama", "mistral"}:
+    if explicit_provider in {"local_ollama", "mistral", "hybrid_marker_olmocr"}:
         default_provider = explicit_provider
     elif not config_existed:
         default_provider = "local_ollama"
@@ -1242,18 +1242,23 @@ def choose_setup_ocr_provider(config_existed: bool, raw_config: dict) -> str:
         default_provider = "mistral"
         if explicit_provider:
             print(
-                f"\nExisting OCR provider '{explicit_provider}' is not selectable in setup yet. "
-                "Choose local_ollama or mistral.\n"
+                f"\nExisting OCR provider '{explicit_provider}' is not selectable in setup. "
+                "Choose local_ollama, mistral, or hybrid_marker_olmocr.\n"
             )
 
-    default_choice = "1" if default_provider == "local_ollama" else "2"
+    default_choice = {
+        "local_ollama": "1",
+        "mistral": "2",
+        "hybrid_marker_olmocr": "3",
+    }[default_provider]
 
     while True:
         choice = ask(
             "OCR strategy:\n"
-            "1. local_ollama — local/private OCR; requires Ollama, PyMuPDF, and the model\n"
-            "2. mistral — cloud OCR; requires a Mistral API key\n"
-            "Choose OCR strategy (1 or 2)",
+            "1. local_ollama — Local Ollama OCR; private/local; requires Ollama, PyMuPDF, and the model\n"
+            "2. mistral — Mistral cloud OCR; requires a Mistral API key\n"
+            "3. hybrid_marker_olmocr — Experimental: local Ollama OCR + Marker visual extraction\n"
+            "Choose OCR strategy (1, 2, or 3)",
             default_choice,
         ).strip().lower()
 
@@ -1261,8 +1266,49 @@ def choose_setup_ocr_provider(config_existed: bool, raw_config: dict) -> str:
             return "local_ollama"
         if choice in {"2", "mistral"}:
             return "mistral"
+        if choice in {"3", "hybrid_marker_olmocr", "hybrid"}:
+            return "hybrid_marker_olmocr"
 
-        print("Please choose 1 for local_ollama or 2 for mistral.")
+        print(
+            "Please choose 1 for local_ollama, 2 for mistral, "
+            "or 3 for hybrid_marker_olmocr."
+        )
+
+
+def print_local_provider_setup_checks(provider: str, marker_command: str) -> None:
+    """Print non-blocking setup checks shared by the local OCR providers."""
+    (
+        pymupdf_ok,
+        pymupdf_detail,
+        ollama_ok,
+        ollama_detail,
+        model_ok,
+        model_detail,
+    ) = local_ollama_diagnostics()
+
+    if provider == "hybrid_marker_olmocr":
+        print("Hybrid Marker + Ollama setup checks (non-blocking):")
+    else:
+        print("Local Ollama setup checks (non-blocking):")
+
+    print(f"{'✅' if pymupdf_ok else '⚠️'} PyMuPDF — {pymupdf_detail}")
+    print(f"{'✅' if ollama_ok else '⚠️'} Ollama — {ollama_detail}")
+    print(f"{'✅' if model_ok else '⚠️'} Model '{LOCAL_OLLAMA_MODEL}' — {model_detail}")
+    if not model_ok:
+        print(f"   Run: ollama pull {LOCAL_OLLAMA_MODEL}")
+
+    if provider == "hybrid_marker_olmocr":
+        marker_command_path = shutil.which(marker_command)
+        print(f"{'✅' if marker_command_path else '⚠️'} Marker command — {marker_command}")
+        print(
+            "⚠️ Experimental provider selected. Marker must be installed, and marker_single "
+            "must be available to Supsidian’s app/LaunchAgent runtime. If it is not found, "
+            "use an absolute hybrid_marker_command path."
+        )
+        if marker_command_path:
+            print(f"   Resolved path: {marker_command_path}")
+
+    print("")
 
 
 def setup() -> None:
@@ -1278,6 +1324,7 @@ def setup() -> None:
     should_update_config = True
     config_existed = CONFIG_FILE.exists()
     selected_ocr_provider = OCR_PROVIDER
+    setup_marker_command = HYBRID_MARKER_COMMAND
 
     if config_existed:
         should_update_config = ask_bool(
@@ -1368,6 +1415,17 @@ def setup() -> None:
             str(existing_config.get("hybrid_marker_command", DEFAULT_CONFIG["hybrid_marker_command"])).strip()
             or DEFAULT_CONFIG["hybrid_marker_command"]
         )
+        if ocr_provider == "hybrid_marker_olmocr":
+            print(
+                "\nHybrid Marker + Ollama is Experimental. Marker must be installed, and an "
+                "absolute marker_single path may be needed when the app/LaunchAgent PATH "
+                "cannot find it.\n"
+            )
+            hybrid_marker_command = ask(
+                "Path or command for marker_single",
+                hybrid_marker_command,
+            ).strip() or hybrid_marker_command
+        setup_marker_command = hybrid_marker_command
 
         new_config = {
             "source_dir": source_dir,
@@ -1425,22 +1483,12 @@ def setup() -> None:
                 print(f"✅ .env written:\n{ENV_FILE}\n")
         else:
             print("Keeping existing .env file.\n")
-    elif selected_ocr_provider == "local_ollama":
-        print("Mistral API key is not required for local_ollama. Leaving .env unchanged.\n")
-
-        (
-            pymupdf_ok,
-            pymupdf_detail,
-            ollama_ok,
-            ollama_detail,
-            model_ok,
-            model_detail,
-        ) = local_ollama_diagnostics()
-        print("Local Ollama setup checks (non-blocking):")
-        print(f"{'✅' if pymupdf_ok else '⚠️'} PyMuPDF — {pymupdf_detail}")
-        print(f"{'✅' if ollama_ok else '⚠️'} Ollama — {ollama_detail}")
-        print(f"{'✅' if model_ok else '⚠️'} Model '{LOCAL_OLLAMA_MODEL}' — {model_detail}")
-        print("")
+    elif selected_ocr_provider in {"local_ollama", "hybrid_marker_olmocr"}:
+        print(
+            f"Mistral API key is not required for {selected_ocr_provider}. "
+            "Leaving .env unchanged.\n"
+        )
+        print_local_provider_setup_checks(selected_ocr_provider, setup_marker_command)
     else:
         print(
             f"Mistral API key is not required for OCR provider '{selected_ocr_provider}'. "

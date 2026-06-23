@@ -88,6 +88,114 @@ def test_legacy_or_empty_provider_effectively_defaults_to_mistral(
     assert module.OCR_PROVIDER == "mistral"
 
 
+@pytest.mark.parametrize(
+    ("config_existed", "raw_config", "expected_provider", "expected_default"),
+    [
+        (False, {}, "local_ollama", "1"),
+        (True, {}, "mistral", "2"),
+        (True, {"ocr_provider": "local_ollama"}, "local_ollama", "1"),
+        (True, {"ocr_provider": "mistral"}, "mistral", "2"),
+        (
+            True,
+            {"ocr_provider": "hybrid_marker_olmocr"},
+            "hybrid_marker_olmocr",
+            "3",
+        ),
+    ],
+)
+def test_setup_provider_defaults(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    config_existed: bool,
+    raw_config: dict,
+    expected_provider: str,
+    expected_default: str,
+) -> None:
+    module = load_sync_module()
+    prompts: list[tuple[str, str]] = []
+
+    def choose_default(prompt: str, default: str = "") -> str:
+        prompts.append((prompt, default))
+        return default
+
+    monkeypatch.setattr(module, "ask", choose_default)
+
+    assert module.choose_setup_ocr_provider(config_existed, raw_config) == expected_provider
+    assert prompts[-1][1] == expected_default
+
+
+@pytest.mark.parametrize(
+    ("choice", "expected_provider"),
+    [
+        ("3", "hybrid_marker_olmocr"),
+        ("hybrid", "hybrid_marker_olmocr"),
+    ],
+)
+def test_setup_provider_accepts_hybrid_choices(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    choice: str,
+    expected_provider: str,
+) -> None:
+    module = load_sync_module()
+    monkeypatch.setattr(module, "ask", lambda _prompt, _default="": choice)
+
+    assert module.choose_setup_ocr_provider(False, {}) == expected_provider
+
+
+def test_unknown_setup_provider_defaults_to_mistral(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = load_sync_module()
+    defaults: list[str] = []
+
+    def choose_default(_prompt: str, default: str = "") -> str:
+        defaults.append(default)
+        return default
+
+    monkeypatch.setattr(module, "ask", choose_default)
+
+    assert module.choose_setup_ocr_provider(True, {"ocr_provider": "unsupported"}) == "mistral"
+    assert defaults == ["2"]
+    assert "not selectable in setup" in capsys.readouterr().out
+
+
+def test_hybrid_setup_saves_marker_command_and_reports_missing_marker(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = load_sync_module()
+
+    def answer(prompt: str, default: str = "") -> str:
+        if prompt.startswith("OCR strategy"):
+            return "3"
+        if prompt.startswith("Path or command for marker_single"):
+            return "/custom/path/marker_single"
+        return default
+
+    monkeypatch.setattr(module, "ask", answer)
+    monkeypatch.setattr(module, "ask_bool", lambda _prompt, default=False: default)
+    monkeypatch.setattr(
+        module,
+        "local_ollama_diagnostics",
+        lambda: (True, "available", True, "reachable", False, "missing"),
+    )
+    monkeypatch.setattr(module.shutil, "which", lambda _command: None)
+
+    module.setup()
+
+    saved_config = json.loads(module.CONFIG_FILE.read_text(encoding="utf-8"))
+    assert saved_config["ocr_provider"] == "hybrid_marker_olmocr"
+    assert saved_config["hybrid_marker_command"] == "/custom/path/marker_single"
+    assert not module.ENV_FILE.exists()
+    output = capsys.readouterr().out
+    assert "Experimental provider selected" in output
+    assert "absolute hybrid_marker_command path" in output
+
+
 def test_format_ocr_pages_uses_provider_markdown_contract(load_sync_module) -> None:
     module = load_sync_module()
 
