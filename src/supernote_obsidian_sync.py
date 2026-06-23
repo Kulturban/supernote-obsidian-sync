@@ -5,8 +5,10 @@ import logging
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 from dotenv import load_dotenv
@@ -47,6 +49,9 @@ DEFAULT_CONFIG = {
     "task_tag": "#task",
     "open_requires_obsidian_running": True,
     "ocr_provider": "mistral",
+    "local_ollama_url": "http://localhost:11434/api/generate",
+    "local_ollama_model": "richardyoung/olmocr2:7b-q8",
+    "local_ollama_num_ctx": 8192,
 }
 
 APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -97,6 +102,14 @@ def load_config() -> dict:
 
 
 config = load_config()
+
+
+def positive_int_or_default(value: object, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 def slugify(value: str) -> str:
@@ -208,6 +221,15 @@ TASK_TAG = config.get("task_tag", "#task")
 OPEN_REQUIRES_OBSIDIAN_RUNNING = bool(config.get("open_requires_obsidian_running", True))
 CUSTOM_OCR_INSTRUCTION = str(config.get("custom_ocr_instruction", "")).strip()
 OCR_PROVIDER = str(config.get("ocr_provider", "mistral")).strip().lower() or "mistral"
+LOCAL_OLLAMA_URL = (
+    str(config.get("local_ollama_url", "http://localhost:11434/api/generate")).strip()
+    or "http://localhost:11434/api/generate"
+)
+LOCAL_OLLAMA_MODEL = (
+    str(config.get("local_ollama_model", "richardyoung/olmocr2:7b-q8")).strip()
+    or "richardyoung/olmocr2:7b-q8"
+)
+LOCAL_OLLAMA_NUM_CTX = positive_int_or_default(config.get("local_ollama_num_ctx"), 8192)
 SUPPORTED_OCR_PROVIDERS = (
     "mistral",
     "local_ollama",
@@ -345,6 +367,33 @@ def convert_note_to_pdf(note_file: Path, pdf_file: Path) -> None:
 # MISTRAL OCR
 # ------------------------------------------------------------
 
+LOCAL_OLLAMA_PROMPT = """You are doing OCR on handwritten school notes.
+Preserve the handwriting as exactly as possible.
+Do not correct spelling, grammar, wording, or mathematical notation.
+Keep line breaks where they help readability.
+
+Tables:
+If there is a table, convert it to a Markdown table.
+Do not use HTML tables.
+Do not use <table>, <tr>, <td>, or <th>.
+If a table cell is empty, leave the Markdown cell empty.
+If the table structure is unclear, write [unclear table] and then transcribe visible text line by line.
+
+Math:
+Only write mathematical notation when it is completely clear.
+Use plain text math where possible, for example x^2, sqrt(3), 7/3.
+Do not use LaTeX unless the handwriting clearly contains LaTeX.
+If a formula, symbol, exponent, fraction, root, or variable is uncertain, write [unclear formula].
+Do not guess.
+
+Drawings:
+If there is a drawing, write [drawing visible] and a short neutral label if obvious.
+Do not invent details.
+
+Do not invent missing content.
+Do not summarize.
+Return only the transcription."""
+
 def mistral_ocr_pdf(pdf_file: Path, image_dir: Path, obsidian_image_folder: str) -> str:
     api_key = os.environ.get("MISTRAL_API_KEY")
 
@@ -445,10 +494,105 @@ def local_ollama_ocr_pdf(
     image_dir: Path,
     obsidian_image_folder: str,
 ) -> str:
-    raise RuntimeError(
-        "OCR provider 'local_ollama' is not implemented yet. Use 'mistral' or "
-        "continue testing with scripts/hybrid_marker_olmocr_test.py."
-    )
+    try:
+        import fitz  # PyMuPDF
+    except ImportError as exc:
+        raise RuntimeError(
+            "local_ollama requires PyMuPDF. Install it in the active Supsidian Python environment."
+        ) from exc
+
+    log(f"Starting local Ollama OCR: {pdf_file}")
+    render_scale = 200 / 72
+    markdown_parts = []
+
+    try:
+        document = fitz.open(pdf_file)
+    except Exception as exc:
+        raise RuntimeError(f"Could not open PDF for local_ollama OCR: {pdf_file}: {exc}") from exc
+
+    try:
+        if len(document) == 0:
+            raise RuntimeError(f"PDF has no pages for local_ollama OCR: {pdf_file}")
+
+        with tempfile.TemporaryDirectory(prefix="supsidian-local-ocr-") as temporary_directory:
+            temporary_dir = Path(temporary_directory)
+
+            for page_number, page in enumerate(document, start=1):
+                page_path = temporary_dir / f"page-{page_number:03d}.png"
+                pixmap = page.get_pixmap(
+                    matrix=fitz.Matrix(render_scale, render_scale),
+                    alpha=False,
+                )
+                pixmap.save(page_path)
+
+                payload = {
+                    "model": LOCAL_OLLAMA_MODEL,
+                    "prompt": LOCAL_OLLAMA_PROMPT,
+                    "stream": False,
+                    "images": [base64.b64encode(page_path.read_bytes()).decode("ascii")],
+                    "options": {"num_ctx": LOCAL_OLLAMA_NUM_CTX},
+                }
+
+                try:
+                    response = requests.post(LOCAL_OLLAMA_URL, json=payload, timeout=600)
+                except requests.ConnectionError as exc:
+                    raise RuntimeError(
+                        f"Could not connect to Ollama at {LOCAL_OLLAMA_URL}. "
+                        "Start Ollama, then ensure the model is installed with: "
+                        f"ollama pull {LOCAL_OLLAMA_MODEL}"
+                    ) from exc
+                except requests.RequestException as exc:
+                    raise RuntimeError(
+                        f"Ollama request failed for page {page_number}: {exc}"
+                    ) from exc
+
+                if not response.ok:
+                    detail = response.text.strip()
+                    lower_detail = detail.lower()
+                    if response.status_code == 400 and "context" in lower_detail:
+                        raise RuntimeError(
+                            f"Ollama context overflow on page {page_number}: {detail}. "
+                            "Increase local_ollama_num_ctx."
+                        )
+                    if response.status_code == 404 or (
+                        "model" in lower_detail
+                        and any(
+                            message in lower_detail
+                            for message in ("not found", "unavailable", "does not exist", "unknown")
+                        )
+                    ):
+                        raise RuntimeError(
+                            f"Ollama model '{LOCAL_OLLAMA_MODEL}' is missing or unavailable. "
+                            f"Run: ollama pull {LOCAL_OLLAMA_MODEL}"
+                        )
+                    raise RuntimeError(
+                        f"Ollama returned HTTP {response.status_code} for page {page_number}: {detail}"
+                    )
+
+                try:
+                    response_data = response.json()
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"Ollama returned invalid JSON for page {page_number}: {response.text}"
+                    ) from exc
+
+                page_markdown = response_data.get("response")
+                if not isinstance(page_markdown, str):
+                    raise RuntimeError(
+                        f"Ollama did not return OCR text for page {page_number}: "
+                        f"{json.dumps(response_data)}"
+                    )
+
+                if page_number == 1:
+                    markdown_parts.append(f"## Page {page_number}\n\n")
+                else:
+                    markdown_parts.append(f"\n\n---\n\n## Page {page_number}\n\n")
+                markdown_parts.append(page_markdown.strip())
+    finally:
+        document.close()
+
+    log(f"Local Ollama OCR finished: {pdf_file}")
+    return "".join(markdown_parts).strip() + "\n"
 
 
 def hybrid_marker_olmocr_pdf(
@@ -754,6 +898,18 @@ def setup() -> None:
             str(existing_config.get("ocr_provider", "mistral")).strip().lower()
             or "mistral"
         )
+        local_ollama_url = (
+            str(existing_config.get("local_ollama_url", DEFAULT_CONFIG["local_ollama_url"])).strip()
+            or DEFAULT_CONFIG["local_ollama_url"]
+        )
+        local_ollama_model = (
+            str(existing_config.get("local_ollama_model", DEFAULT_CONFIG["local_ollama_model"])).strip()
+            or DEFAULT_CONFIG["local_ollama_model"]
+        )
+        local_ollama_num_ctx = positive_int_or_default(
+            existing_config.get("local_ollama_num_ctx"),
+            DEFAULT_CONFIG["local_ollama_num_ctx"],
+        )
 
         new_config = {
             "source_dir": source_dir,
@@ -768,6 +924,9 @@ def setup() -> None:
             "task_tag": task_tag,
             "open_requires_obsidian_running": open_requires_obsidian_running,
             "ocr_provider": ocr_provider,
+            "local_ollama_url": local_ollama_url,
+            "local_ollama_model": local_ollama_model,
+            "local_ollama_num_ctx": local_ollama_num_ctx,
         }
 
         CONFIG_FILE.write_text(
@@ -979,6 +1138,62 @@ def show_agent_status() -> None:
 # CLI COMMANDS
 # ------------------------------------------------------------
 
+def local_ollama_tags_url() -> str:
+    parsed = urlsplit(LOCAL_OLLAMA_URL)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(f"Invalid local_ollama_url: {LOCAL_OLLAMA_URL}")
+    return urlunsplit((parsed.scheme, parsed.netloc, "/api/tags", "", ""))
+
+
+def local_ollama_diagnostics() -> tuple[bool, str, bool, str, bool, str]:
+    try:
+        import fitz  # PyMuPDF  # noqa: F401
+        pymupdf_ok = True
+        pymupdf_detail = "available"
+    except ImportError:
+        pymupdf_ok = False
+        pymupdf_detail = "missing; install PyMuPDF in the active Supsidian Python environment"
+
+    try:
+        tags_url = local_ollama_tags_url()
+        response = requests.get(tags_url, timeout=5)
+        response.raise_for_status()
+        response_data = response.json()
+    except (ValueError, requests.RequestException) as exc:
+        return (
+            pymupdf_ok,
+            pymupdf_detail,
+            False,
+            f"unreachable: {exc}",
+            False,
+            f"cannot check while Ollama is unreachable; run: ollama pull {LOCAL_OLLAMA_MODEL}",
+        )
+
+    if not isinstance(response_data, dict):
+        return (
+            pymupdf_ok,
+            pymupdf_detail,
+            False,
+            f"invalid response from {tags_url}",
+            False,
+            f"cannot check while Ollama is unreachable; run: ollama pull {LOCAL_OLLAMA_MODEL}",
+        )
+
+    model_names = {
+        str(model.get("name") or model.get("model") or "")
+        for model in response_data.get("models", [])
+        if isinstance(model, dict)
+    }
+    model_available = LOCAL_OLLAMA_MODEL in model_names
+    return (
+        pymupdf_ok,
+        pymupdf_detail,
+        True,
+        tags_url,
+        model_available,
+        "available" if model_available else f"missing; run: ollama pull {LOCAL_OLLAMA_MODEL}",
+    )
+
 def diagnose() -> None:
     """
     Check whether the local setup looks correct.
@@ -1049,7 +1264,23 @@ def diagnose() -> None:
             f"not required for OCR provider '{OCR_PROVIDER}'",
         )
 
-    if provider_supported and OCR_PROVIDER != "mistral":
+    if OCR_PROVIDER == "local_ollama":
+        (
+            pymupdf_ok,
+            pymupdf_detail,
+            ollama_ok,
+            ollama_detail,
+            model_ok,
+            model_detail,
+        ) = local_ollama_diagnostics()
+        add_check("PyMuPDF is available", pymupdf_ok, pymupdf_detail)
+        add_check("Ollama is reachable", ollama_ok, ollama_detail)
+        add_check(
+            f"Ollama model '{LOCAL_OLLAMA_MODEL}' is available",
+            model_ok,
+            model_detail,
+        )
+    elif provider_supported and OCR_PROVIDER != "mistral":
         add_check(
             "Selected OCR provider is available",
             False,
@@ -1192,6 +1423,10 @@ def show_status() -> None:
         print(f"Mistral API key:  {'yes' if os.environ.get('MISTRAL_API_KEY') else 'no'}")
     else:
         print("Mistral API key:  not required")
+    if OCR_PROVIDER == "local_ollama":
+        print(f"Ollama URL:       {LOCAL_OLLAMA_URL}")
+        print(f"Ollama model:     {LOCAL_OLLAMA_MODEL}")
+        print(f"Ollama num_ctx:   {LOCAL_OLLAMA_NUM_CTX}")
     print(f"supernote-tool:   {SUPERNOTE_TOOL_PATH}")
     print("")
 
