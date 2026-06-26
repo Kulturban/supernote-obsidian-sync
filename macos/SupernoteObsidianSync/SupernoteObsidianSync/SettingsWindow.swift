@@ -47,6 +47,25 @@ struct NotebookConfig: Identifiable, Codable {
     }
 }
 
+enum OCRProvider: String, CaseIterable, Identifiable {
+    case mistral
+    case localOllama = "local_ollama"
+    case hybridMarkerOlmocr = "hybrid_marker_olmocr"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .mistral:
+            return "Mistral"
+        case .localOllama:
+            return "Local Ollama"
+        case .hybridMarkerOlmocr:
+            return "Hybrid Marker + Ollama — Experimental"
+        }
+    }
+}
+
 struct SyncConfig: Codable {
     var vault_dir: String
     var supernote_tool_path: String
@@ -56,6 +75,11 @@ struct SyncConfig: Codable {
     var task_tag: String
     var custom_ocr_instruction: String?
     var open_requires_obsidian_running: Bool
+    var ocr_provider: String
+    var local_ollama_url: String
+    var local_ollama_model: String
+    var local_ollama_num_ctx: Int
+    var hybrid_marker_command: String
     var notebooks: [NotebookConfig]
 
     static let `default` = SyncConfig(
@@ -67,8 +91,81 @@ struct SyncConfig: Codable {
         task_tag: "#task",
         custom_ocr_instruction: "",
         open_requires_obsidian_running: true,
+        ocr_provider: OCRProvider.localOllama.rawValue,
+        local_ollama_url: "http://localhost:11434/api/generate",
+        local_ollama_model: "richardyoung/olmocr2:7b-q8",
+        local_ollama_num_ctx: 8192,
+        hybrid_marker_command: "marker_single",
         notebooks: []
     )
+
+    enum CodingKeys: String, CodingKey {
+        case vault_dir
+        case supernote_tool_path
+        case check_interval_seconds
+        case file_stability_wait_seconds
+        case task_marker
+        case task_tag
+        case custom_ocr_instruction
+        case open_requires_obsidian_running
+        case ocr_provider
+        case local_ollama_url
+        case local_ollama_model
+        case local_ollama_num_ctx
+        case hybrid_marker_command
+        case notebooks
+    }
+
+    init(
+        vault_dir: String,
+        supernote_tool_path: String,
+        check_interval_seconds: Int,
+        file_stability_wait_seconds: Int,
+        task_marker: String,
+        task_tag: String,
+        custom_ocr_instruction: String?,
+        open_requires_obsidian_running: Bool,
+        ocr_provider: String,
+        local_ollama_url: String,
+        local_ollama_model: String,
+        local_ollama_num_ctx: Int,
+        hybrid_marker_command: String,
+        notebooks: [NotebookConfig]
+    ) {
+        self.vault_dir = vault_dir
+        self.supernote_tool_path = supernote_tool_path
+        self.check_interval_seconds = check_interval_seconds
+        self.file_stability_wait_seconds = file_stability_wait_seconds
+        self.task_marker = task_marker
+        self.task_tag = task_tag
+        self.custom_ocr_instruction = custom_ocr_instruction
+        self.open_requires_obsidian_running = open_requires_obsidian_running
+        self.ocr_provider = ocr_provider
+        self.local_ollama_url = local_ollama_url
+        self.local_ollama_model = local_ollama_model
+        self.local_ollama_num_ctx = local_ollama_num_ctx
+        self.hybrid_marker_command = hybrid_marker_command
+        self.notebooks = notebooks
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+
+        self.vault_dir = try container.decodeIfPresent(String.self, forKey: .vault_dir) ?? ""
+        self.supernote_tool_path = try container.decodeIfPresent(String.self, forKey: .supernote_tool_path) ?? ""
+        self.check_interval_seconds = try container.decodeIfPresent(Int.self, forKey: .check_interval_seconds) ?? 60
+        self.file_stability_wait_seconds = try container.decodeIfPresent(Int.self, forKey: .file_stability_wait_seconds) ?? 10
+        self.task_marker = try container.decodeIfPresent(String.self, forKey: .task_marker) ?? "#"
+        self.task_tag = try container.decodeIfPresent(String.self, forKey: .task_tag) ?? "#task"
+        self.custom_ocr_instruction = try container.decodeIfPresent(String.self, forKey: .custom_ocr_instruction)
+        self.open_requires_obsidian_running = try container.decodeIfPresent(Bool.self, forKey: .open_requires_obsidian_running) ?? true
+        self.ocr_provider = try container.decodeIfPresent(String.self, forKey: .ocr_provider) ?? OCRProvider.mistral.rawValue
+        self.local_ollama_url = try container.decodeIfPresent(String.self, forKey: .local_ollama_url) ?? "http://localhost:11434/api/generate"
+        self.local_ollama_model = try container.decodeIfPresent(String.self, forKey: .local_ollama_model) ?? "richardyoung/olmocr2:7b-q8"
+        self.local_ollama_num_ctx = try container.decodeIfPresent(Int.self, forKey: .local_ollama_num_ctx) ?? 8192
+        self.hybrid_marker_command = try container.decodeIfPresent(String.self, forKey: .hybrid_marker_command) ?? "marker_single"
+        self.notebooks = try container.decodeIfPresent([NotebookConfig].self, forKey: .notebooks) ?? []
+    }
 }
 
 enum SettingsSection: String, CaseIterable, Identifiable {
@@ -119,7 +216,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 enum SetupStep: String, CaseIterable, Identifiable {
     case obsidianVault
     case supernoteTool
-    case mistralApiKey
+    case ocrProvider
     case folders
 
     var id: String { rawValue }
@@ -130,7 +227,7 @@ enum SetupStep: String, CaseIterable, Identifiable {
             return 1
         case .supernoteTool:
             return 2
-        case .mistralApiKey:
+        case .ocrProvider:
             return 3
         case .folders:
             return 4
@@ -143,8 +240,8 @@ enum SetupStep: String, CaseIterable, Identifiable {
             return "Choose your Obsidian vault"
         case .supernoteTool:
             return "Connect supernote-tool"
-        case .mistralApiKey:
-            return "Add your Mistral API key"
+        case .ocrProvider:
+            return "Choose OCR provider"
         case .folders:
             return "Add a Supernote folder"
         }
@@ -156,8 +253,8 @@ enum SetupStep: String, CaseIterable, Identifiable {
             return "The app needs your Obsidian vault so it knows where to save Markdown files and attachments."
         case .supernoteTool:
             return "supernote-tool converts Supernote .note files into PDFs before they are sent to OCR."
-        case .mistralApiKey:
-            return "Mistral OCR turns handwriting into searchable Markdown text."
+        case .ocrProvider:
+            return "Choose how Supsidian should turn handwriting into searchable Markdown text."
         case .folders:
             return "Choose which Supernote folders should sync, and where they should appear in Obsidian."
         }
@@ -167,7 +264,7 @@ enum SetupStep: String, CaseIterable, Identifiable {
         switch self {
         case .obsidianVault, .supernoteTool:
             return "Open Obsidian Settings"
-        case .mistralApiKey:
+        case .ocrProvider:
             return "Open OCR & Tasks"
         case .folders:
             return "Open Folders"
@@ -178,7 +275,7 @@ enum SetupStep: String, CaseIterable, Identifiable {
         switch self {
         case .obsidianVault, .supernoteTool:
             return .obsidianSettings
-        case .mistralApiKey:
+        case .ocrProvider:
             return .ocrTasks
         case .folders:
             return .folders
@@ -191,8 +288,8 @@ enum SetupStep: String, CaseIterable, Identifiable {
             return "square.stack.3d.up"
         case .supernoteTool:
             return "wrench.and.screwdriver"
-        case .mistralApiKey:
-            return "key"
+        case .ocrProvider:
+            return "text.viewfinder"
         case .folders:
             return "folder.badge.plus"
         }
@@ -221,9 +318,16 @@ final class SettingsViewModel: ObservableObject {
     @Published var taskTag = "#task"
     @Published var customOcrInstruction = ""
     @Published var openRequiresObsidianRunning = true
+    @Published var ocrProvider = OCRProvider.localOllama.rawValue
+    @Published var localOllamaURL = "http://localhost:11434/api/generate"
+    @Published var localOllamaModel = "richardyoung/olmocr2:7b-q8"
+    @Published var localOllamaNumCtx = "8192"
+    @Published var hybridMarkerCommand = "marker_single"
     @Published var mistralApiKey = ""
     @Published var notebooks: [NotebookConfig] = []
     @Published var statusMessage = ""
+    @Published var localOCRStatusMessage = ""
+    @Published var isRunningLocalOCRCommand = false
     @Published var startAtLoginEnabled = false
     @Published var selectedSection: SettingsSection = .setup
 
@@ -295,6 +399,17 @@ final class SettingsViewModel: ObservableObject {
                 task_tag: taskTag,
                 custom_ocr_instruction: customOcrInstruction,
                 open_requires_obsidian_running: openRequiresObsidianRunning,
+                ocr_provider: selectedOCRProvider.rawValue,
+                local_ollama_url: localOllamaURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? "http://localhost:11434/api/generate"
+                    : localOllamaURL.trimmingCharacters(in: .whitespacesAndNewlines),
+                local_ollama_model: localOllamaModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? "richardyoung/olmocr2:7b-q8"
+                    : localOllamaModel.trimmingCharacters(in: .whitespacesAndNewlines),
+                local_ollama_num_ctx: parsedLocalOllamaNumCtx ?? 8192,
+                hybrid_marker_command: hybridMarkerCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? "marker_single"
+                    : hybridMarkerCommand.trimmingCharacters(in: .whitespacesAndNewlines),
                 notebooks: notebooks
             )
 
@@ -304,8 +419,11 @@ final class SettingsViewModel: ObservableObject {
             let data = try encoder.encode(config)
             try data.write(to: configURL)
 
-            let envText = "MISTRAL_API_KEY=\(mistralApiKey.trimmingCharacters(in: .whitespacesAndNewlines))\n"
-            try envText.write(to: envURL, atomically: true, encoding: .utf8)
+            let trimmedMistralKey = mistralApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            if selectedOCRProvider == .mistral || !trimmedMistralKey.isEmpty {
+                let envText = "MISTRAL_API_KEY=\(trimmedMistralKey)\n"
+                try envText.write(to: envURL, atomically: true, encoding: .utf8)
+            }
 
             if let nextStep = nextSetupStep {
                 statusMessage = "✅ Settings saved. Continue setup: \(nextStep.title)."
@@ -326,6 +444,11 @@ final class SettingsViewModel: ObservableObject {
         taskTag = config.task_tag
         customOcrInstruction = config.custom_ocr_instruction ?? ""
         openRequiresObsidianRunning = config.open_requires_obsidian_running
+        ocrProvider = OCRProvider(rawValue: config.ocr_provider)?.rawValue ?? OCRProvider.mistral.rawValue
+        localOllamaURL = config.local_ollama_url.isEmpty ? "http://localhost:11434/api/generate" : config.local_ollama_url
+        localOllamaModel = config.local_ollama_model.isEmpty ? "richardyoung/olmocr2:7b-q8" : config.local_ollama_model
+        localOllamaNumCtx = String(config.local_ollama_num_ctx > 0 ? config.local_ollama_num_ctx : 8192)
+        hybridMarkerCommand = config.hybrid_marker_command.isEmpty ? "marker_single" : config.hybrid_marker_command
         notebooks = config.notebooks
     }
 
@@ -334,12 +457,31 @@ final class SettingsViewModel: ObservableObject {
     func validateSettings() -> [String] {
         var errors: [String] = []
 
-        let trimmedKey = mistralApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if selectedOCRProvider == .mistral {
+            let trimmedKey = mistralApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        if trimmedKey.isEmpty {
-            errors.append("Mistral AI API key is missing.")
-        } else if trimmedKey.contains(" ") || trimmedKey.count < 20 {
-            errors.append("Mistral AI API key does not look valid.")
+            if trimmedKey.isEmpty {
+                errors.append("Mistral AI API key is missing.")
+            } else if trimmedKey.contains(" ") || trimmedKey.count < 20 {
+                errors.append("Mistral AI API key does not look valid.")
+            }
+        } else {
+            if localOllamaURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                errors.append("Ollama URL is missing.")
+            }
+
+            if localOllamaModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                errors.append("Ollama model is missing.")
+            }
+
+            if (parsedLocalOllamaNumCtx ?? 0) <= 0 {
+                errors.append("Ollama context size must be a positive number.")
+            }
+
+            if selectedOCRProvider == .hybridMarkerOlmocr &&
+                hybridMarkerCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                errors.append("Marker command is missing.")
+            }
         }
 
         if vaultDir.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -400,9 +542,9 @@ final class SettingsViewModel: ObservableObject {
                 .obsidianSettings
             ),
             (
-                "Mistral API key",
-                isSetupStepComplete(.mistralApiKey),
-                mistralApiKey.isEmpty ? "Missing" : "Set",
+                "OCR provider",
+                isSetupStepComplete(.ocrProvider),
+                selectedOCRProvider.displayName,
                 .ocrTasks
             ),
             (
@@ -438,11 +580,36 @@ final class SettingsViewModel: ObservableObject {
             return isValidDirectory(vaultDir)
         case .supernoteTool:
             return FileManager.default.isExecutableFile(atPath: supernoteToolPath)
-        case .mistralApiKey:
-            return !mistralApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .ocrProvider:
+            switch selectedOCRProvider {
+            case .mistral:
+                return !mistralApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            case .localOllama:
+                return !localOllamaURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && !localOllamaModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && (parsedLocalOllamaNumCtx ?? 0) > 0
+            case .hybridMarkerOlmocr:
+                return !localOllamaURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && !localOllamaModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && (parsedLocalOllamaNumCtx ?? 0) > 0
+                    && !hybridMarkerCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
         case .folders:
             return !notebooks.isEmpty
         }
+    }
+
+    var selectedOCRProvider: OCRProvider {
+        get {
+            OCRProvider(rawValue: ocrProvider) ?? .mistral
+        }
+        set {
+            ocrProvider = newValue.rawValue
+        }
+    }
+
+    private var parsedLocalOllamaNumCtx: Int? {
+        Int(localOllamaNumCtx.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     private func isValidDirectory(_ path: String) -> Bool {
@@ -847,6 +1014,12 @@ final class SettingsViewModel: ObservableObject {
         }
     }
 
+    func openOllamaDownloadPage() {
+        if let url = URL(string: "https://ollama.com/download") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     func openSupernoteToolHelp() {
         if let url = URL(string: "https://github.com/jya-dev/supernote-tool") {
             NSWorkspace.shared.open(url)
@@ -877,7 +1050,101 @@ final class SettingsViewModel: ObservableObject {
         statusMessage = "❌ supernote-tool not found. Use Get supernote-tool for Obsidian or Choose…"
     }
 
+    func checkLocalOCRDependencies() async {
+        guard !isRunningLocalOCRCommand else { return }
+
+        isRunningLocalOCRCommand = true
+        localOCRStatusMessage = "Checking local OCR setup…"
+        defer {
+            isRunningLocalOCRCommand = false
+        }
+
+        let model = localOllamaModelName
+
+        guard let ollamaPath = resolveExecutable("ollama") else {
+            localOCRStatusMessage = """
+            ❌ Ollama not found.
+            Install Ollama first, then run: ollama pull \(model)
+            """
+            return
+        }
+
+        var lines = ["✅ Ollama found: \(ollamaPath)"]
+
+        let listResult = await runProcessCapture(
+            executable: ollamaPath,
+            arguments: ["list"]
+        )
+
+        if listResult.exitCode == 0 {
+            if listResult.output.contains(model) {
+                lines.append("✅ Ollama model installed: \(model)")
+            } else {
+                lines.append("❌ Ollama model missing: \(model)")
+                lines.append("Run: ollama pull \(model)")
+            }
+        } else {
+            lines.append("❌ Could not list Ollama models.")
+            lines.append(listResult.output.isEmpty ? "Make sure Ollama is running." : listResult.output)
+        }
+
+        if selectedOCRProvider == .hybridMarkerOlmocr {
+            let markerCommand = hybridMarkerCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "marker_single"
+                : hybridMarkerCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if let markerPath = resolveExecutable(markerCommand) {
+                lines.append("✅ Marker command found: \(markerPath)")
+            } else {
+                lines.append("❌ Marker command not found: \(markerCommand)")
+                lines.append("Use an absolute hybrid_marker_command path if the app cannot find marker_single.")
+            }
+        }
+
+        localOCRStatusMessage = lines.joined(separator: "\n")
+    }
+
+    func installOllamaModel() async {
+        guard !isRunningLocalOCRCommand else { return }
+
+        isRunningLocalOCRCommand = true
+        defer {
+            isRunningLocalOCRCommand = false
+        }
+
+        let model = localOllamaModelName
+
+        guard let ollamaPath = resolveExecutable("ollama") else {
+            localOCRStatusMessage = """
+            ❌ Ollama was not found.
+            Install Ollama first, then try again.
+            """
+            return
+        }
+
+        localOCRStatusMessage = "Installing Ollama model… This can take a while.\n\(model)"
+
+        let result = await runProcessCapture(
+            executable: ollamaPath,
+            arguments: ["pull", model]
+        )
+
+        if result.exitCode == 0 {
+            localOCRStatusMessage = "✅ Ollama model installed: \(model)"
+        } else {
+            localOCRStatusMessage = """
+            ❌ Failed to install Ollama model: \(model)
+            \(result.output)
+            """
+        }
+    }
+
     // MARK: Utility
+
+    private var localOllamaModelName: String {
+        let trimmed = localOllamaModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "richardyoung/olmocr2:7b-q8" : trimmed
+    }
 
     private func loadEnvValue(for key: String) -> String? {
         guard FileManager.default.fileExists(atPath: envURL.path),
@@ -920,6 +1187,72 @@ final class SettingsViewModel: ObservableObject {
         } catch {
             return nil
         }
+    }
+
+    private func resolveExecutable(_ command: String) -> String? {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+
+        if trimmed.hasPrefix("/"),
+           FileManager.default.isExecutableFile(atPath: trimmed) {
+            return trimmed
+        }
+
+        if let detected = runWhich(trimmed) {
+            return detected
+        }
+
+        let commandName = URL(fileURLWithPath: trimmed).lastPathComponent
+        let candidates = [
+            "/opt/homebrew/bin/\(commandName)",
+            "/usr/local/bin/\(commandName)",
+            "/usr/bin/\(commandName)",
+            "/bin/\(commandName)"
+        ]
+
+        return candidates.first {
+            FileManager.default.isExecutableFile(atPath: $0)
+        }
+    }
+
+    private nonisolated func runProcessCapture(
+        executable: String,
+        arguments: [String]
+    ) async -> (exitCode: Int32, output: String) {
+        await Task.detached(priority: .userInitiated) {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: executable)
+            task.arguments = arguments
+
+            let outputPipe = Pipe()
+            let errorPipe = Pipe()
+            task.standardOutput = outputPipe
+            task.standardError = errorPipe
+
+            do {
+                try task.run()
+                task.waitUntilExit()
+
+                let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+                let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+
+                let output = String(data: outputData, encoding: .utf8) ?? ""
+                let error = String(data: errorData, encoding: .utf8) ?? ""
+                let combined = [output, error]
+                    .joined(separator: "\n")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+
+                if combined.count > 3000 {
+                    return (task.terminationStatus, String(combined.prefix(3000)) + "\n…")
+                }
+
+                return (task.terminationStatus, combined)
+            } catch {
+                return (-1, error.localizedDescription)
+            }
+        }.value
     }
 
     private static func slugify(_ value: String) -> String {
@@ -1200,19 +1533,14 @@ struct SettingsView: View {
                     .foregroundColor(.secondary)
             }
 
-        case .mistralApiKey:
+        case .ocrProvider:
             SettingsCard(
-                title: "Add your Mistral API key",
-                description: "Mistral OCR turns your handwritten Supernote notes into searchable Markdown text."
+                title: "Choose OCR provider",
+                description: "Choose how Supsidian should turn your handwritten Supernote notes into searchable Markdown text."
             ) {
-                SecureField("API key", text: $model.mistralApiKey)
-                    .textFieldStyle(.roundedBorder)
+                ocrProviderSettingsContent(showCustomInstruction: false)
 
-                Button("Get a Mistral API key") {
-                    model.openMistralApiKeyPage()
-                }
-
-                Text("After entering an API key, the final setup step will appear automatically.")
+                Text("After the selected OCR provider has its required fields, the final setup step will appear automatically.")
                     .font(.footnote)
                     .foregroundColor(.secondary)
             }
@@ -1318,42 +1646,255 @@ struct SettingsView: View {
         }
     }
 
-    private var ocrTasksPage: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            SettingsCard(
-                title: "Mistral OCR",
-                description: "Supernote notes are converted to PDF and sent to Mistral OCR. The returned text is saved as searchable Markdown in Obsidian."
+    @ViewBuilder
+    private func ocrProviderSettingsContent(showCustomInstruction: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Picker(
+                "OCR provider",
+                selection: Binding(
+                    get: { model.selectedOCRProvider },
+                    set: { model.selectedOCRProvider = $0 }
+                )
             ) {
-                SecureField("API key", text: $model.mistralApiKey)
-                    .textFieldStyle(.roundedBorder)
-
-                Button("Get a Mistral API key") {
-                    model.openMistralApiKeyPage()
+                ForEach(OCRProvider.allCases) { provider in
+                    Text(provider.displayName).tag(provider)
                 }
             }
+            .pickerStyle(.menu)
 
-            SettingsCard(
-                title: "Custom OCR Instruction",
-                description: "Optional. Add a short instruction for how Mistral should render your notes."
-            ) {
-                VStack(alignment: .leading, spacing: 8) {
-                    TextEditor(text: $model.customOcrInstruction)
-                        .font(.system(.body, design: .default))
-                        .frame(minHeight: 110)
-                        .padding(6)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8)
-                                .stroke(Color.secondary.opacity(0.25))
-                        )
+            Divider()
 
-                    Text("Leave empty for the default faithful OCR behavior. Bad instructions can reduce OCR quality.")
+            switch model.selectedOCRProvider {
+            case .mistral:
+                VStack(alignment: .leading, spacing: 12) {
+                    providerExplanation([
+                        "Cloud OCR.",
+                        "Easiest setup if you already have a Mistral API key.",
+                        "Sends note/PDF content to Mistral’s OCR API.",
+                        "Good general quality.",
+                        "API usage/costs may apply.",
+                        "Requires MISTRAL_API_KEY."
+                    ])
+
+                    SecureField("Mistral API key", text: $model.mistralApiKey)
+                        .textFieldStyle(.roundedBorder)
+
+                    Button("Get a Mistral API key") {
+                        model.openMistralApiKeyPage()
+                    }
+
+                    if showCustomInstruction {
+                        Divider()
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Custom OCR Instruction")
+                                .font(.headline)
+
+                            TextEditor(text: $model.customOcrInstruction)
+                                .font(.system(.body, design: .default))
+                                .frame(minHeight: 110)
+                                .padding(6)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .stroke(Color.secondary.opacity(0.25))
+                                )
+
+                            Text("Leave empty for the default faithful OCR behavior. Bad instructions can reduce OCR quality.")
+                                .font(.footnote)
+                                .foregroundColor(.secondary)
+
+                            Text("Example: Preserve headings and bullet lists. Keep diagrams as images. Do not summarize. Keep the original wording as faithfully as possible.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+
+            case .localOllama:
+                VStack(alignment: .leading, spacing: 12) {
+                    providerExplanation([
+                        "Local OCR on this Mac using Ollama.",
+                        "Requires Ollama running locally.",
+                        "Requires model richardyoung/olmocr2:7b-q8.",
+                        "Does not send note pages to Mistral.",
+                        "Heavier/slower than cloud OCR.",
+                        "Good for private/local handwriting OCR preview."
+                    ])
+
+                    SettingField(title: "Ollama URL", text: $model.localOllamaURL)
+                    SettingField(title: "Ollama model", text: $model.localOllamaModel)
+                    SettingField(title: "Context size", text: $model.localOllamaNumCtx)
+
+                    Text("Requires Ollama and:\nollama pull richardyoung/olmocr2:7b-q8")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.secondary)
+
+                    localOCRActionButtons()
+                }
+
+            case .hybridMarkerOlmocr:
+                VStack(alignment: .leading, spacing: 12) {
+                    providerExplanation(
+                        [
+                            "Experimental advanced mode.",
+                            "Uses Ollama for local OCR.",
+                            "Uses Marker to extract layout, visuals, tables, and diagrams.",
+                            "Best for visual notes with drawings or structure.",
+                            "Hardest to install.",
+                            "marker_single may need an absolute path."
+                        ],
+                        color: .orange
+                    )
+
+                    SettingField(title: "Ollama URL", text: $model.localOllamaURL)
+                    SettingField(title: "Ollama model", text: $model.localOllamaModel)
+                    SettingField(title: "Context size", text: $model.localOllamaNumCtx)
+                    SettingField(title: "Marker command", text: $model.hybridMarkerCommand)
+
+                    Text("Experimental. Requires Marker/marker_single. If Supsidian app or LaunchAgent cannot find marker_single, use an absolute path.")
+                        .font(.footnote)
+                        .foregroundColor(.orange)
+
+                    Text("Also requires Ollama and:\nollama pull richardyoung/olmocr2:7b-q8")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.secondary)
+
+                    Text("Marker auto-install is not available yet. Install Marker in the Python environment used by Supsidian. If the app cannot find marker_single, use an absolute path.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
 
-                    Text("Example: Preserve headings and bullet lists. Keep diagrams as images. Do not summarize. Keep the original wording as faithfully as possible.")
-                        .font(.caption)
+                    markerInstallationHelp()
+
+                    localOCRActionButtons()
+                }
+            }
+        }
+    }
+
+    private func providerExplanation(_ lines: [String], color: Color = .secondary) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(lines, id: \.self) { line in
+                Text("• \(line)")
+                    .font(.footnote)
+                    .foregroundColor(color)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func markerInstallationHelp() -> some View {
+        DisclosureGroup("Marker installation help") {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Marker is used only in Hybrid mode. It helps Supsidian extract layout, visuals, tables, and diagrams from the generated PDF.")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text("Marker is not installed automatically yet because it needs a Python environment and can be sensitive to Python versions and PATH.")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text("Recommended manual install for now:")
+                    .font(.headline)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("1. Open Terminal.")
+                    Text("2. Go to your Supsidian project folder:")
+                    commandSnippet("cd ~/supernote-obsidian-sync")
+                    Text("3. If python3.12 is missing, install it first:")
+                    commandSnippet("brew install python@3.12")
+                    Text("4. Create a separate Marker Python environment:")
+                    commandSnippet("/opt/homebrew/bin/python3.12 -m venv .venv-marker-ocr")
+                    Text("5. Activate it:")
+                    commandSnippet("source .venv-marker-ocr/bin/activate")
+                    Text("6. Install Marker:")
+                    commandSnippet("python -m pip install --upgrade pip\npython -m pip install marker-pdf")
+                    Text("7. Use this marker command path in Supsidian:")
+                    commandSnippet("~/supernote-obsidian-sync/.venv-marker-ocr/bin/marker_single")
+                    Text("If this path does not work in the app, replace ~ with your full home folder path.")
+                    Text("8. Then click “Check Local OCR Setup”.")
+                }
+                .font(.footnote)
+                .foregroundColor(.secondary)
+
+                Text("If Supsidian cannot find marker_single, an absolute path is safer than just marker_single. Marker is experimental and optional; Local Ollama mode works without Marker.")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.top, 8)
+        }
+    }
+
+    private func commandSnippet(_ text: String) -> some View {
+        Text(text)
+            .font(.system(.caption, design: .monospaced))
+            .foregroundColor(.secondary)
+            .textSelection(.enabled)
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+            )
+    }
+
+    private func localOCRActionButtons() -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Button("Check Local OCR Setup") {
+                    Task {
+                        await model.checkLocalOCRDependencies()
+                    }
+                }
+                .disabled(model.isRunningLocalOCRCommand)
+
+                Button("Install Ollama model") {
+                    Task {
+                        await model.installOllamaModel()
+                    }
+                }
+                .disabled(model.isRunningLocalOCRCommand)
+
+                Button("Open Ollama Download") {
+                    model.openOllamaDownloadPage()
+                }
+            }
+
+            if model.isRunningLocalOCRCommand {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+
+                    Text("Working…")
+                        .font(.footnote)
                         .foregroundColor(.secondary)
                 }
+            }
+
+            if !model.localOCRStatusMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text(model.localOCRStatusMessage)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(Color(nsColor: .controlBackgroundColor))
+                    )
+            }
+        }
+    }
+
+    private var ocrTasksPage: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            SettingsCard(
+                title: "OCR Provider",
+                description: "Choose between cloud OCR and local OCR providers. Provider-specific settings are saved to config.json."
+            ) {
+                ocrProviderSettingsContent(showCustomInstruction: true)
             }
 
             SettingsCard(
