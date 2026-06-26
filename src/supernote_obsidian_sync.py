@@ -1,5 +1,6 @@
 import argparse
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -30,6 +31,9 @@ APP_SUPPORT_DIR = (
 CONFIG_FILE = APP_SUPPORT_DIR / "config.json"
 ENV_FILE = APP_SUPPORT_DIR / ".env"
 LOG_FILE = APP_SUPPORT_DIR / "supernote_obsidian_sync.log"
+PAGE_CACHE_SCHEMA_VERSION = 1
+PAGE_CACHE_CODE_VERSION = "page-cache-v1"
+PAGE_CACHE_DIR = APP_SUPPORT_DIR / "page_cache"
 
 LAUNCH_AGENT_LABEL = "com.kulturban.supernote-obsidian-sync"
 LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
@@ -367,6 +371,197 @@ def convert_note_to_pdf(note_file: Path, pdf_file: Path) -> None:
     )
 
     log(f"PDF created: {pdf_file}")
+
+
+# ------------------------------------------------------------
+# PAGE OCR CACHE CORE
+# ------------------------------------------------------------
+
+def note_page_cache_id(note_file: Path) -> str:
+    """
+    Return a stable, filesystem-safe cache id for a note path.
+
+    The visible stem keeps cache folders recognizable, while the hash prevents
+    collisions between same-named notes in different source folders.
+    """
+    normalized_path = str(note_file.expanduser().resolve())
+    path_hash = hashlib.sha256(normalized_path.encode("utf-8")).hexdigest()[:12]
+    return f"{slugify(note_file.stem)}-{path_hash}"
+
+
+def page_cache_path(note_file: Path) -> Path:
+    return PAGE_CACHE_DIR / note_page_cache_id(note_file) / "cache.json"
+
+
+def ocr_settings_fingerprint(provider: str | None = None) -> str:
+    """
+    Fingerprint OCR settings that can materially change cached page text.
+    """
+    selected_provider = (provider or OCR_PROVIDER).strip().lower() or "mistral"
+    fingerprint_data: dict[str, object] = {
+        "schema_version": PAGE_CACHE_SCHEMA_VERSION,
+        "code_version": PAGE_CACHE_CODE_VERSION,
+        "provider": selected_provider,
+    }
+
+    if selected_provider == "mistral":
+        fingerprint_data["mistral"] = {
+            "model": "mistral-ocr-latest",
+            "custom_ocr_instruction": CUSTOM_OCR_INSTRUCTION,
+        }
+    elif selected_provider == "local_ollama":
+        fingerprint_data["local_ollama"] = {
+            "model": LOCAL_OLLAMA_MODEL,
+            "num_ctx": LOCAL_OLLAMA_NUM_CTX,
+            "prompt": LOCAL_OLLAMA_PROMPT,
+            "rendering": {
+                "dpi": 200,
+                "alpha": False,
+            },
+        }
+    elif selected_provider == "hybrid_marker_olmocr":
+        fingerprint_data["hybrid_marker_olmocr"] = {
+            "model": LOCAL_OLLAMA_MODEL,
+            "num_ctx": LOCAL_OLLAMA_NUM_CTX,
+            "prompt": LOCAL_OLLAMA_PROMPT,
+            "marker_command": HYBRID_MARKER_COMMAND,
+            "table_conversion": "forgiving-html-v1",
+            "visual_placement": "marker-order-v1",
+            "rendering": {
+                "dpi": 200,
+                "alpha": False,
+            },
+        }
+    else:
+        fingerprint_data["unsupported_provider"] = selected_provider
+
+    serialized = json.dumps(fingerprint_data, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _cached_page_is_reusable(page: dict) -> bool:
+    return bool(page.get("page_hash")) and isinstance(page.get("markdown"), str)
+
+
+def reconcile_page_cache(
+    current_page_hashes: list[str],
+    cached_pages: list[dict],
+    fingerprint: str,
+    cached_fingerprint: str | None = None,
+) -> dict:
+    """
+    Match current rendered page hashes against cached OCR pages.
+
+    Same-position matches are preferred, then remaining pages are matched by
+    hash so inserted/deleted pages can still reuse shifted cached OCR.
+    """
+    if cached_fingerprint is not None and cached_fingerprint != fingerprint:
+        ordered_pages = [
+            {
+                "page_number": page_number,
+                "page_hash": page_hash,
+                "markdown": None,
+                "reused": False,
+            }
+            for page_number, page_hash in enumerate(current_page_hashes, start=1)
+        ]
+        return {
+            "ordered_pages": ordered_pages,
+            "changed_pages": [page["page_number"] for page in ordered_pages],
+            "reused_pages_count": 0,
+            "pages_to_ocr_count": len(ordered_pages),
+            "deleted_pages_count": max(0, len(cached_pages) - len(current_page_hashes)),
+        }
+
+    ordered_pages: list[dict] = []
+    used_cached_indexes: set[int] = set()
+
+    for current_index, page_hash in enumerate(current_page_hashes):
+        cached_page = cached_pages[current_index] if current_index < len(cached_pages) else None
+        if (
+            isinstance(cached_page, dict)
+            and _cached_page_is_reusable(cached_page)
+            and cached_page.get("page_hash") == page_hash
+        ):
+            used_cached_indexes.add(current_index)
+            ordered_pages.append(
+                {
+                    "page_number": current_index + 1,
+                    "page_hash": page_hash,
+                    "markdown": cached_page["markdown"],
+                    "reused": True,
+                }
+            )
+        else:
+            ordered_pages.append(
+                {
+                    "page_number": current_index + 1,
+                    "page_hash": page_hash,
+                    "markdown": None,
+                    "reused": False,
+                }
+            )
+
+    cached_pages_by_hash: dict[str, list[tuple[int, dict]]] = {}
+    for cached_index, cached_page in enumerate(cached_pages):
+        if cached_index in used_cached_indexes:
+            continue
+        if not isinstance(cached_page, dict) or not _cached_page_is_reusable(cached_page):
+            continue
+        cached_pages_by_hash.setdefault(str(cached_page["page_hash"]), []).append(
+            (cached_index, cached_page)
+        )
+
+    for ordered_page in ordered_pages:
+        if ordered_page["reused"]:
+            continue
+        candidates = cached_pages_by_hash.get(ordered_page["page_hash"], [])
+        while candidates and candidates[0][0] in used_cached_indexes:
+            candidates.pop(0)
+        if not candidates:
+            continue
+        cached_index, cached_page = candidates.pop(0)
+        used_cached_indexes.add(cached_index)
+        ordered_page["markdown"] = cached_page["markdown"]
+        ordered_page["reused"] = True
+
+    changed_pages = [
+        page["page_number"]
+        for page in ordered_pages
+        if not page["reused"]
+    ]
+    reusable_cached_count = sum(
+        1
+        for page in cached_pages
+        if isinstance(page, dict) and _cached_page_is_reusable(page)
+    )
+
+    return {
+        "ordered_pages": ordered_pages,
+        "changed_pages": changed_pages,
+        "reused_pages_count": len(ordered_pages) - len(changed_pages),
+        "pages_to_ocr_count": len(changed_pages),
+        "deleted_pages_count": max(0, reusable_cached_count - len(used_cached_indexes)),
+    }
+
+
+def load_page_cache(note_file: Path) -> dict | None:
+    cache_file = page_cache_path(note_file)
+    if not cache_file.exists():
+        return None
+
+    try:
+        loaded_cache = json.loads(cache_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    return loaded_cache if isinstance(loaded_cache, dict) else None
+
+
+def save_page_cache(note_file: Path, cache: dict) -> None:
+    cache_file = page_cache_path(note_file)
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    cache_file.write_text(json.dumps(cache, indent=2), encoding="utf-8")
 
 
 # ------------------------------------------------------------
