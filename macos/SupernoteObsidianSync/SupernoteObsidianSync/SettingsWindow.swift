@@ -1139,11 +1139,100 @@ final class SettingsViewModel: ObservableObject {
         }
     }
 
+    func installMarker() async {
+        guard !isRunningLocalOCRCommand else { return }
+
+        isRunningLocalOCRCommand = true
+        defer {
+            isRunningLocalOCRCommand = false
+        }
+
+        let projectDirectory = markerProjectDirectory
+        let markerVenvDirectory = "\(projectDirectory)/.venv-marker-ocr"
+        let venvPython = "\(markerVenvDirectory)/bin/python"
+        let markerPath = "\(markerVenvDirectory)/bin/marker_single"
+
+        let pythonCandidates = [
+            "/opt/homebrew/bin/python3.12",
+            "/usr/local/bin/python3.12"
+        ]
+
+        let pythonPath = pythonCandidates.first {
+            FileManager.default.isExecutableFile(atPath: $0)
+        } ?? runWhich("python3.12")
+
+        guard let pythonPath else {
+            localOCRStatusMessage = "❌ Python 3.12 was not found. Install it first with: brew install python@3.12"
+            return
+        }
+
+        localOCRStatusMessage = """
+        Installing Marker into local project environment…
+        \(markerVenvDirectory)
+        """
+
+        let venvResult = await runProcessCapture(
+            executable: pythonPath,
+            arguments: ["-m", "venv", markerVenvDirectory]
+        )
+        guard venvResult.exitCode == 0 else {
+            localOCRStatusMessage = """
+            ❌ Failed to create Marker Python environment.
+            \(venvResult.output)
+            """
+            return
+        }
+
+        localOCRStatusMessage = "Upgrading pip in Marker environment…"
+        let pipUpgradeResult = await runProcessCapture(
+            executable: venvPython,
+            arguments: ["-m", "pip", "install", "--upgrade", "pip"]
+        )
+        guard pipUpgradeResult.exitCode == 0 else {
+            localOCRStatusMessage = """
+            ❌ Failed to upgrade pip in Marker environment.
+            \(pipUpgradeResult.output)
+            """
+            return
+        }
+
+        localOCRStatusMessage = "Installing Marker… This can take a while."
+        let markerInstallResult = await runProcessCapture(
+            executable: venvPython,
+            arguments: ["-m", "pip", "install", "marker-pdf"]
+        )
+        guard markerInstallResult.exitCode == 0 else {
+            localOCRStatusMessage = """
+            ❌ Failed to install Marker.
+            \(markerInstallResult.output)
+            """
+            return
+        }
+
+        if FileManager.default.isExecutableFile(atPath: markerPath) {
+            hybridMarkerCommand = markerPath
+            localOCRStatusMessage = "✅ Marker installed. Marker command set to: \(markerPath)"
+        } else {
+            localOCRStatusMessage = """
+            Marker install finished, but marker_single was not found at:
+            \(markerPath)
+
+            \(markerInstallResult.output)
+            """
+        }
+    }
+
     // MARK: Utility
 
     private var localOllamaModelName: String {
         let trimmed = localOllamaModel.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? "richardyoung/olmocr2:7b-q8" : trimmed
+    }
+
+    private var markerProjectDirectory: String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("supernote-obsidian-sync")
+            .path
     }
 
     private func loadEnvValue(for key: String) -> String? {
@@ -1759,11 +1848,18 @@ struct SettingsView: View {
                         .font(.system(.caption, design: .monospaced))
                         .foregroundColor(.secondary)
 
-                    Text("Marker auto-install is not available yet. Install Marker in the Python environment used by Supsidian. If the app cannot find marker_single, use an absolute path.")
+                    Text("Marker is not installed silently. The Install Marker button creates a local project environment and installs Marker there. If the app cannot find marker_single, use an absolute path.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
 
                     markerInstallationHelp()
+
+                    Button("Install Marker") {
+                        Task {
+                            await model.installMarker()
+                        }
+                    }
+                    .disabled(model.isRunningLocalOCRCommand)
 
                     localOCRActionButtons()
                 }
