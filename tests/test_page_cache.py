@@ -319,7 +319,7 @@ def run_fake_hybrid_ocr(
     tmp_path: Path,
     page_hashes: list[str],
     ocr_calls: list[list[int]],
-    marker_calls: list[Path],
+    marker_calls: list[str | None],
 ) -> str:
     monkeypatch.setattr(module, "render_pdf_page_hashes", lambda _pdf_file: page_hashes)
 
@@ -330,8 +330,8 @@ def run_fake_hybrid_ocr(
             for page_number in page_numbers
         }
 
-    def fake_marker(pdf_file: Path, marker_dir: Path) -> None:
-        marker_calls.append(pdf_file)
+    def fake_marker(_pdf_file: Path, marker_dir: Path, page_range: str | None = None) -> None:
+        marker_calls.append(page_range)
         marker_dir.mkdir(parents=True, exist_ok=True)
         (marker_dir / "result.md").write_text("No visuals", encoding="utf-8")
 
@@ -352,7 +352,7 @@ def run_fake_hybrid_ocr_with_marker_failure(
     tmp_path: Path,
     page_hashes: list[str],
     ocr_calls: list[list[int]],
-    marker_calls: list[Path],
+    marker_calls: list[str | None],
 ) -> str:
     monkeypatch.setattr(module, "render_pdf_page_hashes", lambda _pdf_file: page_hashes)
 
@@ -363,8 +363,8 @@ def run_fake_hybrid_ocr_with_marker_failure(
             for page_number in page_numbers
         }
 
-    def failing_marker(pdf_file: Path, _marker_dir: Path) -> None:
-        marker_calls.append(pdf_file)
+    def failing_marker(_pdf_file: Path, _marker_dir: Path, page_range: str | None = None) -> None:
+        marker_calls.append(page_range)
         raise RuntimeError("Invalid buffer size: 23.97 GiB")
 
     monkeypatch.setattr(module, "ollama_ocr_selected_pdf_pages", fake_selected_ocr)
@@ -527,7 +527,7 @@ def test_incremental_hybrid_first_run_ocrs_all_pages_and_runs_marker(
 ) -> None:
     module = load_sync_module({"ocr_provider": "hybrid_marker_olmocr"})
     ocr_calls: list[list[int]] = []
-    marker_calls: list[Path] = []
+    marker_calls: list[str | None] = []
 
     markdown = run_fake_hybrid_ocr(
         module,
@@ -540,13 +540,13 @@ def test_incremental_hybrid_first_run_ocrs_all_pages_and_runs_marker(
     cache = module.load_page_cache(tmp_path / "source" / "Hybrid.note")
 
     assert ocr_calls == [[1, 2, 3]]
-    assert len(marker_calls) == 1
+    assert marker_calls == ["0", "1", "2"]
     assert "## Page 1\n\nhybrid fresh page 1" in markdown
     assert cache["provider"] == "hybrid_marker_olmocr"
     assert cache["last_run"]["pages_to_ocr_count"] == 3
 
 
-def test_incremental_hybrid_second_run_reuses_text_but_still_runs_marker(
+def test_incremental_hybrid_second_run_reuses_text_and_skips_marker_when_no_pages_changed(
     load_sync_module,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -554,7 +554,7 @@ def test_incremental_hybrid_second_run_reuses_text_but_still_runs_marker(
     module = load_sync_module({"ocr_provider": "hybrid_marker_olmocr"})
     first_ocr_calls: list[list[int]] = []
     second_ocr_calls: list[list[int]] = []
-    marker_calls: list[Path] = []
+    marker_calls: list[str | None] = []
 
     run_fake_hybrid_ocr(module, monkeypatch, tmp_path, ["a", "b"], first_ocr_calls, marker_calls)
     markdown = run_fake_hybrid_ocr(module, monkeypatch, tmp_path, ["a", "b"], second_ocr_calls, marker_calls)
@@ -562,7 +562,7 @@ def test_incremental_hybrid_second_run_reuses_text_but_still_runs_marker(
 
     assert first_ocr_calls == [[1, 2]]
     assert second_ocr_calls == []
-    assert len(marker_calls) == 2
+    assert marker_calls == ["0", "1"]
     assert "hybrid fresh page 1" in markdown
     assert "hybrid fresh page 2" in markdown
     assert cache["last_run"]["reused_pages_count"] == 2
@@ -577,7 +577,7 @@ def test_incremental_hybrid_changed_middle_page_ocrs_only_that_page_and_runs_mar
     module = load_sync_module({"ocr_provider": "hybrid_marker_olmocr"})
     first_ocr_calls: list[list[int]] = []
     second_ocr_calls: list[list[int]] = []
-    marker_calls: list[Path] = []
+    marker_calls: list[str | None] = []
 
     run_fake_hybrid_ocr(module, monkeypatch, tmp_path, ["a", "b", "c"], first_ocr_calls, marker_calls)
     markdown = run_fake_hybrid_ocr(
@@ -591,7 +591,7 @@ def test_incremental_hybrid_changed_middle_page_ocrs_only_that_page_and_runs_mar
     cache = module.load_page_cache(tmp_path / "source" / "Hybrid.note")
 
     assert second_ocr_calls == [[2]]
-    assert len(marker_calls) == 2
+    assert marker_calls == ["0", "1", "2", "1"]
     assert "## Page 1\n\nhybrid fresh page 1" in markdown
     assert "## Page 2\n\nhybrid fresh page 2" in markdown
     assert "## Page 3\n\nhybrid fresh page 3" in markdown
@@ -616,7 +616,7 @@ def test_incremental_hybrid_does_not_reuse_local_ollama_cache(
         },
     )
     ocr_calls: list[list[int]] = []
-    marker_calls: list[Path] = []
+    marker_calls: list[str | None] = []
 
     markdown = run_fake_hybrid_ocr(
         module,
@@ -629,7 +629,7 @@ def test_incremental_hybrid_does_not_reuse_local_ollama_cache(
     cache = module.load_page_cache(note_file)
 
     assert ocr_calls == [[1, 2]]
-    assert len(marker_calls) == 1
+    assert marker_calls == ["0", "1"]
     assert "local cached" not in markdown
     assert "hybrid fresh page 1" in markdown
     assert cache["provider"] == "hybrid_marker_olmocr"
@@ -643,7 +643,7 @@ def test_incremental_hybrid_marker_failure_returns_ollama_text_and_saves_cache(
 ) -> None:
     module = load_sync_module({"ocr_provider": "hybrid_marker_olmocr"})
     ocr_calls: list[list[int]] = []
-    marker_calls: list[Path] = []
+    marker_calls: list[str | None] = []
 
     markdown = run_fake_hybrid_ocr_with_marker_failure(
         module,
@@ -656,7 +656,7 @@ def test_incremental_hybrid_marker_failure_returns_ollama_text_and_saves_cache(
     cache = module.load_page_cache(tmp_path / "source" / "Hybrid.note")
 
     assert ocr_calls == [[1, 2]]
-    assert len(marker_calls) == 1
+    assert marker_calls == ["0", "1"]
     assert "## Page 1\n\nhybrid fresh page 1" in markdown
     assert "## Page 2\n\nhybrid fresh page 2" in markdown
     assert "extracted_visuals" not in markdown
@@ -672,7 +672,7 @@ def test_incremental_hybrid_marker_failure_on_second_run_still_ocrs_only_changed
     module = load_sync_module({"ocr_provider": "hybrid_marker_olmocr"})
     first_ocr_calls: list[list[int]] = []
     second_ocr_calls: list[list[int]] = []
-    marker_calls: list[Path] = []
+    marker_calls: list[str | None] = []
 
     run_fake_hybrid_ocr(module, monkeypatch, tmp_path, ["a", "b", "c"], first_ocr_calls, marker_calls)
     markdown = run_fake_hybrid_ocr_with_marker_failure(
@@ -687,7 +687,7 @@ def test_incremental_hybrid_marker_failure_on_second_run_still_ocrs_only_changed
 
     assert first_ocr_calls == [[1, 2, 3]]
     assert second_ocr_calls == [[2]]
-    assert len(marker_calls) == 2
+    assert marker_calls == ["0", "1", "2", "1"]
     assert "## Page 1\n\nhybrid fresh page 1" in markdown
     assert "## Page 2\n\nhybrid fresh page 2" in markdown
     assert "## Page 3\n\nhybrid fresh page 3" in markdown

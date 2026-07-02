@@ -1248,7 +1248,11 @@ def nearby_marker_text(lines: list[str], image_line_index: int, step: int) -> st
     return None
 
 
-def run_hybrid_marker(pdf_file: Path, marker_output_dir: Path) -> None:
+def run_hybrid_marker(
+    pdf_file: Path,
+    marker_output_dir: Path,
+    page_range: str | None = None,
+) -> None:
     marker_command = shutil.which(HYBRID_MARKER_COMMAND)
     if not marker_command:
         raise RuntimeError(
@@ -1290,6 +1294,9 @@ def run_hybrid_marker(pdf_file: Path, marker_output_dir: Path) -> None:
     if HYBRID_MARKER_DISABLE_TQDM:
         marker_args.append("--disable_tqdm")
 
+    if page_range is not None:
+        marker_args.extend(["--page_range", page_range])
+
     result = subprocess.run(
         marker_args,
         capture_output=True,
@@ -1302,7 +1309,23 @@ def run_hybrid_marker(pdf_file: Path, marker_output_dir: Path) -> None:
         raise RuntimeError(f"Marker failed with exit status {result.returncode}: {detail}")
 
 
-def copy_marker_visuals(marker_dir: Path, extracted_visual_dir: Path) -> list[dict]:
+def run_hybrid_marker_for_page(
+    pdf_file: Path,
+    marker_output_dir: Path,
+    page_number: int,
+) -> None:
+    run_hybrid_marker(
+        pdf_file,
+        marker_output_dir,
+        page_range=str(page_number - 1),
+    )
+
+
+def copy_marker_visuals(
+    marker_dir: Path,
+    extracted_visual_dir: Path,
+    assigned_page_override: int | None = None,
+) -> list[dict]:
     """Copy only Marker-declared local image assets into the note attachment folder."""
     visuals: list[dict] = []
     copied_sources: set[Path] = set()
@@ -1338,6 +1361,8 @@ def copy_marker_visuals(marker_dir: Path, extracted_visual_dir: Path) -> list[di
 
                 marker_page_index = marker_page_index_from_filename(source_path)
                 assigned_page = marker_page_index + 1 if marker_page_index is not None else current_page
+                if assigned_page_override is not None and assigned_page in {None, 1}:
+                    assigned_page = assigned_page_override
 
                 if assigned_page is not None:
                     page_visual_counts[assigned_page] = page_visual_counts.get(assigned_page, 0) + 1
@@ -1426,6 +1451,49 @@ def append_extracted_visuals(page_text: str, image_embeds: list[str]) -> str:
     return page_text.rstrip() + "\n\n### Extracted visuals\n\n" + "\n\n".join(image_embeds)
 
 
+def apply_marker_visuals_to_pages(
+    page_transcriptions: list[str],
+    visuals: list[dict],
+    obsidian_image_folder: str,
+) -> int:
+    fallback_embeds: dict[int, list[str]] = {}
+    placed_count = 0
+
+    for visual in visuals:
+        assigned_page = visual["assigned_page"]
+        if assigned_page is None and len(page_transcriptions) == 1:
+            assigned_page = 1
+            visual["assigned_page"] = assigned_page
+
+        if assigned_page is None or not 1 <= assigned_page <= len(page_transcriptions):
+            log(f"Skipping unassigned Marker visual embed: {visual['copied_filename']}")
+            continue
+
+        image_embed = (
+            f"![[{obsidian_image_folder}/extracted_visuals/{visual['copied_filename']}]]"
+        )
+        page_index = assigned_page - 1
+        updated_text, was_placed = place_visual_by_marker_order(
+            page_transcriptions[page_index],
+            visual,
+            image_embed,
+        )
+        if was_placed:
+            page_transcriptions[page_index] = updated_text
+            placed_count += 1
+        else:
+            fallback_embeds.setdefault(assigned_page, []).append(image_embed)
+
+    for page_number, image_embeds in fallback_embeds.items():
+        page_index = page_number - 1
+        page_transcriptions[page_index] = append_extracted_visuals(
+            page_transcriptions[page_index],
+            image_embeds,
+        )
+
+    return placed_count
+
+
 def hybrid_marker_olmocr_pdf(
     pdf_file: Path,
     image_dir: Path,
@@ -1434,8 +1502,9 @@ def hybrid_marker_olmocr_pdf(
 ) -> str:
     log(f"Starting hybrid Marker + Ollama OCR: {pdf_file}")
 
+    reconciliation = None
     if note_file is not None:
-        page_transcriptions, _reconciliation = incremental_ollama_page_transcriptions(
+        page_transcriptions, reconciliation = incremental_ollama_page_transcriptions(
             pdf_file,
             note_file,
             "hybrid_marker_olmocr",
@@ -1449,48 +1518,57 @@ def hybrid_marker_olmocr_pdf(
         for page_text in page_transcriptions
     ]
 
+    extracted_visual_dir = image_dir / "extracted_visuals"
+    if reconciliation is not None:
+        marker_pages_to_process = reconciliation["changed_pages"]
+        if not marker_pages_to_process:
+            log("Hybrid Marker page-scope: no changed pages; skipping Marker")
+            return format_ocr_pages(page_transcriptions)
+
+        log(f"Hybrid Marker page-scope: processing changed pages {marker_pages_to_process}")
+        with tempfile.TemporaryDirectory(prefix="supsidian-hybrid-marker-") as temporary_directory:
+            total_visuals = 0
+            placed_count = 0
+            for page_number in marker_pages_to_process:
+                marker_dir = Path(temporary_directory) / f"marker_page_{page_number:03d}"
+                try:
+                    run_hybrid_marker_for_page(pdf_file, marker_dir, page_number)
+                    visuals = copy_marker_visuals(
+                        marker_dir,
+                        extracted_visual_dir,
+                        assigned_page_override=page_number,
+                    )
+                    total_visuals += len(visuals)
+                    placed_count += apply_marker_visuals_to_pages(
+                        page_transcriptions,
+                        visuals,
+                        obsidian_image_folder,
+                    )
+                except Exception as exc:
+                    log(
+                        f"Hybrid Marker page {page_number} failed; continuing without "
+                        f"Marker visuals for this page: {exc}"
+                    )
+                    continue
+
+        log(
+            f"Hybrid Marker + Ollama OCR finished: {pdf_file} "
+            f"({total_visuals} visual(s), {placed_count} placed by Marker order)"
+        )
+        return format_ocr_pages(page_transcriptions)
+
     try:
         with tempfile.TemporaryDirectory(prefix="supsidian-hybrid-marker-") as temporary_directory:
             marker_dir = Path(temporary_directory) / "marker_output"
             log("Hybrid Marker + Ollama: running Marker on the full current PDF")
             run_hybrid_marker(pdf_file, marker_dir)
 
-            extracted_visual_dir = image_dir / "extracted_visuals"
             visuals = copy_marker_visuals(marker_dir, extracted_visual_dir)
-            fallback_embeds: dict[int, list[str]] = {}
-            placed_count = 0
-
-            for visual in visuals:
-                assigned_page = visual["assigned_page"]
-                if assigned_page is None and len(page_transcriptions) == 1:
-                    assigned_page = 1
-                    visual["assigned_page"] = assigned_page
-
-                if assigned_page is None or not 1 <= assigned_page <= len(page_transcriptions):
-                    log(f"Skipping unassigned Marker visual embed: {visual['copied_filename']}")
-                    continue
-
-                image_embed = (
-                    f"![[{obsidian_image_folder}/extracted_visuals/{visual['copied_filename']}]]"
-                )
-                page_index = assigned_page - 1
-                updated_text, was_placed = place_visual_by_marker_order(
-                    page_transcriptions[page_index],
-                    visual,
-                    image_embed,
-                )
-                if was_placed:
-                    page_transcriptions[page_index] = updated_text
-                    placed_count += 1
-                else:
-                    fallback_embeds.setdefault(assigned_page, []).append(image_embed)
-
-            for page_number, image_embeds in fallback_embeds.items():
-                page_index = page_number - 1
-                page_transcriptions[page_index] = append_extracted_visuals(
-                    page_transcriptions[page_index],
-                    image_embeds,
-                )
+            placed_count = apply_marker_visuals_to_pages(
+                page_transcriptions,
+                visuals,
+                obsidian_image_folder,
+            )
 
         log(
             f"Hybrid Marker + Ollama OCR finished: {pdf_file} "

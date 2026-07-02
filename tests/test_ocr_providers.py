@@ -296,6 +296,37 @@ def test_run_hybrid_marker_uses_low_memory_profile_by_default(
     assert args[args.index("--lowres_image_dpi") + 1] == "72"
     assert args[args.index("--highres_image_dpi") + 1] == "144"
     assert "--disable_tqdm" in args
+    assert "--page_range" not in args
+
+
+def test_run_hybrid_marker_for_page_uses_zero_based_page_range(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module()
+    captured: dict[str, list[str]] = {}
+
+    class FakeCompletedProcess:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(args: list[str], **_kwargs) -> FakeCompletedProcess:
+        captured["args"] = args
+        return FakeCompletedProcess()
+
+    monkeypatch.setattr(module.shutil, "which", lambda _command: "/fake/bin/marker_single")
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    module.run_hybrid_marker_for_page(
+        tmp_path / "note.pdf",
+        tmp_path / "marker-output",
+        25,
+    )
+
+    args = captured["args"]
+    assert args[args.index("--page_range") + 1] == "24"
 
 
 def test_copy_marker_visuals_filters_unsafe_and_unreferenced_assets(load_sync_module, tmp_path: Path) -> None:
@@ -368,7 +399,10 @@ def test_hybrid_uses_obsidian_embed_for_copied_visual(
 ) -> None:
     module = load_sync_module()
 
-    def fake_marker(_pdf_file: Path, marker_dir: Path) -> None:
+    marker_page_ranges: list[str | None] = []
+
+    def fake_marker(_pdf_file: Path, marker_dir: Path, page_range: str | None = None) -> None:
+        marker_page_ranges.append(page_range)
         marker_dir.mkdir(parents=True)
         (marker_dir / "_page_0_Picture_6.jpeg").write_bytes(b"crop")
         (marker_dir / "result.md").write_text(
@@ -389,6 +423,7 @@ def test_hybrid_uses_obsidian_embed_for_copied_visual(
     assert embed in markdown
     assert "![](extracted_visuals/" not in markdown
     assert markdown.index(embed) < markdown.index("List")
+    assert marker_page_ranges == [None]
 
 
 def test_marker_order_prefers_unique_following_then_previous_anchor(load_sync_module) -> None:
