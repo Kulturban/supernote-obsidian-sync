@@ -77,6 +77,7 @@ def test_reconcile_reuses_99_pages_when_one_middle_page_changes(load_sync_module
     assert result["reused_pages_count"] == 99
     assert result["pages_to_ocr_count"] == 1
     assert result["changed_pages"] == [25]
+    assert result["deleted_pages_count"] == 0
     assert result["ordered_pages"][24]["markdown"] is None
     assert result["ordered_pages"][23]["markdown"] == "cached page-024"
     assert result["ordered_pages"][25]["markdown"] == "cached page-026"
@@ -312,6 +313,71 @@ def run_fake_incremental_ocr(
     )
 
 
+def run_fake_hybrid_ocr(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    page_hashes: list[str],
+    ocr_calls: list[list[int]],
+    marker_calls: list[Path],
+) -> str:
+    monkeypatch.setattr(module, "render_pdf_page_hashes", lambda _pdf_file: page_hashes)
+
+    def fake_selected_ocr(_pdf_file: Path, page_numbers: list[int]) -> dict[int, str]:
+        ocr_calls.append(page_numbers)
+        return {
+            page_number: f"hybrid fresh page {page_number}"
+            for page_number in page_numbers
+        }
+
+    def fake_marker(pdf_file: Path, marker_dir: Path) -> None:
+        marker_calls.append(pdf_file)
+        marker_dir.mkdir(parents=True, exist_ok=True)
+        (marker_dir / "result.md").write_text("No visuals", encoding="utf-8")
+
+    monkeypatch.setattr(module, "ollama_ocr_selected_pdf_pages", fake_selected_ocr)
+    monkeypatch.setattr(module, "run_hybrid_marker", fake_marker)
+
+    return module.hybrid_marker_olmocr_pdf(
+        tmp_path / "hybrid.pdf",
+        tmp_path / "attachments",
+        "Attachments/Test",
+        tmp_path / "source" / "Hybrid.note",
+    )
+
+
+def run_fake_hybrid_ocr_with_marker_failure(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    page_hashes: list[str],
+    ocr_calls: list[list[int]],
+    marker_calls: list[Path],
+) -> str:
+    monkeypatch.setattr(module, "render_pdf_page_hashes", lambda _pdf_file: page_hashes)
+
+    def fake_selected_ocr(_pdf_file: Path, page_numbers: list[int]) -> dict[int, str]:
+        ocr_calls.append(page_numbers)
+        return {
+            page_number: f"hybrid fresh page {page_number}"
+            for page_number in page_numbers
+        }
+
+    def failing_marker(pdf_file: Path, _marker_dir: Path) -> None:
+        marker_calls.append(pdf_file)
+        raise RuntimeError("Invalid buffer size: 23.97 GiB")
+
+    monkeypatch.setattr(module, "ollama_ocr_selected_pdf_pages", fake_selected_ocr)
+    monkeypatch.setattr(module, "run_hybrid_marker", failing_marker)
+
+    return module.hybrid_marker_olmocr_pdf(
+        tmp_path / "hybrid.pdf",
+        tmp_path / "attachments",
+        "Attachments/Test",
+        tmp_path / "source" / "Hybrid.note",
+    )
+
+
 def test_incremental_local_ollama_first_run_ocrs_all_pages(
     load_sync_module,
     monkeypatch: pytest.MonkeyPatch,
@@ -376,6 +442,7 @@ def test_incremental_local_ollama_changed_middle_page_ocrs_only_that_page(
     assert "## Page 3\n\nfresh page 3" in markdown
     assert cache["last_run"]["changed_pages"] == [2]
     assert cache["last_run"]["reused_pages_count"] == 2
+    assert cache["last_run"]["deleted_pages_count"] == 0
 
 
 def test_incremental_local_ollama_inserted_page_reuses_shifted_pages(
@@ -397,6 +464,7 @@ def test_incremental_local_ollama_inserted_page_reuses_shifted_pages(
     assert "## Page 4\n\nfresh page 3" in markdown
     assert cache["last_run"]["changed_pages"] == [2]
     assert cache["last_run"]["reused_pages_count"] == 3
+    assert cache["last_run"]["deleted_pages_count"] == 0
 
 
 def test_incremental_local_ollama_deleted_page_is_removed(
@@ -450,3 +518,180 @@ def test_incremental_local_ollama_fingerprint_change_ocrs_all_pages(
     assert "fresh page 1" in markdown
     assert cache["ocr_fingerprint"] == "new-fingerprint"
     assert cache["last_run"]["pages_to_ocr_count"] == 2
+
+
+def test_incremental_hybrid_first_run_ocrs_all_pages_and_runs_marker(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module({"ocr_provider": "hybrid_marker_olmocr"})
+    ocr_calls: list[list[int]] = []
+    marker_calls: list[Path] = []
+
+    markdown = run_fake_hybrid_ocr(
+        module,
+        monkeypatch,
+        tmp_path,
+        ["a", "b", "c"],
+        ocr_calls,
+        marker_calls,
+    )
+    cache = module.load_page_cache(tmp_path / "source" / "Hybrid.note")
+
+    assert ocr_calls == [[1, 2, 3]]
+    assert len(marker_calls) == 1
+    assert "## Page 1\n\nhybrid fresh page 1" in markdown
+    assert cache["provider"] == "hybrid_marker_olmocr"
+    assert cache["last_run"]["pages_to_ocr_count"] == 3
+
+
+def test_incremental_hybrid_second_run_reuses_text_but_still_runs_marker(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module({"ocr_provider": "hybrid_marker_olmocr"})
+    first_ocr_calls: list[list[int]] = []
+    second_ocr_calls: list[list[int]] = []
+    marker_calls: list[Path] = []
+
+    run_fake_hybrid_ocr(module, monkeypatch, tmp_path, ["a", "b"], first_ocr_calls, marker_calls)
+    markdown = run_fake_hybrid_ocr(module, monkeypatch, tmp_path, ["a", "b"], second_ocr_calls, marker_calls)
+    cache = module.load_page_cache(tmp_path / "source" / "Hybrid.note")
+
+    assert first_ocr_calls == [[1, 2]]
+    assert second_ocr_calls == []
+    assert len(marker_calls) == 2
+    assert "hybrid fresh page 1" in markdown
+    assert "hybrid fresh page 2" in markdown
+    assert cache["last_run"]["reused_pages_count"] == 2
+    assert cache["last_run"]["pages_to_ocr_count"] == 0
+
+
+def test_incremental_hybrid_changed_middle_page_ocrs_only_that_page_and_runs_marker(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module({"ocr_provider": "hybrid_marker_olmocr"})
+    first_ocr_calls: list[list[int]] = []
+    second_ocr_calls: list[list[int]] = []
+    marker_calls: list[Path] = []
+
+    run_fake_hybrid_ocr(module, monkeypatch, tmp_path, ["a", "b", "c"], first_ocr_calls, marker_calls)
+    markdown = run_fake_hybrid_ocr(
+        module,
+        monkeypatch,
+        tmp_path,
+        ["a", "changed", "c"],
+        second_ocr_calls,
+        marker_calls,
+    )
+    cache = module.load_page_cache(tmp_path / "source" / "Hybrid.note")
+
+    assert second_ocr_calls == [[2]]
+    assert len(marker_calls) == 2
+    assert "## Page 1\n\nhybrid fresh page 1" in markdown
+    assert "## Page 2\n\nhybrid fresh page 2" in markdown
+    assert "## Page 3\n\nhybrid fresh page 3" in markdown
+    assert cache["last_run"]["changed_pages"] == [2]
+    assert cache["last_run"]["reused_pages_count"] == 2
+    assert cache["last_run"]["deleted_pages_count"] == 0
+
+
+def test_incremental_hybrid_does_not_reuse_local_ollama_cache(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module({"ocr_provider": "hybrid_marker_olmocr"})
+    note_file = tmp_path / "source" / "Hybrid.note"
+    module.save_page_cache(
+        note_file,
+        {
+            "ocr_fingerprint": module.ocr_settings_fingerprint("local_ollama"),
+            "provider": "local_ollama",
+            "pages": [cached_page("a", "local cached a"), cached_page("b", "local cached b")],
+        },
+    )
+    ocr_calls: list[list[int]] = []
+    marker_calls: list[Path] = []
+
+    markdown = run_fake_hybrid_ocr(
+        module,
+        monkeypatch,
+        tmp_path,
+        ["a", "b"],
+        ocr_calls,
+        marker_calls,
+    )
+    cache = module.load_page_cache(note_file)
+
+    assert ocr_calls == [[1, 2]]
+    assert len(marker_calls) == 1
+    assert "local cached" not in markdown
+    assert "hybrid fresh page 1" in markdown
+    assert cache["provider"] == "hybrid_marker_olmocr"
+    assert cache["last_run"]["pages_to_ocr_count"] == 2
+
+
+def test_incremental_hybrid_marker_failure_returns_ollama_text_and_saves_cache(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module({"ocr_provider": "hybrid_marker_olmocr"})
+    ocr_calls: list[list[int]] = []
+    marker_calls: list[Path] = []
+
+    markdown = run_fake_hybrid_ocr_with_marker_failure(
+        module,
+        monkeypatch,
+        tmp_path,
+        ["a", "b"],
+        ocr_calls,
+        marker_calls,
+    )
+    cache = module.load_page_cache(tmp_path / "source" / "Hybrid.note")
+
+    assert ocr_calls == [[1, 2]]
+    assert len(marker_calls) == 1
+    assert "## Page 1\n\nhybrid fresh page 1" in markdown
+    assert "## Page 2\n\nhybrid fresh page 2" in markdown
+    assert "extracted_visuals" not in markdown
+    assert cache["provider"] == "hybrid_marker_olmocr"
+    assert cache["last_run"]["pages_to_ocr_count"] == 2
+
+
+def test_incremental_hybrid_marker_failure_on_second_run_still_ocrs_only_changed_page(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module({"ocr_provider": "hybrid_marker_olmocr"})
+    first_ocr_calls: list[list[int]] = []
+    second_ocr_calls: list[list[int]] = []
+    marker_calls: list[Path] = []
+
+    run_fake_hybrid_ocr(module, monkeypatch, tmp_path, ["a", "b", "c"], first_ocr_calls, marker_calls)
+    markdown = run_fake_hybrid_ocr_with_marker_failure(
+        module,
+        monkeypatch,
+        tmp_path,
+        ["a", "changed", "c"],
+        second_ocr_calls,
+        marker_calls,
+    )
+    cache = module.load_page_cache(tmp_path / "source" / "Hybrid.note")
+
+    assert first_ocr_calls == [[1, 2, 3]]
+    assert second_ocr_calls == [[2]]
+    assert len(marker_calls) == 2
+    assert "## Page 1\n\nhybrid fresh page 1" in markdown
+    assert "## Page 2\n\nhybrid fresh page 2" in markdown
+    assert "## Page 3\n\nhybrid fresh page 3" in markdown
+    assert cache["last_run"]["changed_pages"] == [2]
+    assert cache["last_run"]["pages_to_ocr_count"] == 1
+    assert cache["last_run"]["reused_pages_count"] == 2
+    assert cache["last_run"]["deleted_pages_count"] == 0

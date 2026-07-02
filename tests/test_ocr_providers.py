@@ -104,9 +104,13 @@ def test_process_note_non_local_provider_uses_existing_dispatcher(
     def fail_incremental(*_args) -> str:
         raise AssertionError("local incremental OCR should not run for non-local providers")
 
+    def fail_hybrid(*_args) -> str:
+        raise AssertionError("hybrid OCR should not run for mistral")
+
     monkeypatch.setattr(module, "convert_note_to_pdf", fake_convert)
     monkeypatch.setattr(module, "ocr_pdf", fake_ocr_pdf)
     monkeypatch.setattr(module, "local_ollama_ocr_pdf_incremental", fail_incremental)
+    monkeypatch.setattr(module, "hybrid_marker_olmocr_pdf", fail_hybrid)
 
     module.process_note(note_file)
 
