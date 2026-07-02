@@ -34,6 +34,9 @@ LOG_FILE = APP_SUPPORT_DIR / "supernote_obsidian_sync.log"
 PAGE_CACHE_SCHEMA_VERSION = 1
 PAGE_CACHE_CODE_VERSION = "page-cache-v1"
 PAGE_CACHE_DIR = APP_SUPPORT_DIR / "page_cache"
+PAGE_HASH_DPI = 200
+PAGE_HASH_ALPHA = False
+PAGE_HASH_VERSION = "rendered-page-hash-v1"
 
 LAUNCH_AGENT_LABEL = "com.kulturban.supernote-obsidian-sync"
 LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
@@ -562,6 +565,66 @@ def save_page_cache(note_file: Path, cache: dict) -> None:
     cache_file = page_cache_path(note_file)
     cache_file.parent.mkdir(parents=True, exist_ok=True)
     cache_file.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+
+
+def hash_pixmap_for_cache(pixmap) -> str:
+    """
+    Hash stable visual pixmap data for page-level OCR cache matching.
+    """
+    colorspace = getattr(pixmap, "colorspace", None)
+    colorspace_name = getattr(colorspace, "name", "") if colorspace is not None else ""
+    hash_parts = [
+        PAGE_HASH_VERSION,
+        f"width={getattr(pixmap, 'width', '')}",
+        f"height={getattr(pixmap, 'height', '')}",
+        f"n={getattr(pixmap, 'n', '')}",
+        f"alpha={getattr(pixmap, 'alpha', '')}",
+        f"stride={getattr(pixmap, 'stride', '')}",
+        f"colorspace={colorspace_name}",
+    ]
+
+    hasher = hashlib.sha256()
+    hasher.update("\n".join(hash_parts).encode("utf-8"))
+    hasher.update(b"\n")
+    hasher.update(bytes(pixmap.samples))
+    return hasher.hexdigest()
+
+
+def render_pdf_page_hashes(pdf_file: Path) -> list[str]:
+    """
+    Render a PDF at fixed settings and return stable visual hashes per page.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError as exc:
+        raise RuntimeError(
+            "Page cache hashing requires PyMuPDF. Install it in the active Supsidian Python environment."
+        ) from exc
+
+    render_scale = PAGE_HASH_DPI / 72
+
+    try:
+        document = fitz.open(pdf_file)
+    except Exception as exc:
+        raise RuntimeError(f"Could not open PDF for page cache hashing: {pdf_file}: {exc}") from exc
+
+    try:
+        page_hashes = []
+        for page_number, page in enumerate(document, start=1):
+            try:
+                pixmap = page.get_pixmap(
+                    matrix=fitz.Matrix(render_scale, render_scale),
+                    alpha=PAGE_HASH_ALPHA,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not render page {page_number} for page cache hashing: {pdf_file}: {exc}"
+                ) from exc
+            page_hashes.append(hash_pixmap_for_cache(pixmap))
+    finally:
+        document.close()
+
+    return page_hashes
 
 
 # ------------------------------------------------------------

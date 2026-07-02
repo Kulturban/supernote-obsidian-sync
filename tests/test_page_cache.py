@@ -44,6 +44,22 @@ def cached_page(page_hash: str, markdown: str | None = None) -> dict:
     }
 
 
+@pytest.fixture
+def fitz_module():
+    return pytest.importorskip("fitz")
+
+
+def write_simple_pdf(fitz, pdf_path: Path, page_texts: list[str]) -> None:
+    document = fitz.open()
+    try:
+        for page_text in page_texts:
+            page = document.new_page(width=240, height=240)
+            page.insert_text((40, 80), page_text, fontsize=14)
+        document.save(pdf_path)
+    finally:
+        document.close()
+
+
 def test_reconcile_reuses_99_pages_when_one_middle_page_changes(load_sync_module) -> None:
     module = load_sync_module()
     fingerprint = "fingerprint"
@@ -200,3 +216,72 @@ def test_ocr_settings_fingerprint_is_deterministic(load_sync_module) -> None:
 
     assert module.ocr_settings_fingerprint() == module.ocr_settings_fingerprint()
     assert module.ocr_settings_fingerprint("local_ollama") != module.ocr_settings_fingerprint("mistral")
+
+
+def test_render_pdf_page_hashes_is_deterministic(
+    load_sync_module,
+    fitz_module,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module()
+    pdf_path = tmp_path / "deterministic.pdf"
+    write_simple_pdf(fitz_module, pdf_path, ["Page one"])
+
+    first_hashes = module.render_pdf_page_hashes(pdf_path)
+    second_hashes = module.render_pdf_page_hashes(pdf_path)
+
+    assert first_hashes == second_hashes
+    assert len(first_hashes) == 1
+    assert first_hashes[0]
+
+
+def test_render_pdf_page_hashes_returns_one_hash_per_page(
+    load_sync_module,
+    fitz_module,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module()
+    pdf_path = tmp_path / "two-pages.pdf"
+    write_simple_pdf(fitz_module, pdf_path, ["Page one", "Page two"])
+
+    page_hashes = module.render_pdf_page_hashes(pdf_path)
+
+    assert len(page_hashes) == 2
+    assert all(page_hashes)
+    assert page_hashes[0] != page_hashes[1]
+
+
+def test_render_pdf_page_hashes_only_changed_page_hash_changes(
+    load_sync_module,
+    fitz_module,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module()
+    original_pdf = tmp_path / "original.pdf"
+    changed_pdf = tmp_path / "changed.pdf"
+    write_simple_pdf(fitz_module, original_pdf, ["Page one", "Page two"])
+    write_simple_pdf(fitz_module, changed_pdf, ["Page one", "Page two changed"])
+
+    original_hashes = module.render_pdf_page_hashes(original_pdf)
+    changed_hashes = module.render_pdf_page_hashes(changed_pdf)
+
+    assert len(original_hashes) == 2
+    assert original_hashes[0] == changed_hashes[0]
+    assert original_hashes[1] != changed_hashes[1]
+
+
+def test_render_pdf_page_hashes_raises_useful_error_for_missing_or_non_pdf_file(
+    load_sync_module,
+    fitz_module,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module()
+    missing_pdf = tmp_path / "missing.pdf"
+    not_pdf = tmp_path / "not-a-pdf.pdf"
+    not_pdf.write_text("not actually a PDF", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Could not open PDF for page cache hashing"):
+        module.render_pdf_page_hashes(missing_pdf)
+
+    with pytest.raises(RuntimeError, match="Could not open PDF for page cache hashing"):
+        module.render_pdf_page_hashes(not_pdf)
