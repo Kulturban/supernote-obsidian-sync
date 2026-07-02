@@ -92,6 +92,8 @@ ollama pull richardyoung/olmocr2:7b-q8
 
 By default, Supsidian unloads the Ollama model after each processed note to free memory on 16 GB Macs. You can disable this for faster batch processing with `local_ollama_unload_after_note: false`.
 
+The first local OCR run for a note can still be slow because every page needs OCR. Later runs are much faster when pages are unchanged; if only one page changed, Supsidian can reuse cached OCR for the unchanged pages.
+
 ### mistral
 
 `mistral` is the cloud OCR option and the best compatibility choice for existing configurations. It sends note/PDF content to Mistral's OCR API and requires a `MISTRAL_API_KEY`.
@@ -101,6 +103,8 @@ By default, Supsidian unloads the Ollama model after each processed note to free
 `hybrid_marker_olmocr` is an **Experimental** backend option for advanced users. It combines local Ollama/olmOCR text recognition with Marker layout and visual extraction. When Marker identifies drawings or other visual assets, Supsidian copies the cropped asset into the note attachment folder and embeds it near its document position in Obsidian.
 
 It requires all `local_ollama` prerequisites plus `marker_single` on the runtime PATH. It is available in interactive setup as an **Experimental** option, and advanced users can also select it manually in `config.json`.
+
+Hybrid mode also uses the page-level cache for Ollama text. Marker is used only for visual/layout enrichment and is run on changed pages when cache information is available.
 
 If the app or LaunchAgent PATH does not include `marker_single`, set `hybrid_marker_command` to its absolute path:
 
