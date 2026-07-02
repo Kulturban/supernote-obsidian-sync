@@ -1844,6 +1844,10 @@ struct SettingsView: View {
                         .font(.footnote)
                         .foregroundColor(.orange)
 
+                    Text("Hybrid Marker uses a low-memory profile by default for 16 GB Macs.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+
                     Text("Also requires Ollama and:\nollama pull richardyoung/olmocr2:7b-q8")
                         .font(.system(.caption, design: .monospaced))
                         .foregroundColor(.secondary)

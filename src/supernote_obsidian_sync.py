@@ -63,6 +63,14 @@ DEFAULT_CONFIG = {
     "local_ollama_model": "richardyoung/olmocr2:7b-q8",
     "local_ollama_num_ctx": 8192,
     "hybrid_marker_command": "marker_single",
+    "hybrid_marker_disable_multiprocessing": True,
+    "hybrid_marker_layout_batch_size": 1,
+    "hybrid_marker_detection_batch_size": 1,
+    "hybrid_marker_recognition_batch_size": 1,
+    "hybrid_marker_table_rec_batch_size": 1,
+    "hybrid_marker_lowres_image_dpi": 72,
+    "hybrid_marker_highres_image_dpi": 144,
+    "hybrid_marker_disable_tqdm": True,
 }
 
 APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -244,6 +252,28 @@ LOCAL_OLLAMA_NUM_CTX = positive_int_or_default(config.get("local_ollama_num_ctx"
 HYBRID_MARKER_COMMAND = (
     str(config.get("hybrid_marker_command", "marker_single")).strip() or "marker_single"
 )
+HYBRID_MARKER_DISABLE_MULTIPROCESSING = bool(
+    config.get("hybrid_marker_disable_multiprocessing", True)
+)
+HYBRID_MARKER_LAYOUT_BATCH_SIZE = positive_int_or_default(
+    config.get("hybrid_marker_layout_batch_size"), 1
+)
+HYBRID_MARKER_DETECTION_BATCH_SIZE = positive_int_or_default(
+    config.get("hybrid_marker_detection_batch_size"), 1
+)
+HYBRID_MARKER_RECOGNITION_BATCH_SIZE = positive_int_or_default(
+    config.get("hybrid_marker_recognition_batch_size"), 1
+)
+HYBRID_MARKER_TABLE_REC_BATCH_SIZE = positive_int_or_default(
+    config.get("hybrid_marker_table_rec_batch_size"), 1
+)
+HYBRID_MARKER_LOWRES_IMAGE_DPI = positive_int_or_default(
+    config.get("hybrid_marker_lowres_image_dpi"), 72
+)
+HYBRID_MARKER_HIGHRES_IMAGE_DPI = positive_int_or_default(
+    config.get("hybrid_marker_highres_image_dpi"), 144
+)
+HYBRID_MARKER_DISABLE_TQDM = bool(config.get("hybrid_marker_disable_tqdm", True))
 SUPPORTED_OCR_PROVIDERS = (
     "mistral",
     "local_ollama",
@@ -429,6 +459,16 @@ def ocr_settings_fingerprint(provider: str | None = None) -> str:
             "num_ctx": LOCAL_OLLAMA_NUM_CTX,
             "prompt": LOCAL_OLLAMA_PROMPT,
             "marker_command": HYBRID_MARKER_COMMAND,
+            "marker_low_memory_profile": {
+                "disable_multiprocessing": HYBRID_MARKER_DISABLE_MULTIPROCESSING,
+                "layout_batch_size": HYBRID_MARKER_LAYOUT_BATCH_SIZE,
+                "detection_batch_size": HYBRID_MARKER_DETECTION_BATCH_SIZE,
+                "recognition_batch_size": HYBRID_MARKER_RECOGNITION_BATCH_SIZE,
+                "table_rec_batch_size": HYBRID_MARKER_TABLE_REC_BATCH_SIZE,
+                "lowres_image_dpi": HYBRID_MARKER_LOWRES_IMAGE_DPI,
+                "highres_image_dpi": HYBRID_MARKER_HIGHRES_IMAGE_DPI,
+                "disable_tqdm": HYBRID_MARKER_DISABLE_TQDM,
+            },
             "table_conversion": "forgiving-html-v1",
             "visual_placement": "marker-order-v1",
             "rendering": {
@@ -1217,8 +1257,41 @@ def run_hybrid_marker(pdf_file: Path, marker_output_dir: Path) -> None:
         )
 
     marker_output_dir.mkdir(parents=True, exist_ok=True)
+    marker_args = [
+        marker_command,
+        str(pdf_file),
+        "--output_dir",
+        str(marker_output_dir),
+        "--output_format",
+        "markdown",
+        "--force_ocr",
+    ]
+
+    if HYBRID_MARKER_DISABLE_MULTIPROCESSING:
+        marker_args.append("--disable_multiprocessing")
+
+    marker_args.extend(
+        [
+            "--layout_batch_size",
+            str(HYBRID_MARKER_LAYOUT_BATCH_SIZE),
+            "--detection_batch_size",
+            str(HYBRID_MARKER_DETECTION_BATCH_SIZE),
+            "--recognition_batch_size",
+            str(HYBRID_MARKER_RECOGNITION_BATCH_SIZE),
+            "--table_rec_batch_size",
+            str(HYBRID_MARKER_TABLE_REC_BATCH_SIZE),
+            "--lowres_image_dpi",
+            str(HYBRID_MARKER_LOWRES_IMAGE_DPI),
+            "--highres_image_dpi",
+            str(HYBRID_MARKER_HIGHRES_IMAGE_DPI),
+        ]
+    )
+
+    if HYBRID_MARKER_DISABLE_TQDM:
+        marker_args.append("--disable_tqdm")
+
     result = subprocess.run(
-        [marker_command, str(pdf_file), "--output_dir", str(marker_output_dir)],
+        marker_args,
         capture_output=True,
         text=True,
         check=False,

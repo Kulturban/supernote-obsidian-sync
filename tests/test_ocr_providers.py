@@ -260,6 +260,44 @@ def test_missing_marker_command_has_clear_error(load_sync_module, monkeypatch: p
         module.run_hybrid_marker(tmp_path / "note.pdf", tmp_path / "marker-output")
 
 
+def test_run_hybrid_marker_uses_low_memory_profile_by_default(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module()
+    captured: dict[str, list[str]] = {}
+
+    class FakeCompletedProcess:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(args: list[str], **_kwargs) -> FakeCompletedProcess:
+        captured["args"] = args
+        return FakeCompletedProcess()
+
+    monkeypatch.setattr(module.shutil, "which", lambda _command: "/fake/bin/marker_single")
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    module.run_hybrid_marker(tmp_path / "note.pdf", tmp_path / "marker-output")
+
+    args = captured["args"]
+    assert args[:2] == ["/fake/bin/marker_single", str(tmp_path / "note.pdf")]
+    assert "--output_dir" in args
+    assert str(tmp_path / "marker-output") in args
+    assert args[args.index("--output_format") + 1] == "markdown"
+    assert "--force_ocr" in args
+    assert "--disable_multiprocessing" in args
+    assert args[args.index("--layout_batch_size") + 1] == "1"
+    assert args[args.index("--detection_batch_size") + 1] == "1"
+    assert args[args.index("--recognition_batch_size") + 1] == "1"
+    assert args[args.index("--table_rec_batch_size") + 1] == "1"
+    assert args[args.index("--lowres_image_dpi") + 1] == "72"
+    assert args[args.index("--highres_image_dpi") + 1] == "144"
+    assert "--disable_tqdm" in args
+
+
 def test_copy_marker_visuals_filters_unsafe_and_unreferenced_assets(load_sync_module, tmp_path: Path) -> None:
     module = load_sync_module()
     marker_dir = tmp_path / "marker-output"
