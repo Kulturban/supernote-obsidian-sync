@@ -118,6 +118,177 @@ def test_process_note_non_local_provider_uses_existing_dispatcher(
     assert (tmp_path / "vault" / "notes" / "source - Test.md").exists()
 
 
+@pytest.mark.parametrize(
+    ("provider", "provider_function_name"),
+    [
+        ("local_ollama", "local_ollama_ocr_pdf_incremental"),
+        ("hybrid_marker_olmocr", "hybrid_marker_olmocr_pdf"),
+    ],
+)
+def test_process_note_unloads_ollama_once_after_local_provider_success(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    provider: str,
+    provider_function_name: str,
+) -> None:
+    module = load_sync_module()
+    note_file = tmp_path / "source" / "Test.note"
+    note_file.parent.mkdir(parents=True)
+    note_file.write_bytes(b"note")
+    monkeypatch.setattr(module, "OCR_PROVIDER", provider)
+    monkeypatch.setattr(module, "OBSIDIAN_NOTE_DIR", tmp_path / "vault" / "notes")
+    monkeypatch.setattr(module, "PDF_DIR", tmp_path / "vault" / "attachments")
+    monkeypatch.setattr(module, "ACTIVE_ATTACHMENT_FOLDER", "Attachments/Test")
+
+    unload_calls: list[str] = []
+
+    def fake_convert(_note_file: Path, pdf_file: Path) -> None:
+        pdf_file.parent.mkdir(parents=True, exist_ok=True)
+        pdf_file.write_bytes(b"pdf")
+
+    def fake_provider(*_args) -> str:
+        return "## Page 1\n\nlocal text\n"
+
+    monkeypatch.setattr(module, "convert_note_to_pdf", fake_convert)
+    monkeypatch.setattr(module, provider_function_name, fake_provider)
+    monkeypatch.setattr(module, "unload_local_ollama_model_after_note", lambda: unload_calls.append("unload"))
+
+    module.process_note(note_file)
+
+    assert unload_calls == ["unload"]
+
+
+def test_process_note_does_not_unload_ollama_for_mistral(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module()
+    note_file = tmp_path / "source" / "Test.note"
+    note_file.parent.mkdir(parents=True)
+    note_file.write_bytes(b"note")
+    monkeypatch.setattr(module, "OCR_PROVIDER", "mistral")
+    monkeypatch.setattr(module, "OBSIDIAN_NOTE_DIR", tmp_path / "vault" / "notes")
+    monkeypatch.setattr(module, "PDF_DIR", tmp_path / "vault" / "attachments")
+    monkeypatch.setattr(module, "ACTIVE_ATTACHMENT_FOLDER", "Attachments/Test")
+
+    def fake_convert(_note_file: Path, pdf_file: Path) -> None:
+        pdf_file.parent.mkdir(parents=True, exist_ok=True)
+        pdf_file.write_bytes(b"pdf")
+
+    monkeypatch.setattr(module, "convert_note_to_pdf", fake_convert)
+    monkeypatch.setattr(module, "ocr_pdf", lambda *_args: "## Page 1\n\nmistral text\n")
+    monkeypatch.setattr(
+        module,
+        "unload_local_ollama_model_after_note",
+        lambda: (_ for _ in ()).throw(AssertionError("mistral should not unload Ollama")),
+    )
+
+    module.process_note(note_file)
+
+
+def test_process_note_unloads_ollama_if_local_provider_raises_after_start(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module()
+    note_file = tmp_path / "source" / "Test.note"
+    note_file.parent.mkdir(parents=True)
+    note_file.write_bytes(b"note")
+    monkeypatch.setattr(module, "OCR_PROVIDER", "local_ollama")
+    monkeypatch.setattr(module, "OBSIDIAN_NOTE_DIR", tmp_path / "vault" / "notes")
+    monkeypatch.setattr(module, "PDF_DIR", tmp_path / "vault" / "attachments")
+    monkeypatch.setattr(module, "ACTIVE_ATTACHMENT_FOLDER", "Attachments/Test")
+
+    unload_calls: list[str] = []
+
+    def fake_convert(_note_file: Path, pdf_file: Path) -> None:
+        pdf_file.parent.mkdir(parents=True, exist_ok=True)
+        pdf_file.write_bytes(b"pdf")
+
+    def failing_local_provider(*_args) -> str:
+        raise RuntimeError("OCR failed after starting")
+
+    monkeypatch.setattr(module, "convert_note_to_pdf", fake_convert)
+    monkeypatch.setattr(module, "local_ollama_ocr_pdf_incremental", failing_local_provider)
+    monkeypatch.setattr(module, "unload_local_ollama_model_after_note", lambda: unload_calls.append("unload"))
+
+    with pytest.raises(RuntimeError, match="OCR failed after starting"):
+        module.process_note(note_file)
+
+    assert unload_calls == ["unload"]
+
+
+def test_unload_local_ollama_model_runs_ollama_stop_when_enabled(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_sync_module({"local_ollama_model": "test-model"})
+    calls: list[list[str]] = []
+
+    class FakeCompletedProcess:
+        returncode = 0
+        stdout = "stopped"
+        stderr = ""
+
+    def fake_run(args: list[str], **_kwargs) -> FakeCompletedProcess:
+        calls.append(args)
+        return FakeCompletedProcess()
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    module.unload_local_ollama_model_after_note()
+
+    assert calls == [["ollama", "stop", "test-model"]]
+
+
+def test_unload_local_ollama_model_does_not_raise_when_stop_fails(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_sync_module({"local_ollama_model": "test-model"})
+
+    class FakeCompletedProcess:
+        returncode = 1
+        stdout = ""
+        stderr = "not running"
+
+    monkeypatch.setattr(module.subprocess, "run", lambda *_args, **_kwargs: FakeCompletedProcess())
+
+    module.unload_local_ollama_model_after_note()
+
+
+def test_unload_local_ollama_model_does_nothing_when_disabled(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_sync_module({"local_ollama_unload_after_note": False})
+
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ollama stop should not run")),
+    )
+
+    module.unload_local_ollama_model_after_note()
+
+
+def test_unload_local_ollama_model_does_not_raise_when_ollama_missing(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_sync_module({"local_ollama_model": "test-model"})
+
+    def missing_ollama(*_args, **_kwargs):
+        raise FileNotFoundError("ollama")
+
+    monkeypatch.setattr(module.subprocess, "run", missing_ollama)
+
+    module.unload_local_ollama_model_after_note()
+
+
 @pytest.mark.parametrize("configured_provider", [None, ""])
 def test_legacy_or_empty_provider_effectively_defaults_to_mistral(
     load_sync_module,

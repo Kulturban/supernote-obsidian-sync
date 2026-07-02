@@ -62,6 +62,7 @@ DEFAULT_CONFIG = {
     "local_ollama_url": "http://localhost:11434/api/generate",
     "local_ollama_model": "richardyoung/olmocr2:7b-q8",
     "local_ollama_num_ctx": 8192,
+    "local_ollama_unload_after_note": True,
     "hybrid_marker_command": "marker_single",
     "hybrid_marker_disable_multiprocessing": True,
     "hybrid_marker_layout_batch_size": 1,
@@ -249,6 +250,7 @@ LOCAL_OLLAMA_MODEL = (
     or "richardyoung/olmocr2:7b-q8"
 )
 LOCAL_OLLAMA_NUM_CTX = positive_int_or_default(config.get("local_ollama_num_ctx"), 8192)
+LOCAL_OLLAMA_UNLOAD_AFTER_NOTE = bool(config.get("local_ollama_unload_after_note", True))
 HYBRID_MARKER_COMMAND = (
     str(config.get("hybrid_marker_command", "marker_single")).strip() or "marker_single"
 )
@@ -948,6 +950,35 @@ def local_ollama_ocr_pdf(
     page_transcriptions = ollama_ocr_pdf_pages(pdf_file)
     log(f"Local Ollama OCR finished: {pdf_file}")
     return format_ocr_pages(page_transcriptions)
+
+
+def unload_local_ollama_model_after_note() -> None:
+    if not LOCAL_OLLAMA_UNLOAD_AFTER_NOTE:
+        return
+
+    try:
+        result = subprocess.run(
+            ["ollama", "stop", LOCAL_OLLAMA_MODEL],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        log("Could not unload Ollama model after note: ollama command not found")
+        return
+    except Exception as exc:
+        log(f"Could not unload Ollama model after note: {exc}")
+        return
+
+    if result.returncode == 0:
+        log(f"Unloaded Ollama model after note: {LOCAL_OLLAMA_MODEL}")
+    else:
+        detail = (result.stderr or result.stdout).strip().replace("\n", " ")
+        detail = detail[:1000] or "no output"
+        log(
+            f"Could not unload Ollama model after note "
+            f"({LOCAL_OLLAMA_MODEL}): {detail}"
+        )
 
 
 def incremental_ollama_page_transcriptions(
@@ -1671,11 +1702,13 @@ def process_note(note_file: Path) -> None:
 
     shutil.copy2(note_file, obsidian_note_copy)
     log(f"Copied .note temporarily to Obsidian: {obsidian_note_copy}")
+    started_local_ollama_ocr = False
 
     try:
         convert_note_to_pdf(note_file, pdf_file)
 
         if OCR_PROVIDER == "local_ollama":
+            started_local_ollama_ocr = True
             ocr_markdown = local_ollama_ocr_pdf_incremental(
                 pdf_file,
                 note_attachment_dir,
@@ -1683,6 +1716,7 @@ def process_note(note_file: Path) -> None:
                 note_file,
             )
         elif OCR_PROVIDER == "hybrid_marker_olmocr":
+            started_local_ollama_ocr = True
             ocr_markdown = hybrid_marker_olmocr_pdf(
                 pdf_file,
                 note_attachment_dir,
@@ -1711,6 +1745,9 @@ def process_note(note_file: Path) -> None:
         log(f"Markdown written: {md_file}")
 
     finally:
+        if started_local_ollama_ocr:
+            unload_local_ollama_model_after_note()
+
         if obsidian_note_copy.exists():
             obsidian_note_copy.unlink()
             log(f"Deleted copied .note file: {obsidian_note_copy}")

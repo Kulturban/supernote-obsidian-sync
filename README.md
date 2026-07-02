@@ -90,6 +90,8 @@ Pull the default model with:
 ollama pull richardyoung/olmocr2:7b-q8
 ```
 
+By default, Supsidian unloads the Ollama model after each processed note to free memory on 16 GB Macs. You can disable this for faster batch processing with `local_ollama_unload_after_note: false`.
+
 ### mistral
 
 `mistral` is the cloud OCR option and the best compatibility choice for existing configurations. It sends note/PDF content to Mistral's OCR API and requires a `MISTRAL_API_KEY`.
@@ -128,7 +130,8 @@ Example local Ollama configuration:
   "ocr_provider": "local_ollama",
   "local_ollama_url": "http://localhost:11434/api/generate",
   "local_ollama_model": "richardyoung/olmocr2:7b-q8",
-  "local_ollama_num_ctx": 8192
+  "local_ollama_num_ctx": 8192,
+  "local_ollama_unload_after_note": true
 }
 ```
 

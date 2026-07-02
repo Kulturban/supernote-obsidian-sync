@@ -79,6 +79,7 @@ struct SyncConfig: Codable {
     var local_ollama_url: String
     var local_ollama_model: String
     var local_ollama_num_ctx: Int
+    var local_ollama_unload_after_note: Bool
     var hybrid_marker_command: String
     var notebooks: [NotebookConfig]
 
@@ -95,6 +96,7 @@ struct SyncConfig: Codable {
         local_ollama_url: "http://localhost:11434/api/generate",
         local_ollama_model: "richardyoung/olmocr2:7b-q8",
         local_ollama_num_ctx: 8192,
+        local_ollama_unload_after_note: true,
         hybrid_marker_command: "marker_single",
         notebooks: []
     )
@@ -112,6 +114,7 @@ struct SyncConfig: Codable {
         case local_ollama_url
         case local_ollama_model
         case local_ollama_num_ctx
+        case local_ollama_unload_after_note
         case hybrid_marker_command
         case notebooks
     }
@@ -129,6 +132,7 @@ struct SyncConfig: Codable {
         local_ollama_url: String,
         local_ollama_model: String,
         local_ollama_num_ctx: Int,
+        local_ollama_unload_after_note: Bool,
         hybrid_marker_command: String,
         notebooks: [NotebookConfig]
     ) {
@@ -144,6 +148,7 @@ struct SyncConfig: Codable {
         self.local_ollama_url = local_ollama_url
         self.local_ollama_model = local_ollama_model
         self.local_ollama_num_ctx = local_ollama_num_ctx
+        self.local_ollama_unload_after_note = local_ollama_unload_after_note
         self.hybrid_marker_command = hybrid_marker_command
         self.notebooks = notebooks
     }
@@ -163,6 +168,7 @@ struct SyncConfig: Codable {
         self.local_ollama_url = try container.decodeIfPresent(String.self, forKey: .local_ollama_url) ?? "http://localhost:11434/api/generate"
         self.local_ollama_model = try container.decodeIfPresent(String.self, forKey: .local_ollama_model) ?? "richardyoung/olmocr2:7b-q8"
         self.local_ollama_num_ctx = try container.decodeIfPresent(Int.self, forKey: .local_ollama_num_ctx) ?? 8192
+        self.local_ollama_unload_after_note = try container.decodeIfPresent(Bool.self, forKey: .local_ollama_unload_after_note) ?? true
         self.hybrid_marker_command = try container.decodeIfPresent(String.self, forKey: .hybrid_marker_command) ?? "marker_single"
         self.notebooks = try container.decodeIfPresent([NotebookConfig].self, forKey: .notebooks) ?? []
     }
@@ -322,6 +328,7 @@ final class SettingsViewModel: ObservableObject {
     @Published var localOllamaURL = "http://localhost:11434/api/generate"
     @Published var localOllamaModel = "richardyoung/olmocr2:7b-q8"
     @Published var localOllamaNumCtx = "8192"
+    @Published var localOllamaUnloadAfterNote = true
     @Published var hybridMarkerCommand = "marker_single"
     @Published var mistralApiKey = ""
     @Published var notebooks: [NotebookConfig] = []
@@ -407,6 +414,7 @@ final class SettingsViewModel: ObservableObject {
                     ? "richardyoung/olmocr2:7b-q8"
                     : localOllamaModel.trimmingCharacters(in: .whitespacesAndNewlines),
                 local_ollama_num_ctx: parsedLocalOllamaNumCtx ?? 8192,
+                local_ollama_unload_after_note: localOllamaUnloadAfterNote,
                 hybrid_marker_command: hybridMarkerCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     ? "marker_single"
                     : hybridMarkerCommand.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -448,6 +456,7 @@ final class SettingsViewModel: ObservableObject {
         localOllamaURL = config.local_ollama_url.isEmpty ? "http://localhost:11434/api/generate" : config.local_ollama_url
         localOllamaModel = config.local_ollama_model.isEmpty ? "richardyoung/olmocr2:7b-q8" : config.local_ollama_model
         localOllamaNumCtx = String(config.local_ollama_num_ctx > 0 ? config.local_ollama_num_ctx : 8192)
+        localOllamaUnloadAfterNote = config.local_ollama_unload_after_note
         hybridMarkerCommand = config.hybrid_marker_command.isEmpty ? "marker_single" : config.hybrid_marker_command
         notebooks = config.notebooks
     }
@@ -1813,6 +1822,10 @@ struct SettingsView: View {
                     SettingField(title: "Ollama URL", text: $model.localOllamaURL)
                     SettingField(title: "Ollama model", text: $model.localOllamaModel)
                     SettingField(title: "Context size", text: $model.localOllamaNumCtx)
+                    Toggle("Unload Ollama model after each note", isOn: $model.localOllamaUnloadAfterNote)
+                    Text("Recommended for 16 GB Macs to free memory after each processed note. Disable for faster batch processing.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
 
                     Text("Requires Ollama and:\nollama pull richardyoung/olmocr2:7b-q8")
                         .font(.system(.caption, design: .monospaced))
@@ -1838,6 +1851,10 @@ struct SettingsView: View {
                     SettingField(title: "Ollama URL", text: $model.localOllamaURL)
                     SettingField(title: "Ollama model", text: $model.localOllamaModel)
                     SettingField(title: "Context size", text: $model.localOllamaNumCtx)
+                    Toggle("Unload Ollama model after each note", isOn: $model.localOllamaUnloadAfterNote)
+                    Text("Recommended for 16 GB Macs to free memory after each processed note. Disable for faster batch processing.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
                     SettingField(title: "Marker command", text: $model.hybridMarkerCommand)
 
                     Text("Experimental. Requires Marker/marker_single. If Supsidian app or LaunchAgent cannot find marker_single, use an absolute path.")

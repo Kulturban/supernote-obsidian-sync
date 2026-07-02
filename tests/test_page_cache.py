@@ -520,6 +520,30 @@ def test_incremental_local_ollama_fingerprint_change_ocrs_all_pages(
     assert cache["last_run"]["pages_to_ocr_count"] == 2
 
 
+def test_incremental_local_ollama_helper_does_not_unload_model_directly(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module({"ocr_provider": "local_ollama"})
+    ocr_calls: list[list[int]] = []
+    monkeypatch.setattr(
+        module,
+        "unload_local_ollama_model_after_note",
+        lambda: (_ for _ in ()).throw(AssertionError("lower-level local OCR should not unload")),
+    )
+
+    run_fake_incremental_ocr(
+        module,
+        monkeypatch,
+        tmp_path,
+        ["a"],
+        ocr_calls,
+    )
+
+    assert ocr_calls == [[1]]
+
+
 def test_incremental_hybrid_first_run_ocrs_all_pages_and_runs_marker(
     load_sync_module,
     monkeypatch: pytest.MonkeyPatch,
@@ -634,6 +658,33 @@ def test_incremental_hybrid_does_not_reuse_local_ollama_cache(
     assert "hybrid fresh page 1" in markdown
     assert cache["provider"] == "hybrid_marker_olmocr"
     assert cache["last_run"]["pages_to_ocr_count"] == 2
+
+
+def test_incremental_hybrid_helper_does_not_unload_model_directly(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module({"ocr_provider": "hybrid_marker_olmocr"})
+    ocr_calls: list[list[int]] = []
+    marker_calls: list[str | None] = []
+    monkeypatch.setattr(
+        module,
+        "unload_local_ollama_model_after_note",
+        lambda: (_ for _ in ()).throw(AssertionError("lower-level hybrid OCR should not unload")),
+    )
+
+    run_fake_hybrid_ocr(
+        module,
+        monkeypatch,
+        tmp_path,
+        ["a"],
+        ocr_calls,
+        marker_calls,
+    )
+
+    assert ocr_calls == [[1]]
+    assert marker_calls == ["0"]
 
 
 def test_incremental_hybrid_marker_failure_returns_ollama_text_and_saves_cache(
