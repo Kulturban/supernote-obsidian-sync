@@ -285,3 +285,168 @@ def test_render_pdf_page_hashes_raises_useful_error_for_missing_or_non_pdf_file(
 
     with pytest.raises(RuntimeError, match="Could not open PDF for page cache hashing"):
         module.render_pdf_page_hashes(not_pdf)
+
+
+def run_fake_incremental_ocr(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    page_hashes: list[str],
+    ocr_calls: list[list[int]],
+) -> str:
+    monkeypatch.setattr(module, "render_pdf_page_hashes", lambda _pdf_file: page_hashes)
+
+    def fake_selected_ocr(_pdf_file: Path, page_numbers: list[int]) -> dict[int, str]:
+        ocr_calls.append(page_numbers)
+        return {
+            page_number: f"fresh page {page_number}"
+            for page_number in page_numbers
+        }
+
+    monkeypatch.setattr(module, "ollama_ocr_selected_pdf_pages", fake_selected_ocr)
+    return module.local_ollama_ocr_pdf_incremental(
+        tmp_path / "note.pdf",
+        tmp_path / "attachments",
+        "Attachments/Test",
+        tmp_path / "source" / "Incremental.note",
+    )
+
+
+def test_incremental_local_ollama_first_run_ocrs_all_pages(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module({"ocr_provider": "local_ollama"})
+    ocr_calls: list[list[int]] = []
+
+    markdown = run_fake_incremental_ocr(
+        module,
+        monkeypatch,
+        tmp_path,
+        ["a", "b", "c"],
+        ocr_calls,
+    )
+    cache = module.load_page_cache(tmp_path / "source" / "Incremental.note")
+
+    assert ocr_calls == [[1, 2, 3]]
+    assert "## Page 1\n\nfresh page 1" in markdown
+    assert "## Page 3\n\nfresh page 3" in markdown
+    assert cache["last_run"]["pages_to_ocr_count"] == 3
+    assert [page["page_hash"] for page in cache["pages"]] == ["a", "b", "c"]
+
+
+def test_incremental_local_ollama_second_run_reuses_all_cached_pages(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module({"ocr_provider": "local_ollama"})
+    first_calls: list[list[int]] = []
+    second_calls: list[list[int]] = []
+
+    run_fake_incremental_ocr(module, monkeypatch, tmp_path, ["a", "b"], first_calls)
+    markdown = run_fake_incremental_ocr(module, monkeypatch, tmp_path, ["a", "b"], second_calls)
+    cache = module.load_page_cache(tmp_path / "source" / "Incremental.note")
+
+    assert first_calls == [[1, 2]]
+    assert second_calls == []
+    assert "fresh page 1" in markdown
+    assert "fresh page 2" in markdown
+    assert cache["last_run"]["reused_pages_count"] == 2
+    assert cache["last_run"]["pages_to_ocr_count"] == 0
+
+
+def test_incremental_local_ollama_changed_middle_page_ocrs_only_that_page(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module({"ocr_provider": "local_ollama"})
+    first_calls: list[list[int]] = []
+    second_calls: list[list[int]] = []
+
+    run_fake_incremental_ocr(module, monkeypatch, tmp_path, ["a", "b", "c"], first_calls)
+    markdown = run_fake_incremental_ocr(module, monkeypatch, tmp_path, ["a", "changed", "c"], second_calls)
+    cache = module.load_page_cache(tmp_path / "source" / "Incremental.note")
+
+    assert second_calls == [[2]]
+    assert "## Page 1\n\nfresh page 1" in markdown
+    assert "## Page 2\n\nfresh page 2" in markdown
+    assert "## Page 3\n\nfresh page 3" in markdown
+    assert cache["last_run"]["changed_pages"] == [2]
+    assert cache["last_run"]["reused_pages_count"] == 2
+
+
+def test_incremental_local_ollama_inserted_page_reuses_shifted_pages(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module({"ocr_provider": "local_ollama"})
+    first_calls: list[list[int]] = []
+    second_calls: list[list[int]] = []
+
+    run_fake_incremental_ocr(module, monkeypatch, tmp_path, ["a", "b", "c"], first_calls)
+    markdown = run_fake_incremental_ocr(module, monkeypatch, tmp_path, ["a", "new", "b", "c"], second_calls)
+    cache = module.load_page_cache(tmp_path / "source" / "Incremental.note")
+
+    assert second_calls == [[2]]
+    assert "## Page 2\n\nfresh page 2" in markdown
+    assert "## Page 3\n\nfresh page 2" in markdown
+    assert "## Page 4\n\nfresh page 3" in markdown
+    assert cache["last_run"]["changed_pages"] == [2]
+    assert cache["last_run"]["reused_pages_count"] == 3
+
+
+def test_incremental_local_ollama_deleted_page_is_removed(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module({"ocr_provider": "local_ollama"})
+    first_calls: list[list[int]] = []
+    second_calls: list[list[int]] = []
+
+    run_fake_incremental_ocr(module, monkeypatch, tmp_path, ["a", "b", "c"], first_calls)
+    markdown = run_fake_incremental_ocr(module, monkeypatch, tmp_path, ["a", "c"], second_calls)
+    cache = module.load_page_cache(tmp_path / "source" / "Incremental.note")
+
+    assert second_calls == []
+    assert "## Page 1\n\nfresh page 1" in markdown
+    assert "## Page 2\n\nfresh page 3" in markdown
+    assert "## Page 3" not in markdown
+    assert cache["last_run"]["deleted_pages_count"] == 1
+
+
+def test_incremental_local_ollama_fingerprint_change_ocrs_all_pages(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module({"ocr_provider": "local_ollama"})
+    note_file = tmp_path / "source" / "Incremental.note"
+    module.save_page_cache(
+        note_file,
+        {
+            "ocr_fingerprint": "old-fingerprint",
+            "pages": [cached_page("a", "old a"), cached_page("b", "old b")],
+        },
+    )
+    monkeypatch.setattr(module, "ocr_settings_fingerprint", lambda _provider=None: "new-fingerprint")
+    ocr_calls: list[list[int]] = []
+
+    markdown = run_fake_incremental_ocr(
+        module,
+        monkeypatch,
+        tmp_path,
+        ["a", "b"],
+        ocr_calls,
+    )
+    cache = module.load_page_cache(note_file)
+
+    assert ocr_calls == [[1, 2]]
+    assert "old a" not in markdown
+    assert "fresh page 1" in markdown
+    assert cache["ocr_fingerprint"] == "new-fingerprint"
+    assert cache["last_run"]["pages_to_ocr_count"] == 2

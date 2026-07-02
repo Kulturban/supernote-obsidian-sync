@@ -77,6 +77,43 @@ def test_provider_dispatch_rejects_unknown_provider(load_sync_module, monkeypatc
         module.ocr_pdf(Path("note.pdf"), Path("images"), "Attachments/Test")
 
 
+def test_process_note_non_local_provider_uses_existing_dispatcher(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module()
+    note_file = tmp_path / "source" / "Test.note"
+    note_file.parent.mkdir(parents=True)
+    note_file.write_bytes(b"note")
+    monkeypatch.setattr(module, "OCR_PROVIDER", "mistral")
+    monkeypatch.setattr(module, "OBSIDIAN_NOTE_DIR", tmp_path / "vault" / "notes")
+    monkeypatch.setattr(module, "PDF_DIR", tmp_path / "vault" / "attachments")
+    monkeypatch.setattr(module, "ACTIVE_ATTACHMENT_FOLDER", "Attachments/Test")
+
+    calls: list[str] = []
+
+    def fake_convert(_note_file: Path, pdf_file: Path) -> None:
+        pdf_file.parent.mkdir(parents=True, exist_ok=True)
+        pdf_file.write_bytes(b"pdf")
+
+    def fake_ocr_pdf(_pdf_file: Path, _image_dir: Path, _obsidian_image_folder: str) -> str:
+        calls.append("dispatcher")
+        return "## Page 1\n\nmistral text\n"
+
+    def fail_incremental(*_args) -> str:
+        raise AssertionError("local incremental OCR should not run for non-local providers")
+
+    monkeypatch.setattr(module, "convert_note_to_pdf", fake_convert)
+    monkeypatch.setattr(module, "ocr_pdf", fake_ocr_pdf)
+    monkeypatch.setattr(module, "local_ollama_ocr_pdf_incremental", fail_incremental)
+
+    module.process_note(note_file)
+
+    assert calls == ["dispatcher"]
+    assert (tmp_path / "vault" / "notes" / "source - Test.md").exists()
+
+
 @pytest.mark.parametrize("configured_provider", [None, ""])
 def test_legacy_or_empty_provider_effectively_defaults_to_mistral(
     load_sync_module,

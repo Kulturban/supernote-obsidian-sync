@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -567,6 +568,10 @@ def save_page_cache(note_file: Path, cache: dict) -> None:
     cache_file.write_text(json.dumps(cache, indent=2), encoding="utf-8")
 
 
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
 def hash_pixmap_for_cache(pixmap) -> str:
     """
     Hash stable visual pixmap data for page-level OCR cache matching.
@@ -753,7 +758,10 @@ def mistral_ocr_pdf(pdf_file: Path, image_dir: Path, obsidian_image_folder: str)
     return "".join(markdown_parts).strip() + "\n"
 
 
-def ollama_ocr_pdf_pages(pdf_file: Path) -> list[str]:
+def ollama_ocr_selected_pdf_pages(pdf_file: Path, page_numbers: list[int]) -> dict[int, str]:
+    if not page_numbers:
+        return {}
+
     try:
         import fitz  # PyMuPDF
     except ImportError as exc:
@@ -762,7 +770,8 @@ def ollama_ocr_pdf_pages(pdf_file: Path) -> list[str]:
         ) from exc
 
     render_scale = 200 / 72
-    page_transcriptions = []
+    selected_pages = sorted(set(page_numbers))
+    page_transcriptions: dict[int, str] = {}
 
     try:
         document = fitz.open(pdf_file)
@@ -772,11 +781,23 @@ def ollama_ocr_pdf_pages(pdf_file: Path) -> list[str]:
     try:
         if len(document) == 0:
             raise RuntimeError(f"PDF has no pages for local_ollama OCR: {pdf_file}")
+        invalid_pages = [
+            page_number
+            for page_number in selected_pages
+            if page_number < 1 or page_number > len(document)
+        ]
+        if invalid_pages:
+            raise RuntimeError(
+                f"Invalid local_ollama OCR page number(s) for {pdf_file}: {invalid_pages}"
+            )
 
         with tempfile.TemporaryDirectory(prefix="supsidian-local-ocr-") as temporary_directory:
             temporary_dir = Path(temporary_directory)
 
             for page_number, page in enumerate(document, start=1):
+                if page_number not in selected_pages:
+                    continue
+
                 page_path = temporary_dir / f"page-{page_number:03d}.png"
                 pixmap = page.get_pixmap(
                     matrix=fitz.Matrix(render_scale, render_scale),
@@ -842,11 +863,33 @@ def ollama_ocr_pdf_pages(pdf_file: Path) -> list[str]:
                         f"{json.dumps(response_data)}"
                     )
 
-                page_transcriptions.append(page_markdown.strip())
+                page_transcriptions[page_number] = page_markdown.strip()
     finally:
         document.close()
 
     return page_transcriptions
+
+
+def ollama_ocr_pdf_pages(pdf_file: Path) -> list[str]:
+    try:
+        import fitz  # PyMuPDF
+    except ImportError as exc:
+        raise RuntimeError(
+            "local_ollama requires PyMuPDF. Install it in the active Supsidian Python environment."
+        ) from exc
+
+    try:
+        document = fitz.open(pdf_file)
+    except Exception as exc:
+        raise RuntimeError(f"Could not open PDF for local_ollama OCR: {pdf_file}: {exc}") from exc
+
+    try:
+        page_numbers = list(range(1, len(document) + 1))
+    finally:
+        document.close()
+
+    page_transcriptions = ollama_ocr_selected_pdf_pages(pdf_file, page_numbers)
+    return [page_transcriptions[page_number] for page_number in page_numbers]
 
 
 def format_ocr_pages(page_transcriptions: list[str]) -> str:
@@ -870,6 +913,93 @@ def local_ollama_ocr_pdf(
     log(f"Starting local Ollama OCR: {pdf_file}")
     page_transcriptions = ollama_ocr_pdf_pages(pdf_file)
     log(f"Local Ollama OCR finished: {pdf_file}")
+    return format_ocr_pages(page_transcriptions)
+
+
+def local_ollama_ocr_pdf_incremental(
+    pdf_file: Path,
+    image_dir: Path,
+    obsidian_image_folder: str,
+    note_file: Path,
+) -> str:
+    log(f"Starting incremental local Ollama OCR: {pdf_file}")
+
+    current_page_hashes = render_pdf_page_hashes(pdf_file)
+    cache = load_page_cache(note_file) or {}
+    cached_pages = cache.get("pages", [])
+    if not isinstance(cached_pages, list):
+        cached_pages = []
+    cached_fingerprint = cache.get("ocr_fingerprint")
+    cached_fingerprint = cached_fingerprint if isinstance(cached_fingerprint, str) else None
+    fingerprint = ocr_settings_fingerprint("local_ollama")
+
+    if cached_fingerprint and cached_fingerprint != fingerprint:
+        log("local_ollama page cache invalidated due to OCR settings fingerprint change")
+
+    reconciliation = reconcile_page_cache(
+        current_page_hashes,
+        cached_pages,
+        fingerprint,
+        cached_fingerprint=cached_fingerprint,
+    )
+    pages_to_ocr = reconciliation["changed_pages"]
+    new_page_markdown = (
+        ollama_ocr_selected_pdf_pages(pdf_file, pages_to_ocr)
+        if pages_to_ocr
+        else {}
+    )
+
+    page_transcriptions: list[str] = []
+    updated_pages: list[dict] = []
+    updated_at = utc_now_iso()
+
+    for ordered_page in reconciliation["ordered_pages"]:
+        page_number = ordered_page["page_number"]
+        if ordered_page["reused"]:
+            markdown = ordered_page["markdown"]
+        else:
+            if page_number not in new_page_markdown:
+                raise RuntimeError(
+                    f"local_ollama did not return OCR text for changed page {page_number}"
+                )
+            markdown = new_page_markdown[page_number]
+
+        page_transcriptions.append(markdown)
+        updated_pages.append(
+            {
+                "page_number": page_number,
+                "page_hash": ordered_page["page_hash"],
+                "markdown": markdown,
+                "assets": [],
+                "updated_at": updated_at,
+            }
+        )
+
+    cache_data = {
+        "schema_version": PAGE_CACHE_SCHEMA_VERSION,
+        "note_path": str(note_file.expanduser().resolve()),
+        "note_cache_id": note_page_cache_id(note_file),
+        "ocr_fingerprint": fingerprint,
+        "provider": "local_ollama",
+        "updated_at": updated_at,
+        "pages": updated_pages,
+        "last_run": {
+            "page_count": len(current_page_hashes),
+            "changed_pages": pages_to_ocr,
+            "reused_pages_count": reconciliation["reused_pages_count"],
+            "pages_to_ocr_count": reconciliation["pages_to_ocr_count"],
+            "deleted_pages_count": reconciliation["deleted_pages_count"],
+        },
+    }
+    save_page_cache(note_file, cache_data)
+
+    log(
+        "local_ollama page cache: "
+        f"reused {reconciliation['reused_pages_count']} page(s), "
+        f"OCRed {reconciliation['pages_to_ocr_count']} page(s), "
+        f"changed pages: {pages_to_ocr}"
+    )
+    log(f"Incremental local Ollama OCR finished: {pdf_file}")
     return format_ocr_pages(page_transcriptions)
 
 
@@ -1366,11 +1496,19 @@ def process_note(note_file: Path) -> None:
     try:
         convert_note_to_pdf(note_file, pdf_file)
 
-        ocr_markdown = ocr_pdf(
-            pdf_file,
-            note_attachment_dir,
-            obsidian_image_folder,
-        )
+        if OCR_PROVIDER == "local_ollama":
+            ocr_markdown = local_ollama_ocr_pdf_incremental(
+                pdf_file,
+                note_attachment_dir,
+                obsidian_image_folder,
+                note_file,
+            )
+        else:
+            ocr_markdown = ocr_pdf(
+                pdf_file,
+                note_attachment_dir,
+                obsidian_image_folder,
+            )
 
         ocr_markdown = convert_hash_lines_to_tasks(ocr_markdown)
 
