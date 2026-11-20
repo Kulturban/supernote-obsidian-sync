@@ -49,6 +49,9 @@ struct NotebookConfig: Identifiable, Codable {
 
 enum OCRProvider: String, CaseIterable, Identifiable {
     case mistral
+    case gemini
+    case claude
+    case openai
     case localOllama = "local_ollama"
     case hybridMarkerOlmocr = "hybrid_marker_olmocr"
     case none = "none"
@@ -59,12 +62,83 @@ enum OCRProvider: String, CaseIterable, Identifiable {
         switch self {
         case .mistral:
             return "Mistral"
+        case .gemini:
+            return "Google Gemini"
+        case .claude:
+            return "Anthropic Claude"
+        case .openai:
+            return "OpenAI"
         case .localOllama:
             return "Local Ollama"
         case .hybridMarkerOlmocr:
             return "Hybrid Marker + Ollama — Experimental"
         case .none:
             return "No OCR (PDF Embed Only)"
+        }
+    }
+
+    var isCloudVLM: Bool {
+        switch self {
+        case .gemini, .claude, .openai:
+            return true
+        case .mistral, .localOllama, .hybridMarkerOlmocr, .none:
+            return false
+        }
+    }
+
+    var defaultCloudModel: String {
+        switch self {
+        case .gemini:
+            return "gemini-2.5-flash"
+        case .claude:
+            return "claude-sonnet-4-5"
+        case .openai:
+            return "gpt-4.1"
+        case .mistral, .localOllama, .hybridMarkerOlmocr, .none:
+            return ""
+        }
+    }
+
+    var suggestedCloudModels: [String] {
+        switch self {
+        case .gemini:
+            return ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"]
+        case .claude:
+            return ["claude-sonnet-4-5", "claude-3-7-sonnet-latest", "claude-3-5-haiku-latest"]
+        case .openai:
+            return ["gpt-4.1", "gpt-4.1-mini", "gpt-4o"]
+        case .mistral, .localOllama, .hybridMarkerOlmocr, .none:
+            return []
+        }
+    }
+
+    var apiKeyEnvVarName: String {
+        switch self {
+        case .mistral:
+            return "MISTRAL_API_KEY"
+        case .gemini:
+            return "GEMINI_API_KEY"
+        case .claude:
+            return "ANTHROPIC_API_KEY"
+        case .openai:
+            return "OPENAI_API_KEY"
+        case .localOllama, .hybridMarkerOlmocr, .none:
+            return ""
+        }
+    }
+
+    var apiKeyFieldLabel: String {
+        switch self {
+        case .mistral:
+            return "Mistral API key"
+        case .gemini:
+            return "Gemini API key"
+        case .claude:
+            return "Anthropic API key"
+        case .openai:
+            return "OpenAI API key"
+        case .localOllama, .hybridMarkerOlmocr, .none:
+            return "API key"
         }
     }
 
@@ -90,6 +164,10 @@ struct SyncConfig: Codable {
     var supernote_partner_app: String
     var supernote_partner_sync_delay_seconds: Int
     var ocr_provider: String
+    var ocr_model: String
+    var gemini_api_key: String
+    var anthropic_api_key: String
+    var openai_api_key: String
     var local_ollama_url: String
     var local_ollama_model: String
     var local_ollama_num_ctx: Int
@@ -110,6 +188,10 @@ struct SyncConfig: Codable {
         supernote_partner_app: "Supernote Partner",
         supernote_partner_sync_delay_seconds: 15,
         ocr_provider: OCRProvider.localOllama.rawValue,
+        ocr_model: "",
+        gemini_api_key: "",
+        anthropic_api_key: "",
+        openai_api_key: "",
         local_ollama_url: "http://localhost:11434/api/generate",
         local_ollama_model: "richardyoung/olmocr2:7b-q8",
         local_ollama_num_ctx: 8192,
@@ -131,6 +213,10 @@ struct SyncConfig: Codable {
         case supernote_partner_app
         case supernote_partner_sync_delay_seconds
         case ocr_provider
+        case ocr_model
+        case gemini_api_key
+        case anthropic_api_key
+        case openai_api_key
         case local_ollama_url
         case local_ollama_model
         case local_ollama_num_ctx
@@ -152,6 +238,10 @@ struct SyncConfig: Codable {
         supernote_partner_app: String,
         supernote_partner_sync_delay_seconds: Int,
         ocr_provider: String,
+        ocr_model: String = "",
+        gemini_api_key: String = "",
+        anthropic_api_key: String = "",
+        openai_api_key: String = "",
         local_ollama_url: String,
         local_ollama_model: String,
         local_ollama_num_ctx: Int,
@@ -171,6 +261,10 @@ struct SyncConfig: Codable {
         self.supernote_partner_app = supernote_partner_app
         self.supernote_partner_sync_delay_seconds = supernote_partner_sync_delay_seconds
         self.ocr_provider = ocr_provider
+        self.ocr_model = ocr_model
+        self.gemini_api_key = gemini_api_key
+        self.anthropic_api_key = anthropic_api_key
+        self.openai_api_key = openai_api_key
         self.local_ollama_url = local_ollama_url
         self.local_ollama_model = local_ollama_model
         self.local_ollama_num_ctx = local_ollama_num_ctx
@@ -194,6 +288,10 @@ struct SyncConfig: Codable {
         self.supernote_partner_app = try container.decodeIfPresent(String.self, forKey: .supernote_partner_app) ?? "Supernote Partner"
         self.supernote_partner_sync_delay_seconds = try container.decodeIfPresent(Int.self, forKey: .supernote_partner_sync_delay_seconds) ?? 15
         self.ocr_provider = try container.decodeIfPresent(String.self, forKey: .ocr_provider) ?? OCRProvider.mistral.rawValue
+        self.ocr_model = try container.decodeIfPresent(String.self, forKey: .ocr_model) ?? ""
+        self.gemini_api_key = try container.decodeIfPresent(String.self, forKey: .gemini_api_key) ?? ""
+        self.anthropic_api_key = try container.decodeIfPresent(String.self, forKey: .anthropic_api_key) ?? ""
+        self.openai_api_key = try container.decodeIfPresent(String.self, forKey: .openai_api_key) ?? ""
         self.local_ollama_url = try container.decodeIfPresent(String.self, forKey: .local_ollama_url) ?? "http://localhost:11434/api/generate"
         self.local_ollama_model = try container.decodeIfPresent(String.self, forKey: .local_ollama_model) ?? "richardyoung/olmocr2:7b-q8"
         self.local_ollama_num_ctx = try container.decodeIfPresent(Int.self, forKey: .local_ollama_num_ctx) ?? 8192
@@ -357,6 +455,14 @@ final class SettingsViewModel: ObservableObject {
     @Published var supernotePartnerApp = "Supernote Partner"
     @Published var supernotePartnerSyncDelaySeconds = "15"
     @Published var ocrProvider = OCRProvider.localOllama.rawValue
+    @Published var ocrModel = ""
+    @Published var geminiApiKey = ""
+    @Published var anthropicApiKey = ""
+    @Published var openaiApiKey = ""
+    @Published var showCloudApiKey = false
+    @Published var isTestingCloudConnection = false
+    @Published var cloudConnectionTestMessage = ""
+    @Published var cloudConnectionTestSucceeded: Bool? = nil
     @Published var localOllamaURL = "http://localhost:11434/api/generate"
     @Published var localOllamaModel = "richardyoung/olmocr2:7b-q8"
     @Published var localOllamaNumCtx = "8192"
@@ -446,6 +552,10 @@ final class SettingsViewModel: ObservableObject {
                     : supernotePartnerApp.trimmingCharacters(in: .whitespacesAndNewlines),
                 supernote_partner_sync_delay_seconds: parsedSupernotePartnerSyncDelaySeconds ?? 15,
                 ocr_provider: selectedOCRProvider.rawValue,
+                ocr_model: ocrModel.trimmingCharacters(in: .whitespacesAndNewlines),
+                gemini_api_key: geminiApiKey.trimmingCharacters(in: .whitespacesAndNewlines),
+                anthropic_api_key: anthropicApiKey.trimmingCharacters(in: .whitespacesAndNewlines),
+                openai_api_key: openaiApiKey.trimmingCharacters(in: .whitespacesAndNewlines),
                 local_ollama_url: localOllamaURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     ? "http://localhost:11434/api/generate"
                     : localOllamaURL.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -464,12 +574,20 @@ final class SettingsViewModel: ObservableObject {
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
 
             let data = try encoder.encode(config)
-            try data.write(to: configURL)
+            try data.write(to: configURL, options: [.atomic])
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: configURL.path
+            )
 
             let trimmedMistralKey = mistralApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
             if selectedOCRProvider == .mistral || !trimmedMistralKey.isEmpty {
                 let envText = "MISTRAL_API_KEY=\(trimmedMistralKey)\n"
                 try envText.write(to: envURL, atomically: true, encoding: .utf8)
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: envURL.path
+                )
             }
 
             if let nextStep = nextSetupStep {
@@ -501,6 +619,10 @@ final class SettingsViewModel: ObservableObject {
                 : 15
         )
         ocrProvider = OCRProvider.normalized(from: config.ocr_provider).rawValue
+        ocrModel = config.ocr_model
+        geminiApiKey = config.gemini_api_key
+        anthropicApiKey = config.anthropic_api_key
+        openaiApiKey = config.openai_api_key
         localOllamaURL = config.local_ollama_url.isEmpty ? "http://localhost:11434/api/generate" : config.local_ollama_url
         localOllamaModel = config.local_ollama_model.isEmpty ? "richardyoung/olmocr2:7b-q8" : config.local_ollama_model
         localOllamaNumCtx = String(config.local_ollama_num_ctx > 0 ? config.local_ollama_num_ctx : 8192)
@@ -522,6 +644,13 @@ final class SettingsViewModel: ObservableObject {
                 errors.append("Mistral AI API key is missing.")
             } else if trimmedKey.contains(" ") || trimmedKey.count < 20 {
                 errors.append("Mistral AI API key does not look valid.")
+            }
+        case .gemini, .claude, .openai:
+            let resolvedKey = resolvedCloudApiKey(for: selectedOCRProvider)
+            if resolvedKey.isEmpty {
+                errors.append("\(selectedOCRProvider.displayName) API key is missing (enter it in settings or set \(selectedOCRProvider.apiKeyEnvVarName)).")
+            } else if resolvedKey.contains(" ") {
+                errors.append("\(selectedOCRProvider.displayName) API key does not look valid.")
             }
         case .localOllama, .hybridMarkerOlmocr:
             if localOllamaURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -654,6 +783,8 @@ final class SettingsViewModel: ObservableObject {
             switch selectedOCRProvider {
             case .mistral:
                 return !mistralApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            case .gemini, .claude, .openai:
+                return !resolvedCloudApiKey(for: selectedOCRProvider).isEmpty
             case .localOllama:
                 return !localOllamaURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     && !localOllamaModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -676,8 +807,192 @@ final class SettingsViewModel: ObservableObject {
             OCRProvider.normalized(from: ocrProvider)
         }
         set {
+            let previous = OCRProvider.normalized(from: ocrProvider)
             ocrProvider = newValue.rawValue
+            if previous != newValue {
+                cloudConnectionTestMessage = ""
+                cloudConnectionTestSucceeded = nil
+                let trimmedModel = ocrModel.trimmingCharacters(in: .whitespacesAndNewlines)
+                if previous.isCloudVLM && newValue.isCloudVLM && !trimmedModel.isEmpty {
+                    let previousDefaults = Set([previous.defaultCloudModel] + previous.suggestedCloudModels)
+                    if previousDefaults.contains(trimmedModel) {
+                        ocrModel = ""
+                    }
+                }
+            }
         }
+    }
+
+    // MARK: Cloud VLM Helpers & Connection Test
+
+    func effectiveCloudModel(for provider: OCRProvider) -> String {
+        let trimmed = ocrModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? provider.defaultCloudModel : trimmed
+    }
+
+    func configuredCloudApiKey(for provider: OCRProvider) -> String {
+        switch provider {
+        case .gemini:
+            return geminiApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        case .claude:
+            return anthropicApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        case .openai:
+            return openaiApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        case .mistral, .localOllama, .hybridMarkerOlmocr, .none:
+            return ""
+        }
+    }
+
+    func environmentCloudApiKey(for provider: OCRProvider) -> String? {
+        let envVar = provider.apiKeyEnvVarName
+        guard !envVar.isEmpty else {
+            return nil
+        }
+
+        if let processValue = ProcessInfo.processInfo.environment[envVar]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !processValue.isEmpty {
+            return processValue
+        }
+
+        if let envFileValue = loadEnvValue(for: envVar)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !envFileValue.isEmpty {
+            return envFileValue
+        }
+
+        return nil
+    }
+
+    func resolvedCloudApiKey(for provider: OCRProvider) -> String {
+        let configured = configuredCloudApiKey(for: provider)
+        if !configured.isEmpty {
+            return configured
+        }
+        return environmentCloudApiKey(for: provider) ?? ""
+    }
+
+    func hasCloudApiKeyFromEnvironmentOnly(for provider: OCRProvider) -> Bool {
+        configuredCloudApiKey(for: provider).isEmpty && environmentCloudApiKey(for: provider) != nil
+    }
+
+    func testCloudProviderConnection() async {
+        let provider = selectedOCRProvider
+        guard provider.isCloudVLM else {
+            return
+        }
+
+        let apiKey = resolvedCloudApiKey(for: provider)
+        let model = effectiveCloudModel(for: provider)
+
+        guard !apiKey.isEmpty else {
+            cloudConnectionTestSucceeded = false
+            cloudConnectionTestMessage = "❌ \(provider.displayName) API key is missing. Enter a key above or set \(provider.apiKeyEnvVarName)."
+            return
+        }
+
+        isTestingCloudConnection = true
+        cloudConnectionTestSucceeded = nil
+        cloudConnectionTestMessage = "Testing connection to \(provider.displayName) (\(model))…"
+        defer { isTestingCloudConnection = false }
+
+        do {
+            let request = try buildCloudConnectionTestRequest(
+                provider: provider,
+                model: model,
+                apiKey: apiKey
+            )
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                cloudConnectionTestSucceeded = false
+                cloudConnectionTestMessage = "❌ Unexpected non-HTTP response from \(provider.displayName)."
+                return
+            }
+
+            if (200...299).contains(httpResponse.statusCode) {
+                cloudConnectionTestSucceeded = true
+                cloudConnectionTestMessage = "✅ Connected to \(provider.displayName) — model '\(model)' is ready."
+            } else {
+                let detail = Self.extractAPIErrorMessage(from: data)
+                cloudConnectionTestSucceeded = false
+                switch httpResponse.statusCode {
+                case 401, 403:
+                    cloudConnectionTestMessage = "❌ Invalid API key or insufficient permissions (HTTP \(httpResponse.statusCode)): \(detail)"
+                case 404:
+                    cloudConnectionTestMessage = "❌ Model '\(model)' not found (HTTP 404): \(detail)"
+                case 429:
+                    cloudConnectionTestMessage = "❌ Rate limit or quota exceeded (HTTP 429): \(detail)"
+                default:
+                    cloudConnectionTestMessage = "❌ Connection failed (HTTP \(httpResponse.statusCode)): \(detail)"
+                }
+            }
+        } catch {
+            cloudConnectionTestSucceeded = false
+            cloudConnectionTestMessage = "❌ Connection error: \(error.localizedDescription)"
+        }
+    }
+
+    private func buildCloudConnectionTestRequest(
+        provider: OCRProvider,
+        model: String,
+        apiKey: String
+    ) throws -> URLRequest {
+        let encodedModel = model.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? model
+        let urlString: String
+
+        switch provider {
+        case .gemini:
+            urlString = "https://generativelanguage.googleapis.com/v1beta/models/\(encodedModel)"
+        case .claude:
+            urlString = "https://api.anthropic.com/v1/models/\(encodedModel)"
+        case .openai:
+            urlString = "https://api.openai.com/v1/models/\(encodedModel)"
+        case .mistral, .localOllama, .hybridMarkerOlmocr, .none:
+            throw URLError(.unsupportedURL)
+        }
+
+        guard let url = URL(string: urlString) else {
+            throw URLError(.badURL)
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 20
+
+        switch provider {
+        case .gemini:
+            request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+        case .claude:
+            request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+            request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        case .openai:
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        case .mistral, .localOllama, .hybridMarkerOlmocr, .none:
+            break
+        }
+
+        return request
+    }
+
+    private static func extractAPIErrorMessage(from data: Data) -> String {
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let errorObj = json["error"] as? [String: Any],
+               let message = errorObj["message"] as? String,
+               !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return message.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if let message = json["message"] as? String,
+               !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return message.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+
+        let rawText = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if rawText.isEmpty {
+            return "No additional details returned."
+        }
+        return String(rawText.prefix(240))
     }
 
     private var parsedLocalOllamaNumCtx: Int? {
@@ -2017,31 +2332,15 @@ struct SettingsView: View {
                     }
 
                     if showCustomInstruction {
-                        Divider()
-
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Custom OCR Instruction")
-                                .font(.headline)
-
-                            TextEditor(text: $model.customOcrInstruction)
-                                .font(.system(.body, design: .default))
-                                .frame(minHeight: 110)
-                                .padding(6)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 8)
-                                        .stroke(Color.secondary.opacity(0.25))
-                                )
-
-                            Text("Leave empty for the default faithful OCR behavior. Bad instructions can reduce OCR quality.")
-                                .font(.footnote)
-                                .foregroundColor(.secondary)
-
-                            Text("Example: Preserve headings and bullet lists. Keep diagrams as images. Do not summarize. Keep the original wording as faithfully as possible.")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
+                        customOCRInstructionEditor
                     }
                 }
+
+            case .gemini, .claude, .openai:
+                cloudVLMProviderSettingsView(
+                    for: model.selectedOCRProvider,
+                    showCustomInstruction: showCustomInstruction
+                )
 
             case .localOllama:
                 VStack(alignment: .leading, spacing: 12) {
@@ -2130,6 +2429,163 @@ struct SettingsView: View {
                         "Does not require a Mistral API key, Ollama, or Marker."
                     ])
                 }
+            }
+        }
+    }
+
+    private var customOCRInstructionEditor: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider()
+
+            Text("Custom OCR Instruction")
+                .font(.headline)
+
+            TextEditor(text: $model.customOcrInstruction)
+                .font(.system(.body, design: .default))
+                .frame(minHeight: 110)
+                .padding(6)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.secondary.opacity(0.25))
+                )
+
+            Text("Leave empty for the default faithful OCR behavior. Bad instructions can reduce OCR quality.")
+                .font(.footnote)
+                .foregroundColor(.secondary)
+
+            Text("Example: Preserve headings and bullet lists. Keep diagrams as images. Do not summarize. Keep the original wording as faithfully as possible.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private func cloudApiKeyBinding(for provider: OCRProvider) -> Binding<String> {
+        switch provider {
+        case .gemini:
+            return $model.geminiApiKey
+        case .claude:
+            return $model.anthropicApiKey
+        case .openai:
+            return $model.openaiApiKey
+        case .mistral, .localOllama, .hybridMarkerOlmocr, .none:
+            return $model.mistralApiKey
+        }
+    }
+
+    @ViewBuilder
+    private func cloudVLMProviderSettingsView(
+        for provider: OCRProvider,
+        showCustomInstruction: Bool
+    ) -> some View {
+        let keyBinding = cloudApiKeyBinding(for: provider)
+
+        VStack(alignment: .leading, spacing: 12) {
+            providerExplanation([
+                "Cloud VLM OCR with high-accuracy handwriting recognition.",
+                "Detects hand-drawn sketches and diagrams via bounding boxes and crops them locally with Pillow.",
+                "Caches unchanged pages per provider and model so only modified pages are reprocessed.",
+                "Sends rendered note page images to \(provider.displayName). API usage/costs may apply.",
+                "Requires \(provider.apiKeyFieldLabel) (or environment variable \(provider.apiKeyEnvVarName))."
+            ])
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(provider.apiKeyFieldLabel)
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+
+                HStack(spacing: 8) {
+                    if model.showCloudApiKey {
+                        TextField(provider.apiKeyFieldLabel, text: keyBinding)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(.body, design: .monospaced))
+                    } else {
+                        SecureField(provider.apiKeyFieldLabel, text: keyBinding)
+                            .textFieldStyle(.roundedBorder)
+                    }
+
+                    Button {
+                        model.showCloudApiKey.toggle()
+                    } label: {
+                        Image(systemName: model.showCloudApiKey ? "eye.slash" : "eye")
+                    }
+                    .buttonStyle(.borderless)
+                    .help(model.showCloudApiKey ? "Hide API key" : "Show API key")
+                }
+
+                if model.hasCloudApiKeyFromEnvironmentOnly(for: provider) {
+                    Text("Detected \(provider.apiKeyEnvVarName) in environment / .env. Leave empty to use it, or enter a key here to override.")
+                        .font(.footnote)
+                        .foregroundColor(.green)
+                } else {
+                    Text("Stored locally in config.json with restricted permissions (0600). Fallback: \(provider.apiKeyEnvVarName).")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Model")
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+
+                TextField(
+                    "Default: \(provider.defaultCloudModel)",
+                    text: $model.ocrModel
+                )
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.body, design: .monospaced))
+
+                HStack(spacing: 6) {
+                    Text("Common models:")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    ForEach(provider.suggestedCloudModels, id: \.self) { suggested in
+                        Button(suggested) {
+                            model.ocrModel = suggested
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                }
+
+                Text("Leave empty to use the default model (\(provider.defaultCloudModel)).")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+            }
+
+            HStack(spacing: 10) {
+                Button("Test Connection") {
+                    Task {
+                        await model.testCloudProviderConnection()
+                    }
+                }
+                .disabled(model.isTestingCloudConnection)
+
+                if model.isTestingCloudConnection {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
+            if !model.cloudConnectionTestMessage.isEmpty {
+                Text(model.cloudConnectionTestMessage)
+                    .font(.footnote)
+                    .foregroundColor(
+                        model.cloudConnectionTestSucceeded == true
+                            ? .green
+                            : (model.cloudConnectionTestSucceeded == false ? .red : .secondary)
+                    )
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.secondary.opacity(0.08))
+                    .cornerRadius(8)
+            }
+
+            if showCustomInstruction {
+                customOCRInstructionEditor
             }
         }
     }
