@@ -47,6 +47,40 @@ struct NotebookConfig: Identifiable, Codable {
     }
 }
 
+struct CloudModelPreset: Identifiable, Hashable {
+    let modelId: String
+    let label: String
+
+    var id: String { modelId }
+}
+
+enum OCRReasoningEffort: String, CaseIterable, Identifiable {
+    case minimal
+    case low
+    case medium
+    case high
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .minimal:
+            return "Minimal (spart Tokens)"
+        case .low:
+            return "Low (Empfohlen)"
+        case .medium:
+            return "Medium"
+        case .high:
+            return "High"
+        }
+    }
+
+    static func normalized(from rawValue: String) -> OCRReasoningEffort {
+        let cleaned = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return OCRReasoningEffort(rawValue: cleaned) ?? .low
+    }
+}
+
 enum OCRProvider: String, CaseIterable, Identifiable {
     case mistral
     case gemini
@@ -89,27 +123,48 @@ enum OCRProvider: String, CaseIterable, Identifiable {
     var defaultCloudModel: String {
         switch self {
         case .gemini:
-            return "gemini-2.5-flash"
+            return "gemini-4-hydrogen"
         case .claude:
-            return "claude-sonnet-4-5"
+            return "claude-sonnet-5-5"
         case .openai:
-            return "gpt-4.1"
+            return "gpt-6.1-terra"
         case .mistral, .localOllama, .hybridMarkerOlmocr, .none:
             return ""
         }
     }
 
-    var suggestedCloudModels: [String] {
+    var cloudModelPresets: [CloudModelPreset] {
         switch self {
         case .gemini:
-            return ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"]
+            return [
+                CloudModelPreset(modelId: "gemini-3.5-flash-lite", label: "Sehr schnell & günstig"),
+                CloudModelPreset(modelId: "gemini-3.8-flash", label: "Schneller Nachfolger von 2.5 Pro"),
+                CloudModelPreset(modelId: "gemini-4-hydrogen", label: "Empfohlen — schnell & ausgewogen"),
+                CloudModelPreset(modelId: "gemini-4-neon", label: "Hohe Präzision (Handschrift/Skizzen)"),
+                CloudModelPreset(modelId: "gemini-4-argon", label: "Effizientes Frontier-Reasoning"),
+                CloudModelPreset(modelId: "gemini-4-carbon", label: "Maximum — visuell komplexe Seiten"),
+            ]
         case .claude:
-            return ["claude-sonnet-4-5", "claude-3-7-sonnet-latest", "claude-3-5-haiku-latest"]
+            return [
+                CloudModelPreset(modelId: "claude-haiku-5-5", label: "Sehr schnell & günstig"),
+                CloudModelPreset(modelId: "claude-sonnet-5-5", label: "Empfohlen — ausgewogen"),
+                CloudModelPreset(modelId: "claude-opus-5-5", label: "Hohe Präzision"),
+                CloudModelPreset(modelId: "claude-fable-5-2", label: "Maximum"),
+            ]
         case .openai:
-            return ["gpt-4.1", "gpt-4.1-mini", "gpt-4o"]
+            return [
+                CloudModelPreset(modelId: "gpt-6-luna", label: "Sehr schnell & günstig"),
+                CloudModelPreset(modelId: "gpt-6.1-terra", label: "Empfohlen — Visual Reasoning & Koordinaten"),
+                CloudModelPreset(modelId: "gpt-6.2-sol", label: "Ausgewogenes Flaggschiff"),
+                CloudModelPreset(modelId: "gpt-6.2-astra", label: "Maximum"),
+            ]
         case .mistral, .localOllama, .hybridMarkerOlmocr, .none:
             return []
         }
+    }
+
+    var suggestedCloudModels: [String] {
+        cloudModelPresets.map(\.modelId)
     }
 
     var apiKeyEnvVarName: String {
@@ -165,6 +220,7 @@ struct SyncConfig: Codable {
     var supernote_partner_sync_delay_seconds: Int
     var ocr_provider: String
     var ocr_model: String
+    var ocr_reasoning_effort: String
     var gemini_api_key: String
     var anthropic_api_key: String
     var openai_api_key: String
@@ -189,6 +245,7 @@ struct SyncConfig: Codable {
         supernote_partner_sync_delay_seconds: 15,
         ocr_provider: OCRProvider.localOllama.rawValue,
         ocr_model: "",
+        ocr_reasoning_effort: OCRReasoningEffort.low.rawValue,
         gemini_api_key: "",
         anthropic_api_key: "",
         openai_api_key: "",
@@ -214,6 +271,7 @@ struct SyncConfig: Codable {
         case supernote_partner_sync_delay_seconds
         case ocr_provider
         case ocr_model
+        case ocr_reasoning_effort
         case gemini_api_key
         case anthropic_api_key
         case openai_api_key
@@ -239,6 +297,7 @@ struct SyncConfig: Codable {
         supernote_partner_sync_delay_seconds: Int,
         ocr_provider: String,
         ocr_model: String = "",
+        ocr_reasoning_effort: String = OCRReasoningEffort.low.rawValue,
         gemini_api_key: String = "",
         anthropic_api_key: String = "",
         openai_api_key: String = "",
@@ -262,6 +321,7 @@ struct SyncConfig: Codable {
         self.supernote_partner_sync_delay_seconds = supernote_partner_sync_delay_seconds
         self.ocr_provider = ocr_provider
         self.ocr_model = ocr_model
+        self.ocr_reasoning_effort = ocr_reasoning_effort
         self.gemini_api_key = gemini_api_key
         self.anthropic_api_key = anthropic_api_key
         self.openai_api_key = openai_api_key
@@ -289,6 +349,9 @@ struct SyncConfig: Codable {
         self.supernote_partner_sync_delay_seconds = try container.decodeIfPresent(Int.self, forKey: .supernote_partner_sync_delay_seconds) ?? 15
         self.ocr_provider = try container.decodeIfPresent(String.self, forKey: .ocr_provider) ?? OCRProvider.mistral.rawValue
         self.ocr_model = try container.decodeIfPresent(String.self, forKey: .ocr_model) ?? ""
+        self.ocr_reasoning_effort = OCRReasoningEffort.normalized(
+            from: try container.decodeIfPresent(String.self, forKey: .ocr_reasoning_effort) ?? OCRReasoningEffort.low.rawValue
+        ).rawValue
         self.gemini_api_key = try container.decodeIfPresent(String.self, forKey: .gemini_api_key) ?? ""
         self.anthropic_api_key = try container.decodeIfPresent(String.self, forKey: .anthropic_api_key) ?? ""
         self.openai_api_key = try container.decodeIfPresent(String.self, forKey: .openai_api_key) ?? ""
@@ -456,6 +519,7 @@ final class SettingsViewModel: ObservableObject {
     @Published var supernotePartnerSyncDelaySeconds = "15"
     @Published var ocrProvider = OCRProvider.localOllama.rawValue
     @Published var ocrModel = ""
+    @Published var ocrReasoningEffort = OCRReasoningEffort.low.rawValue
     @Published var geminiApiKey = ""
     @Published var anthropicApiKey = ""
     @Published var openaiApiKey = ""
@@ -463,6 +527,9 @@ final class SettingsViewModel: ObservableObject {
     @Published var isTestingCloudConnection = false
     @Published var cloudConnectionTestMessage = ""
     @Published var cloudConnectionTestSucceeded: Bool? = nil
+    @Published var isLoadingAvailableModels = false
+    @Published var availableCloudModels: [String] = []
+    @Published var loadAvailableModelsMessage = ""
     @Published var localOllamaURL = "http://localhost:11434/api/generate"
     @Published var localOllamaModel = "richardyoung/olmocr2:7b-q8"
     @Published var localOllamaNumCtx = "8192"
@@ -553,6 +620,7 @@ final class SettingsViewModel: ObservableObject {
                 supernote_partner_sync_delay_seconds: parsedSupernotePartnerSyncDelaySeconds ?? 15,
                 ocr_provider: selectedOCRProvider.rawValue,
                 ocr_model: ocrModel.trimmingCharacters(in: .whitespacesAndNewlines),
+                ocr_reasoning_effort: selectedOCRReasoningEffort.rawValue,
                 gemini_api_key: geminiApiKey.trimmingCharacters(in: .whitespacesAndNewlines),
                 anthropic_api_key: anthropicApiKey.trimmingCharacters(in: .whitespacesAndNewlines),
                 openai_api_key: openaiApiKey.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -620,6 +688,7 @@ final class SettingsViewModel: ObservableObject {
         )
         ocrProvider = OCRProvider.normalized(from: config.ocr_provider).rawValue
         ocrModel = config.ocr_model
+        ocrReasoningEffort = OCRReasoningEffort.normalized(from: config.ocr_reasoning_effort).rawValue
         geminiApiKey = config.gemini_api_key
         anthropicApiKey = config.anthropic_api_key
         openaiApiKey = config.openai_api_key
@@ -812,6 +881,8 @@ final class SettingsViewModel: ObservableObject {
             if previous != newValue {
                 cloudConnectionTestMessage = ""
                 cloudConnectionTestSucceeded = nil
+                availableCloudModels = []
+                loadAvailableModelsMessage = ""
                 let trimmedModel = ocrModel.trimmingCharacters(in: .whitespacesAndNewlines)
                 if previous.isCloudVLM && newValue.isCloudVLM && !trimmedModel.isEmpty {
                     let previousDefaults = Set([previous.defaultCloudModel] + previous.suggestedCloudModels)
@@ -820,6 +891,15 @@ final class SettingsViewModel: ObservableObject {
                     }
                 }
             }
+        }
+    }
+
+    var selectedOCRReasoningEffort: OCRReasoningEffort {
+        get {
+            OCRReasoningEffort.normalized(from: ocrReasoningEffort)
+        }
+        set {
+            ocrReasoningEffort = newValue.rawValue
         }
     }
 
@@ -929,6 +1009,143 @@ final class SettingsViewModel: ObservableObject {
         } catch {
             cloudConnectionTestSucceeded = false
             cloudConnectionTestMessage = "❌ Connection error: \(error.localizedDescription)"
+        }
+    }
+
+    func loadAvailableCloudModels() async {
+        let provider = selectedOCRProvider
+        guard provider.isCloudVLM else {
+            return
+        }
+
+        let apiKey = resolvedCloudApiKey(for: provider)
+        guard !apiKey.isEmpty else {
+            availableCloudModels = []
+            loadAvailableModelsMessage = "❌ \(provider.displayName) API key is missing. Enter a key above or set \(provider.apiKeyEnvVarName)."
+            return
+        }
+
+        isLoadingAvailableModels = true
+        loadAvailableModelsMessage = "Loading available \(provider.displayName) models…"
+        defer { isLoadingAvailableModels = false }
+
+        do {
+            let request = try buildCloudModelListRequest(provider: provider, apiKey: apiKey)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                availableCloudModels = []
+                loadAvailableModelsMessage = "❌ Unexpected non-HTTP response from \(provider.displayName)."
+                return
+            }
+
+            guard (200...299).contains(httpResponse.statusCode) else {
+                let detail = Self.extractAPIErrorMessage(from: data)
+                availableCloudModels = []
+                loadAvailableModelsMessage = "❌ Failed to load models (HTTP \(httpResponse.statusCode)): \(detail)"
+                return
+            }
+
+            let parsedIds = Self.parseAvailableModelIds(from: data, provider: provider)
+            availableCloudModels = parsedIds
+            if parsedIds.isEmpty {
+                loadAvailableModelsMessage = "⚠️ No compatible models returned by \(provider.displayName)."
+            } else {
+                loadAvailableModelsMessage = "✅ Loaded \(parsedIds.count) model(s) from \(provider.displayName)."
+            }
+        } catch {
+            availableCloudModels = []
+            loadAvailableModelsMessage = "❌ Could not load models: \(error.localizedDescription)"
+        }
+    }
+
+    private func buildCloudModelListRequest(
+        provider: OCRProvider,
+        apiKey: String
+    ) throws -> URLRequest {
+        let urlString: String
+        switch provider {
+        case .gemini:
+            urlString = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100"
+        case .claude:
+            urlString = "https://api.anthropic.com/v1/models?limit=100"
+        case .openai:
+            urlString = "https://api.openai.com/v1/models"
+        case .mistral, .localOllama, .hybridMarkerOlmocr, .none:
+            throw URLError(.unsupportedURL)
+        }
+
+        guard let url = URL(string: urlString) else {
+            throw URLError(.badURL)
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 20
+
+        switch provider {
+        case .gemini:
+            request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+        case .claude:
+            request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+            request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        case .openai:
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        case .mistral, .localOllama, .hybridMarkerOlmocr, .none:
+            break
+        }
+
+        return request
+    }
+
+    private static func parseAvailableModelIds(from data: Data, provider: OCRProvider) -> [String] {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return []
+        }
+
+        switch provider {
+        case .gemini:
+            guard let models = json["models"] as? [[String: Any]] else {
+                return []
+            }
+            let ids = models.compactMap { entry -> String? in
+                guard let rawName = entry["name"] as? String else { return nil }
+                let cleaned = rawName.hasPrefix("models/")
+                    ? String(rawName.dropFirst("models/".count))
+                    : rawName
+                if let methods = entry["supportedGenerationMethods"] as? [String],
+                   !methods.isEmpty,
+                   !methods.contains("generateContent") {
+                    return nil
+                }
+                return cleaned.lowercased().hasPrefix("gemini") ? cleaned : nil
+            }
+            return Array(Set(ids)).sorted(by: >)
+
+        case .claude:
+            guard let items = json["data"] as? [[String: Any]] else {
+                return []
+            }
+            let ids = items.compactMap { $0["id"] as? String }
+            return Array(Set(ids)).sorted(by: >)
+
+        case .openai:
+            guard let items = json["data"] as? [[String: Any]] else {
+                return []
+            }
+            let allIds = items.compactMap { $0["id"] as? String }
+            let filtered = allIds.filter { id in
+                let lower = id.lowercased()
+                return lower.hasPrefix("gpt-")
+                    || lower.hasPrefix("o1")
+                    || lower.hasPrefix("o3")
+                    || lower.hasPrefix("o4")
+                    || lower.hasPrefix("chatgpt-")
+            }
+            let chosen = filtered.isEmpty ? allIds : filtered
+            return Array(Set(chosen)).sorted(by: >)
+
+        case .mistral, .localOllama, .hybridMarkerOlmocr, .none:
+            return []
         }
     }
 
@@ -2547,10 +2764,43 @@ struct SettingsView: View {
                 }
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Model")
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Model Presets")
                     .font(.subheadline)
                     .fontWeight(.medium)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(provider.cloudModelPresets) { preset in
+                        let isSelected = model.effectiveCloudModel(for: provider) == preset.modelId
+                        Button {
+                            model.ocrModel = preset.modelId
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                                    .foregroundColor(isSelected ? .accentColor : .secondary)
+                                Text(preset.modelId)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .fontWeight(isSelected ? .semibold : .regular)
+                                Spacer()
+                                Text(preset.label)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .fill(isSelected ? Color.accentColor.opacity(0.10) : Color.secondary.opacity(0.06))
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                Text("Custom Model ID")
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                    .padding(.top, 4)
 
                 TextField(
                     "Default: \(provider.defaultCloudModel)",
@@ -2559,21 +2809,51 @@ struct SettingsView: View {
                 .textFieldStyle(.roundedBorder)
                 .font(.system(.body, design: .monospaced))
 
-                HStack(spacing: 6) {
-                    Text("Common models:")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                Text("Leave empty to use the default model (\(provider.defaultCloudModel)), or enter any custom model ID.")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
 
-                    ForEach(provider.suggestedCloudModels, id: \.self) { suggested in
-                        Button(suggested) {
-                            model.ocrModel = suggested
+                if !model.availableCloudModels.isEmpty {
+                    Picker(
+                        "Loaded API models",
+                        selection: Binding(
+                            get: { model.effectiveCloudModel(for: provider) },
+                            set: { model.ocrModel = $0 }
+                        )
+                    ) {
+                        ForEach(model.availableCloudModels, id: \.self) { modelId in
+                            Text(modelId).tag(modelId)
                         }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
                     }
+                    .pickerStyle(.menu)
                 }
 
-                Text("Leave empty to use the default model (\(provider.defaultCloudModel)).")
+                if !model.loadAvailableModelsMessage.isEmpty {
+                    Text(model.loadAvailableModelsMessage)
+                        .font(.footnote)
+                        .foregroundColor(
+                            model.loadAvailableModelsMessage.hasPrefix("✅")
+                                ? .green
+                                : (model.loadAvailableModelsMessage.hasPrefix("❌") ? .red : .secondary)
+                        )
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Picker(
+                    "Reasoning / Thinking effort",
+                    selection: Binding(
+                        get: { model.selectedOCRReasoningEffort },
+                        set: { model.selectedOCRReasoningEffort = $0 }
+                    )
+                ) {
+                    ForEach(OCRReasoningEffort.allCases) { effort in
+                        Text(effort.displayName).tag(effort)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                Text("Low keeps OCR fast and avoids unnecessary thinking tokens. Note: gpt-6.2-sol and gpt-6.2-astra automatically use at least Low.")
                     .font(.footnote)
                     .foregroundColor(.secondary)
             }
@@ -2584,9 +2864,16 @@ struct SettingsView: View {
                         await model.testCloudProviderConnection()
                     }
                 }
-                .disabled(model.isTestingCloudConnection)
+                .disabled(model.isTestingCloudConnection || model.isLoadingAvailableModels)
 
-                if model.isTestingCloudConnection {
+                Button("Load Available Models") {
+                    Task {
+                        await model.loadAvailableCloudModels()
+                    }
+                }
+                .disabled(model.isTestingCloudConnection || model.isLoadingAvailableModels)
+
+                if model.isTestingCloudConnection || model.isLoadingAvailableModels {
                     ProgressView()
                         .controlSize(.small)
                 }

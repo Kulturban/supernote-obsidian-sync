@@ -95,9 +95,9 @@ def write_pdf_with_sketch(pdf_path: Path, page_texts: list[str], draw_box_on_pag
 @pytest.mark.parametrize(
     ("provider", "config_key", "env_var", "default_model"),
     [
-        ("gemini", "gemini_api_key", "GEMINI_API_KEY", "gemini-2.5-flash"),
-        ("claude", "anthropic_api_key", "ANTHROPIC_API_KEY", "claude-sonnet-4-5"),
-        ("openai", "openai_api_key", "OPENAI_API_KEY", "gpt-4.1"),
+        ("gemini", "gemini_api_key", "GEMINI_API_KEY", "gemini-4-hydrogen"),
+        ("claude", "anthropic_api_key", "ANTHROPIC_API_KEY", "claude-sonnet-5-5"),
+        ("openai", "openai_api_key", "OPENAI_API_KEY", "gpt-6.1-terra"),
     ],
 )
 def test_cloud_provider_defaults_and_key_resolution(
@@ -514,7 +514,7 @@ def test_cloud_vlm_ocr_pdf_caches_pages_and_invalidates_on_provider_or_model_swi
     cache_data = module.load_page_cache(note_file)
     assert cache_data is not None
     assert cache_data["provider"] == "gemini"
-    assert cache_data["model"] == "gemini-2.5-flash"
+    assert cache_data["model"] == "gemini-4-hydrogen"
     assert cache_data["visual_extraction"] == module.CLOUD_VISUAL_EXTRACTION_VERSION
 
     # 2. Second run with same provider & model: 100% cache hit, zero API calls
@@ -539,7 +539,7 @@ def test_cloud_vlm_ocr_pdf_caches_pages_and_invalidates_on_provider_or_model_swi
     )
     assert len(api_calls) == 2
     assert all(call[0] == "claude" for call in api_calls)
-    assert "Claude reprocessed claude-sonnet-4-5" in md_claude
+    assert "Claude reprocessed claude-sonnet-5-5" in md_claude
     # Stale visual from Gemini run is no longer referenced and was cleaned up
     assert not (image_dir / "extracted_visuals" / "page-001-visual-001.jpeg").exists()
 
@@ -556,3 +556,81 @@ def test_cloud_vlm_ocr_pdf_caches_pages_and_invalidates_on_provider_or_model_swi
     assert len(api_calls) == 2
     assert all(call[1] == "claude-opus-4-1" for call in api_calls)
     assert "Claude reprocessed claude-opus-4-1" in md_claude_opus
+
+
+# ------------------------------------------------------------
+# 5. REASONING / THINKING EFFORT PAYLOADS, FALLBACK & FINGERPRINT
+# ------------------------------------------------------------
+
+
+def test_ocr_reasoning_effort_payloads_and_gpt62_minimal_clamp(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_sync_module({"ocr_provider": "gemini", "ocr_reasoning_effort": "minimal"})
+    sent_payloads: list[dict] = []
+
+    def fake_post(url: str, headers: dict, json: dict, timeout: int):
+        sent_payloads.append(json)
+        if "generativelanguage.googleapis.com" in url:
+            return FakeHTTPResponse(
+                200,
+                {"candidates": [{"content": {"parts": [{"text": '{"markdown": "ok", "visuals": []}'}]}}]},
+            )
+        if "api.openai.com" in url:
+            return FakeHTTPResponse(
+                200,
+                {"choices": [{"message": {"content": '{"markdown": "ok", "visuals": []}'}}]},
+            )
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    monkeypatch.setattr(module.requests, "post", fake_post)
+
+    # Gemini receives thinkingConfig.thinkingLevel = "MINIMAL"
+    module.call_gemini_ocr_page(make_sketch_page_png_bytes(), 1, "gemini-4-hydrogen", "key")
+    assert sent_payloads[-1]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "MINIMAL"}
+
+    # gpt-6.1-terra accepts minimal
+    module.call_openai_ocr_page(make_sketch_page_png_bytes(), 1, "gpt-6.1-terra", "key")
+    assert sent_payloads[-1]["reasoning_effort"] == "minimal"
+
+    # gpt-6.2-sol and gpt-6.2-astra clamp minimal -> low
+    module.call_openai_ocr_page(make_sketch_page_png_bytes(), 1, "gpt-6.2-sol", "key")
+    assert sent_payloads[-1]["reasoning_effort"] == "low"
+
+    module.call_openai_ocr_page(make_sketch_page_png_bytes(), 1, "gpt-6.2-astra", "key")
+    assert sent_payloads[-1]["reasoning_effort"] == "low"
+
+    # Legacy gpt-4.1 omits reasoning_effort cleanly
+    module.call_openai_ocr_page(make_sketch_page_png_bytes(), 1, "gpt-4.1", "key")
+    assert "reasoning_effort" not in sent_payloads[-1]
+
+
+def test_ocr_reasoning_effort_retries_without_param_on_http_400_and_invalidates_fingerprint(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_sync_module({"ocr_provider": "gemini", "ocr_reasoning_effort": "low"})
+    fp_low = module.ocr_settings_fingerprint("gemini")
+    monkeypatch.setattr(module, "OCR_REASONING_EFFORT", "high")
+    fp_high = module.ocr_settings_fingerprint("gemini")
+    assert fp_high != fp_low
+
+    attempts: list[dict] = []
+
+    def fake_post_retry(url: str, headers: dict, json: dict, timeout: int):
+        attempts.append(dict(json["generationConfig"]))
+        if len(attempts) == 1:
+            return FakeHTTPResponse(400, text="Invalid JSON payload: Unknown name 'thinkingConfig'")
+        return FakeHTTPResponse(
+            200,
+            {"candidates": [{"content": {"parts": [{"text": '{"markdown": "recovered", "visuals": []}'}]}}]},
+        )
+
+    monkeypatch.setattr(module.requests, "post", fake_post_retry)
+    md, visuals = module.call_gemini_ocr_page(make_sketch_page_png_bytes(), 1, "gemini-4-hydrogen", "key")
+    assert md == "recovered"
+    assert visuals == []
+    assert len(attempts) == 2
+    assert "thinkingConfig" in attempts[0]
+    assert "thinkingConfig" not in attempts[1]

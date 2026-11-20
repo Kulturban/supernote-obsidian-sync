@@ -62,6 +62,7 @@ DEFAULT_CONFIG = {
     "open_requires_obsidian_running": True,
     "ocr_provider": "mistral",
     "ocr_model": "",
+    "ocr_reasoning_effort": "low",
     "gemini_api_key": "",
     "anthropic_api_key": "",
     "openai_api_key": "",
@@ -255,6 +256,17 @@ OPEN_REQUIRES_OBSIDIAN_RUNNING = bool(config.get("open_requires_obsidian_running
 CUSTOM_OCR_INSTRUCTION = str(config.get("custom_ocr_instruction", "")).strip()
 OCR_PROVIDER = str(config.get("ocr_provider", "mistral")).strip().lower() or "mistral"
 OCR_MODEL = str(config.get("ocr_model", "")).strip()
+OCR_REASONING_EFFORT_OPTIONS = ("minimal", "low", "medium", "high")
+
+
+def normalize_ocr_reasoning_effort(value: object) -> str:
+    cleaned = str(value or "").strip().lower()
+    if cleaned in OCR_REASONING_EFFORT_OPTIONS:
+        return cleaned
+    return "low"
+
+
+OCR_REASONING_EFFORT = normalize_ocr_reasoning_effort(config.get("ocr_reasoning_effort", "low"))
 GEMINI_API_KEY = str(config.get("gemini_api_key", "")).strip()
 ANTHROPIC_API_KEY = str(config.get("anthropic_api_key", "")).strip()
 OPENAI_API_KEY = str(config.get("openai_api_key", "")).strip()
@@ -265,9 +277,9 @@ CLOUD_VLM_OCR_PROVIDERS = (
     "openai",
 )
 CLOUD_OCR_DEFAULT_MODELS = {
-    "gemini": "gemini-2.5-flash",
-    "claude": "claude-sonnet-4-5",
-    "openai": "gpt-4.1",
+    "gemini": "gemini-4-hydrogen",
+    "claude": "claude-sonnet-5-5",
+    "openai": "gpt-6.1-terra",
 }
 CLOUD_OCR_API_KEY_CONFIG_KEYS = {
     "gemini": "gemini_api_key",
@@ -570,6 +582,7 @@ def ocr_settings_fingerprint(provider: str | None = None) -> str:
         fingerprint_data["cloud_vlm"] = {
             "ocr_provider": selected_provider,
             "ocr_model": resolve_cloud_ocr_model(selected_provider),
+            "ocr_reasoning_effort": resolve_ocr_reasoning_effort(),
             "visual_extraction": CLOUD_VISUAL_EXTRACTION_VERSION,
             "custom_ocr_instruction": CUSTOM_OCR_INSTRUCTION,
             "prompt": build_cloud_vlm_ocr_prompt(),
@@ -2770,6 +2783,37 @@ def apply_cloud_visuals_to_page_markdown(
     return updated_markdown, saved_filenames
 
 
+def resolve_ocr_reasoning_effort() -> str:
+    return normalize_ocr_reasoning_effort(OCR_REASONING_EFFORT)
+
+
+def _gemini_thinking_config(model: str, effort: str) -> dict | None:
+    normalized_model = model.strip().lower()
+    normalized_effort = normalize_ocr_reasoning_effort(effort)
+    # Gemini 2.0 Flash / legacy 1.5 models do not accept thinkingConfig.
+    if normalized_model.startswith(("gemini-1.", "gemini-2.0")):
+        return None
+    level_map = {
+        "minimal": "MINIMAL",
+        "low": "LOW",
+        "medium": "MEDIUM",
+        "high": "HIGH",
+    }
+    return {"thinkingLevel": level_map[normalized_effort]}
+
+
+def _openai_reasoning_effort(model: str, effort: str) -> str | None:
+    normalized_model = model.strip().lower()
+    normalized_effort = normalize_ocr_reasoning_effort(effort)
+    # Only pass reasoning_effort to OpenAI reasoning-capable model families.
+    if not normalized_model.startswith(("gpt-6", "gpt-5", "o1", "o3", "o4")):
+        return None
+    # gpt-6.2-sol and gpt-6.2-astra require at least "low" (no "none"/"minimal").
+    if normalized_model.startswith("gpt-6.2") and normalized_effort == "minimal":
+        return "low"
+    return normalized_effort
+
+
 def call_gemini_ocr_page(
     page_image_bytes: bytes,
     page_number: int,
@@ -2778,6 +2822,15 @@ def call_gemini_ocr_page(
 ) -> tuple[str, list[dict]]:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     encoded_image = base64.b64encode(page_image_bytes).decode("ascii")
+    generation_config: dict[str, object] = {
+        "temperature": 0.0,
+        "responseMimeType": "application/json",
+        "responseSchema": GEMINI_OCR_RESPONSE_SCHEMA,
+    }
+    thinking_config = _gemini_thinking_config(model, resolve_ocr_reasoning_effort())
+    if thinking_config is not None:
+        generation_config["thinkingConfig"] = thinking_config
+
     payload = {
         "contents": [
             {
@@ -2793,25 +2846,28 @@ def call_gemini_ocr_page(
                 ],
             }
         ],
-        "generationConfig": {
-            "temperature": 0.0,
-            "responseMimeType": "application/json",
-            "responseSchema": GEMINI_OCR_RESPONSE_SCHEMA,
-        },
+        "generationConfig": generation_config,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
     }
 
     try:
-        response = requests.post(
-            url,
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": api_key,
-            },
-            json=payload,
-            timeout=180,
-        )
+        response = requests.post(url, headers=headers, json=payload, timeout=180)
     except requests.RequestException as exc:
         raise RuntimeError(f"Gemini OCR request failed for page {page_number}: {exc}") from exc
+
+    if (
+        response.status_code == 400
+        and "thinkingConfig" in generation_config
+        and any(token in response.text.lower() for token in ("thinkingconfig", "thinkinglevel", "unknown name"))
+    ):
+        generation_config.pop("thinkingConfig", None)
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=180)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Gemini OCR retry failed for page {page_number}: {exc}") from exc
 
     if not response.ok:
         raise RuntimeError(
@@ -2847,7 +2903,8 @@ def call_claude_ocr_page(
 ) -> tuple[str, list[dict]]:
     url = "https://api.anthropic.com/v1/messages"
     encoded_image = base64.b64encode(page_image_bytes).decode("ascii")
-    payload = {
+    effort = resolve_ocr_reasoning_effort()
+    payload: dict[str, object] = {
         "model": model,
         "max_tokens": 4096,
         "temperature": 0.0,
@@ -2883,19 +2940,37 @@ def call_claude_ocr_page(
         ],
     }
 
+    if effort in {"medium", "high"}:
+        budget_tokens = 2048 if effort == "medium" else 4096
+        payload["max_tokens"] = 8192
+        payload.pop("temperature", None)
+        payload["thinking"] = {"type": "enabled", "budget_tokens": budget_tokens}
+        payload["tool_choice"] = {"type": "auto"}
+
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+
     try:
-        response = requests.post(
-            url,
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json=payload,
-            timeout=180,
-        )
+        response = requests.post(url, headers=headers, json=payload, timeout=180)
     except requests.RequestException as exc:
         raise RuntimeError(f"Claude OCR request failed for page {page_number}: {exc}") from exc
+
+    if (
+        response.status_code == 400
+        and "thinking" in payload
+        and "thinking" in response.text.lower()
+    ):
+        payload.pop("thinking", None)
+        payload["max_tokens"] = 4096
+        payload["temperature"] = 0.0
+        payload["tool_choice"] = {"type": "tool", "name": "submit_page_ocr"}
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=180)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Claude OCR retry failed for page {page_number}: {exc}") from exc
 
     if not response.ok:
         raise RuntimeError(
@@ -2938,7 +3013,7 @@ def call_openai_ocr_page(
 ) -> tuple[str, list[dict]]:
     url = "https://api.openai.com/v1/chat/completions"
     encoded_image = base64.b64encode(page_image_bytes).decode("ascii")
-    payload = {
+    payload: dict[str, object] = {
         "model": model,
         "temperature": 0.0,
         "response_format": {
@@ -2966,18 +3041,30 @@ def call_openai_ocr_page(
         ],
     }
 
+    reasoning_effort = _openai_reasoning_effort(model, resolve_ocr_reasoning_effort())
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
     try:
-        response = requests.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=180,
-        )
+        response = requests.post(url, headers=headers, json=payload, timeout=180)
     except requests.RequestException as exc:
         raise RuntimeError(f"OpenAI OCR request failed for page {page_number}: {exc}") from exc
+
+    if (
+        response.status_code == 400
+        and "reasoning_effort" in payload
+        and any(token in response.text.lower() for token in ("reasoning_effort", "reasoning", "unsupported"))
+    ):
+        payload.pop("reasoning_effort", None)
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=180)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"OpenAI OCR retry failed for page {page_number}: {exc}") from exc
 
     if not response.ok:
         raise RuntimeError(

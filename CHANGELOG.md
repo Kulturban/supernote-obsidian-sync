@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.13.0
+
+- Added Cloud VLM OCR providers (`gemini`, `claude`, `openai`) with bounding-box sketch/diagram detection and local Pillow cropping + whitespace trimming.
+- Updated Cloud OCR defaults and presets to November 2026 model generations (`gemini-4-hydrogen`, `claude-sonnet-5-5`, `gpt-6.1-terra`, plus fast/precision/flagship presets).
+- Added `ocr_reasoning_effort` (`minimal`, `low`, `medium`, `high`, default `low`) to keep reasoning token usage low during page OCR, with automatic model-aware fallback and cache-fingerprint invalidation.
+- Added **Test Connection** and **Load Available Models** buttons in macOS Settings (`0600` restricted `config.json` permissions) for future-proof model discovery.
+- Optimized `local_ollama` and `hybrid_marker_olmocr` for `qwen3-vl:8b` on 16 GB Macs (`/api/chat` with `think: false`, sequential `keep_alive: 0` unload before Marker, Marker artifact filtering, and Qwen3-VL visual fallback).
+- Preserved unchanged Obsidian Markdown pages in place and removed the automatic `Sync Now` popup window in favor of live menu bar status.
+
 ## v0.12.1
 
 - Added a visual progress bar header to the macOS **Sync Now** window and live sync status directly at the top of the menu bar menu.
