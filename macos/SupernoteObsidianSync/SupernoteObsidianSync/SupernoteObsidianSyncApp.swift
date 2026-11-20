@@ -180,6 +180,7 @@ final class CommandRunner {
             delaySeconds = 15
         }
         let syncRunningOutput = initialOutput(for: ["--once"], title: "Sync Now")
+        let progressTracker = SyncProgressTracker(command: commandDescription(["--once"]))
 
         let outputWindow = OutputWindowController.show(
             title: "Sync Now",
@@ -226,10 +227,18 @@ final class CommandRunner {
 
             let result = await CommandRunner.runCommand(
                 executablePath: cliPath,
-                arguments: ["--once"]
+                arguments: ["--once"],
+                onProgress: { event in
+                    Task { @MainActor in
+                        guard !progressTracker.isFinished else { return }
+                        let progressText = progressTracker.apply(event)
+                        outputWindow.update(text: progressText)
+                    }
+                }
             )
 
             await MainActor.run {
+                progressTracker.isFinished = true
                 outputWindow.update(text: result.displayText)
             }
         }
@@ -292,16 +301,10 @@ final class CommandRunner {
         )
     }
 
-    private nonisolated static func stripProgressLines(from output: String) -> String {
-        output
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .filter { !$0.hasPrefix("SUSPIDIAN_PROGRESS:") }
-            .joined(separator: "\n")
-    }
-
     private nonisolated static func runCommand(
         executablePath: String,
-        arguments: [String]
+        arguments: [String],
+        onProgress: (@Sendable (SyncProgressEvent) -> Void)? = nil
     ) async -> CommandResult {
         await Task.detached(priority: .userInitiated) {
             let executableURL = URL(fileURLWithPath: executablePath)
@@ -331,16 +334,46 @@ final class CommandRunner {
             task.standardOutput = outputPipe
             task.standardError = errorPipe
 
+            let stdoutBuffer = StdoutStreamBuffer(onProgress: onProgress)
+            let stderrBuffer = DataStreamBuffer()
+            let outputHandle = outputPipe.fileHandleForReading
+            let errorHandle = errorPipe.fileHandleForReading
+
+            outputHandle.readabilityHandler = { handle in
+                let chunk = handle.availableData
+                if chunk.isEmpty {
+                    handle.readabilityHandler = nil
+                } else {
+                    stdoutBuffer.append(chunk)
+                }
+            }
+
+            errorHandle.readabilityHandler = { handle in
+                let chunk = handle.availableData
+                if chunk.isEmpty {
+                    handle.readabilityHandler = nil
+                } else {
+                    stderrBuffer.append(chunk)
+                }
+            }
+
+            defer {
+                outputHandle.readabilityHandler = nil
+                errorHandle.readabilityHandler = nil
+            }
+
             do {
                 try task.run()
-
-                let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-                let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
                 task.waitUntilExit()
 
-                let rawOutput = String(data: outputData, encoding: .utf8) ?? ""
-                let output = stripProgressLines(from: rawOutput)
-                let error = String(data: errorData, encoding: .utf8) ?? ""
+                outputHandle.readabilityHandler = nil
+                errorHandle.readabilityHandler = nil
+
+                let remainingStdout = outputHandle.readDataToEndOfFile()
+                let remainingStderr = errorHandle.readDataToEndOfFile()
+
+                let output = stdoutBuffer.finish(remainingChunk: remainingStdout)
+                let error = stderrBuffer.finish(remainingChunk: remainingStderr)
 
                 if task.terminationStatus == 0 {
                     let text = output.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -370,6 +403,9 @@ final class CommandRunner {
                     """
                 )
             } catch {
+                outputHandle.readabilityHandler = nil
+                errorHandle.readabilityHandler = nil
+
                 return CommandResult(
                     succeeded: false,
                     displayText: """
@@ -384,6 +420,279 @@ final class CommandRunner {
                 )
             }
         }.value
+    }
+}
+
+nonisolated struct SyncProgressEvent: Decodable, Sendable {
+    let stage: String
+    let notebook: String?
+    let notebook_index: Int?
+    let notebook_count: Int?
+    let note: String?
+    let note_name: String?
+    let provider: String?
+    let page: Int?
+    let total_pages: Int?
+}
+
+nonisolated final class StdoutStreamBuffer: @unchecked Sendable {
+    private static let progressPrefix = "SUSPIDIAN_PROGRESS:"
+    private let lock = NSLock()
+    private var pendingBytes = Data()
+    private var outputLines: [String] = []
+    private var hadTrailingNewline = false
+    private let onProgress: (@Sendable (SyncProgressEvent) -> Void)?
+
+    nonisolated init(onProgress: (@Sendable (SyncProgressEvent) -> Void)?) {
+        self.onProgress = onProgress
+    }
+
+    nonisolated func append(_ chunk: Data) {
+        guard !chunk.isEmpty else { return }
+
+        var eventsToEmit: [SyncProgressEvent] = []
+
+        lock.lock()
+        pendingBytes.append(chunk)
+
+        while let newlineIndex = pendingBytes.firstIndex(of: 0x0A) {
+            let lineData = pendingBytes.subdata(in: 0..<newlineIndex)
+            pendingBytes.removeSubrange(0...newlineIndex)
+            hadTrailingNewline = true
+
+            if let event = processLineData(lineData) {
+                eventsToEmit.append(event)
+            }
+        }
+        lock.unlock()
+
+        for event in eventsToEmit {
+            onProgress?(event)
+        }
+    }
+
+    nonisolated func finish(remainingChunk: Data = Data()) -> String {
+        var eventsToEmit: [SyncProgressEvent] = []
+        let finalOutput: String
+
+        lock.lock()
+        if !remainingChunk.isEmpty {
+            pendingBytes.append(remainingChunk)
+        }
+
+        while let newlineIndex = pendingBytes.firstIndex(of: 0x0A) {
+            let lineData = pendingBytes.subdata(in: 0..<newlineIndex)
+            pendingBytes.removeSubrange(0...newlineIndex)
+            hadTrailingNewline = true
+
+            if let event = processLineData(lineData) {
+                eventsToEmit.append(event)
+            }
+        }
+
+        if !pendingBytes.isEmpty {
+            let lineData = pendingBytes
+            pendingBytes.removeAll()
+            hadTrailingNewline = false
+
+            if let event = processLineData(lineData) {
+                eventsToEmit.append(event)
+            }
+        }
+
+        if outputLines.isEmpty {
+            finalOutput = ""
+        } else if hadTrailingNewline {
+            finalOutput = outputLines.joined(separator: "\n") + "\n"
+        } else {
+            finalOutput = outputLines.joined(separator: "\n")
+        }
+        lock.unlock()
+
+        for event in eventsToEmit {
+            onProgress?(event)
+        }
+
+        return finalOutput
+    }
+
+    private nonisolated func processLineData(_ lineData: Data) -> SyncProgressEvent? {
+        var line = String(decoding: lineData, as: UTF8.self)
+        if line.hasSuffix("\r") {
+            line.removeLast()
+        }
+
+        if line.hasPrefix(Self.progressPrefix) {
+            let jsonText = String(line.dropFirst(Self.progressPrefix.count))
+            if let jsonData = jsonText.data(using: .utf8),
+               let event = try? JSONDecoder().decode(SyncProgressEvent.self, from: jsonData) {
+                return event
+            }
+            return nil
+        }
+
+        outputLines.append(line)
+        return nil
+    }
+}
+
+nonisolated final class DataStreamBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+
+    nonisolated init() {}
+
+    nonisolated func append(_ chunk: Data) {
+        guard !chunk.isEmpty else { return }
+        lock.lock()
+        data.append(chunk)
+        lock.unlock()
+    }
+
+    nonisolated func finish(remainingChunk: Data = Data()) -> String {
+        lock.lock()
+        if !remainingChunk.isEmpty {
+            data.append(remainingChunk)
+        }
+        let result = String(decoding: data, as: UTF8.self)
+        lock.unlock()
+        return result
+    }
+}
+
+@MainActor
+final class SyncProgressTracker {
+    private let command: String
+    private var notebook: String?
+    private var notebookIndex: Int?
+    private var notebookCount: Int?
+    private var noteName: String?
+    private var notePath: String?
+    private var provider: String?
+    private var stageDescription = "Looking for changed Supernote notes…"
+    private var completedNotes: [String] = []
+    var isFinished = false
+
+    init(command: String) {
+        self.command = command
+    }
+
+    func apply(_ event: SyncProgressEvent) -> String {
+        if let notebook = event.notebook, !notebook.isEmpty {
+            self.notebook = notebook
+        }
+        if let notebookIndex = event.notebook_index {
+            self.notebookIndex = notebookIndex
+        }
+        if let notebookCount = event.notebook_count {
+            self.notebookCount = notebookCount
+        }
+        if let noteName = event.note_name, !noteName.isEmpty {
+            self.noteName = noteName
+        }
+        if let notePath = event.note, !notePath.isEmpty {
+            self.notePath = notePath
+        }
+        if let provider = event.provider, !provider.isEmpty {
+            self.provider = provider
+        }
+
+        switch event.stage {
+        case "scanning":
+            noteName = nil
+            notePath = nil
+            if let notebook, let notebookIndex, let notebookCount {
+                stageDescription = "Scanning folder \(notebookIndex) of \(notebookCount): \(notebook)…"
+            } else if let notebook {
+                stageDescription = "Scanning folder: \(notebook)…"
+            } else {
+                stageDescription = "Scanning Supernote folder…"
+            }
+
+        case "processing":
+            let currentNote = noteName ?? notePath ?? "note"
+            stageDescription = "Processing note: \(currentNote)…"
+
+        case "converting":
+            let currentNote = noteName ?? notePath ?? "note"
+            stageDescription = "Converting \(currentNote) to PDF…"
+
+        case "ocr_start":
+            let activeProvider = provider ?? "configured provider"
+            stageDescription = "Starting OCR (\(activeProvider))…"
+
+        case "ocr":
+            let activeProvider = provider ?? "local OCR"
+            if let page = event.page, let totalPages = event.total_pages {
+                stageDescription = "Running OCR (\(activeProvider)) — page \(page) of \(totalPages)…"
+            } else if let page = event.page {
+                stageDescription = "Running OCR (\(activeProvider)) — page \(page)…"
+            } else {
+                stageDescription = "Running OCR (\(activeProvider))…"
+            }
+
+        case "marker":
+            if let page = event.page, let totalPages = event.total_pages {
+                stageDescription = "Extracting layout & visuals (Marker) — page \(page) of \(totalPages)…"
+            } else if let page = event.page {
+                stageDescription = "Extracting layout & visuals (Marker) — page \(page)…"
+            } else {
+                stageDescription = "Extracting layout & visuals (Marker)…"
+            }
+
+        case "writing_markdown":
+            let currentNote = noteName ?? notePath ?? "note"
+            stageDescription = "Writing Markdown for \(currentNote)…"
+
+        case "done":
+            if let finishedNote = noteName ?? notePath,
+               !completedNotes.contains(finishedNote) {
+                completedNotes.append(finishedNote)
+            }
+            let currentNote = noteName ?? notePath ?? "note"
+            stageDescription = "Finished note: \(currentNote)"
+
+        default:
+            stageDescription = "Sync step: \(event.stage)…"
+        }
+
+        return formattedText()
+    }
+
+    private func formattedText() -> String {
+        var lines: [String] = ["Sync Now", ""]
+
+        if let notebook {
+            if let notebookIndex, let notebookCount {
+                lines.append("Folder: \(notebook) (\(notebookIndex) of \(notebookCount))")
+            } else {
+                lines.append("Folder: \(notebook)")
+            }
+        }
+
+        if let noteName {
+            lines.append("Note:   \(noteName)")
+        } else if let notePath {
+            lines.append("Note:   \(notePath)")
+        }
+
+        lines.append("Status: \(stageDescription)")
+
+        if !completedNotes.isEmpty {
+            lines.append("")
+            lines.append("Completed in this run (\(completedNotes.count)):")
+            for completed in completedNotes {
+                lines.append("• \(completed)")
+            }
+        }
+
+        lines.append("")
+        lines.append("Please wait until the final summary appears.")
+        lines.append("")
+        lines.append("Command:")
+        lines.append(command)
+
+        return lines.joined(separator: "\n")
     }
 }
 
