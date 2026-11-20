@@ -78,6 +78,7 @@ DEFAULT_CONFIG = {
     "hybrid_marker_lowres_image_dpi": 72,
     "hybrid_marker_highres_image_dpi": 144,
     "hybrid_marker_disable_tqdm": True,
+    "hybrid_qwen_visual_fallback": True,
 }
 
 APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -317,6 +318,13 @@ HYBRID_MARKER_HIGHRES_IMAGE_DPI = positive_int_or_default(
     config.get("hybrid_marker_highres_image_dpi"), 144
 )
 HYBRID_MARKER_DISABLE_TQDM = bool(config.get("hybrid_marker_disable_tqdm", True))
+HYBRID_QWEN_VISUAL_FALLBACK = bool(config.get("hybrid_qwen_visual_fallback", True))
+LOCAL_OLLAMA_PIPELINE_VERSION = "ollama-pipeline-v2"
+MARKER_VISUAL_MIN_WIDTH_PX = 24
+MARKER_VISUAL_MIN_HEIGHT_PX = 24
+MARKER_VISUAL_MIN_INK_RATIO = 0.002
+MARKER_VISUAL_TRIM_MARGIN_PX = 10
+QWEN_FALLBACK_PADDING_RATIO = 0.045
 DISABLED_OCR_PROVIDERS = (
     "none",
     "disabled",
@@ -574,7 +582,9 @@ def ocr_settings_fingerprint(provider: str | None = None) -> str:
         fingerprint_data["local_ollama"] = {
             "model": LOCAL_OLLAMA_MODEL,
             "num_ctx": LOCAL_OLLAMA_NUM_CTX,
-            "prompt": LOCAL_OLLAMA_PROMPT,
+            "pipeline_version": LOCAL_OLLAMA_PIPELINE_VERSION,
+            "qwen3_vl_chat_nothink": is_qwen3_vl_model(LOCAL_OLLAMA_MODEL),
+            "prompt": resolve_local_ollama_prompt(LOCAL_OLLAMA_MODEL),
             "rendering": {
                 "dpi": 200,
                 "alpha": False,
@@ -584,7 +594,9 @@ def ocr_settings_fingerprint(provider: str | None = None) -> str:
         fingerprint_data["hybrid_marker_olmocr"] = {
             "model": LOCAL_OLLAMA_MODEL,
             "num_ctx": LOCAL_OLLAMA_NUM_CTX,
-            "prompt": LOCAL_OLLAMA_PROMPT,
+            "pipeline_version": LOCAL_OLLAMA_PIPELINE_VERSION,
+            "qwen3_vl_chat_nothink": is_qwen3_vl_model(LOCAL_OLLAMA_MODEL),
+            "prompt": resolve_local_ollama_prompt(LOCAL_OLLAMA_MODEL),
             "marker_command": HYBRID_MARKER_COMMAND,
             "marker_low_memory_profile": {
                 "disable_multiprocessing": HYBRID_MARKER_DISABLE_MULTIPROCESSING,
@@ -598,6 +610,7 @@ def ocr_settings_fingerprint(provider: str | None = None) -> str:
             },
             "table_conversion": "forgiving-html-v1",
             "visual_placement": "marker-order-v2",
+            "qwen_visual_fallback": should_run_qwen_visual_fallback(),
             "rendering": {
                 "dpi": 200,
                 "alpha": False,
@@ -919,6 +932,99 @@ def mistral_ocr_pdf(pdf_file: Path, image_dir: Path, obsidian_image_folder: str)
     return "".join(markdown_parts).strip() + "\n"
 
 
+QWEN3_VL_OCR_PROMPT = """Transcribe the handwritten notes on this page into clean Markdown.
+Rules:
+- Keep the original language, spelling, wording, headings, bullet lists, and meaningful line breaks exactly as written.
+- Convert tables to Markdown tables (never use HTML tables).
+- Transcribe clear mathematical notation accurately without guessing.
+- Do not add any introduction, explanation, commentary, or summary.
+- Return ONLY the transcribed Markdown text."""
+
+QWEN3_VL_VISUAL_FALLBACK_PROMPT = """Inspect this handwritten note page for genuine hand-drawn sketches, diagrams, charts, or graphical tables.
+Do NOT include normal body text, headings, bullet lists, or single underlines.
+For each genuine drawing/diagram, return its tight bounding box `box_2d` as [ymin, xmin, ymax, xmax] in normalized integer coordinates from 0 to 1000 relative to page height and width, plus optional `anchor_before` and `anchor_after` (short exact text lines immediately above or below the drawing).
+If there are no genuine drawings or diagrams on this page, return {"visuals": []}.
+Return ONLY valid JSON:
+{"visuals": [{"id": "VISUAL_1", "box_2d": [ymin, xmin, ymax, xmax], "anchor_before": "", "anchor_after": ""}]}"""
+
+THINK_BLOCK_PATTERN = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.IGNORECASE | re.DOTALL)
+
+
+def is_qwen3_vl_model(model_name: str | None = None) -> bool:
+    candidate = (model_name if model_name is not None else LOCAL_OLLAMA_MODEL).strip().lower()
+    return "qwen3-vl" in candidate
+
+
+def should_run_qwen_visual_fallback(model_name: str | None = None) -> bool:
+    return bool(HYBRID_QWEN_VISUAL_FALLBACK) and is_qwen3_vl_model(model_name)
+
+
+def resolve_local_ollama_prompt(model_name: str | None = None) -> str:
+    if is_qwen3_vl_model(model_name):
+        if CUSTOM_OCR_INSTRUCTION:
+            return f"{QWEN3_VL_OCR_PROMPT}\n\nAdditional user instructions:\n{CUSTOM_OCR_INSTRUCTION}"
+        return QWEN3_VL_OCR_PROMPT
+    return LOCAL_OLLAMA_PROMPT
+
+
+def local_ollama_chat_url(url: str | None = None) -> str:
+    target = (url or LOCAL_OLLAMA_URL).strip() or "http://localhost:11434/api/generate"
+    parsed = urlsplit(target)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(f"Invalid local_ollama_url: {target}")
+    path = parsed.path.rstrip("/")
+    if path.endswith("/api/generate"):
+        chat_path = path[: -len("/api/generate")] + "/api/chat"
+    elif path.endswith("/api/chat"):
+        chat_path = path
+    else:
+        chat_path = "/api/chat"
+    return urlunsplit((parsed.scheme, parsed.netloc, chat_path, "", ""))
+
+
+def strip_thinking_blocks(text: str) -> str:
+    return THINK_BLOCK_PATTERN.sub("", text).strip()
+
+
+def unload_local_ollama_model_via_api(model_name: str | None = None) -> bool:
+    target_model = (model_name or LOCAL_OLLAMA_MODEL).strip()
+    if not target_model:
+        return False
+
+    try:
+        if is_qwen3_vl_model(target_model):
+            endpoint = local_ollama_chat_url(LOCAL_OLLAMA_URL)
+            payload: dict[str, object] = {
+                "model": target_model,
+                "messages": [],
+                "stream": False,
+                "keep_alive": 0,
+            }
+        else:
+            endpoint = LOCAL_OLLAMA_URL
+            payload = {
+                "model": target_model,
+                "prompt": "",
+                "stream": False,
+                "keep_alive": 0,
+            }
+
+        response = requests.post(endpoint, json=payload, timeout=30)
+        if response.ok:
+            log(f"Unloaded Ollama model via keep_alive=0: {target_model}")
+            return True
+
+        detail = response.text.strip().replace("\n", " ")[:300]
+        log(
+            f"Could not unload Ollama model via keep_alive=0 "
+            f"({target_model}, HTTP {response.status_code}): {detail}"
+        )
+        return False
+    except Exception as exc:
+        log(f"Could not unload Ollama model via keep_alive=0 ({target_model}): {exc}")
+        return False
+
+
 def ollama_ocr_selected_pdf_pages(pdf_file: Path, page_numbers: list[int]) -> dict[int, str]:
     if not page_numbers:
         return {}
@@ -976,19 +1082,38 @@ def ollama_ocr_selected_pdf_pages(pdf_file: Path, page_numbers: list[int]) -> di
                 )
                 pixmap.save(page_path)
 
-                payload = {
-                    "model": LOCAL_OLLAMA_MODEL,
-                    "prompt": LOCAL_OLLAMA_PROMPT,
-                    "stream": False,
-                    "images": [base64.b64encode(page_path.read_bytes()).decode("ascii")],
-                    "options": {"num_ctx": LOCAL_OLLAMA_NUM_CTX},
-                }
+                encoded_image = base64.b64encode(page_path.read_bytes()).decode("ascii")
+                use_qwen_chat = is_qwen3_vl_model(LOCAL_OLLAMA_MODEL)
+                if use_qwen_chat:
+                    request_url = local_ollama_chat_url(LOCAL_OLLAMA_URL)
+                    payload = {
+                        "model": LOCAL_OLLAMA_MODEL,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": resolve_local_ollama_prompt(LOCAL_OLLAMA_MODEL),
+                                "images": [encoded_image],
+                            }
+                        ],
+                        "stream": False,
+                        "think": False,
+                        "options": {"num_ctx": LOCAL_OLLAMA_NUM_CTX},
+                    }
+                else:
+                    request_url = LOCAL_OLLAMA_URL
+                    payload = {
+                        "model": LOCAL_OLLAMA_MODEL,
+                        "prompt": resolve_local_ollama_prompt(LOCAL_OLLAMA_MODEL),
+                        "stream": False,
+                        "images": [encoded_image],
+                        "options": {"num_ctx": LOCAL_OLLAMA_NUM_CTX},
+                    }
 
                 try:
-                    response = requests.post(LOCAL_OLLAMA_URL, json=payload, timeout=600)
+                    response = requests.post(request_url, json=payload, timeout=600)
                 except requests.ConnectionError as exc:
                     raise RuntimeError(
-                        f"Could not connect to Ollama at {LOCAL_OLLAMA_URL}. "
+                        f"Could not connect to Ollama at {request_url}. "
                         "Start Ollama, then ensure the model is installed with: "
                         f"ollama pull {LOCAL_OLLAMA_MODEL}"
                     ) from exc
@@ -1027,14 +1152,23 @@ def ollama_ocr_selected_pdf_pages(pdf_file: Path, page_numbers: list[int]) -> di
                         f"Ollama returned invalid JSON for page {page_number}: {response.text}"
                     ) from exc
 
-                page_markdown = response_data.get("response")
+                if use_qwen_chat:
+                    message_obj = response_data.get("message")
+                    page_markdown = (
+                        message_obj.get("content")
+                        if isinstance(message_obj, dict)
+                        else response_data.get("response")
+                    )
+                else:
+                    page_markdown = response_data.get("response")
+
                 if not isinstance(page_markdown, str):
                     raise RuntimeError(
                         f"Ollama did not return OCR text for page {page_number}: "
                         f"{json.dumps(response_data)}"
                     )
 
-                page_transcriptions[page_number] = page_markdown.strip()
+                page_transcriptions[page_number] = strip_thinking_blocks(page_markdown)
     finally:
         document.close()
 
@@ -1216,11 +1350,18 @@ def incremental_ollama_page_transcriptions(
         cached_fingerprint = fingerprint
 
     # When an existing Obsidian note is already present on disk, keep page-hash
-    # baselines across minor settings/version fingerprint updates so unchanged
-    # pages are never needlessly re-OCRed.
+    # baselines across minor settings/version fingerprint updates as long as the
+    # provider and Ollama model did not change. Switching models (e.g. olmocr2 ->
+    # qwen3-vl:8b) cleanly invalidates the cache so pages are reprocessed.
+    cached_provider = cache.get("provider")
+    cached_model = cache.get("model")
+    same_provider_and_model = (
+        (not cached_provider or cached_provider == provider)
+        and (not cached_model or cached_model == LOCAL_OLLAMA_MODEL)
+    )
     effective_cached_fingerprint = (
         fingerprint
-        if (existing_md_pages and cached_pages)
+        if (existing_md_pages and cached_pages and same_provider_and_model)
         else cached_fingerprint
     )
 
@@ -1284,6 +1425,7 @@ def incremental_ollama_page_transcriptions(
         "note_cache_id": note_page_cache_id(note_file),
         "ocr_fingerprint": fingerprint,
         "provider": provider,
+        "model": LOCAL_OLLAMA_MODEL,
         "updated_at": updated_at,
         "pages": updated_pages,
         "last_run": {
@@ -1640,6 +1782,71 @@ def run_hybrid_marker_for_page(
     )
 
 
+def clean_and_save_marker_visual(
+    source_path: Path,
+    destination_path: Path,
+    min_width: int = MARKER_VISUAL_MIN_WIDTH_PX,
+    min_height: int = MARKER_VISUAL_MIN_HEIGHT_PX,
+    min_ink_ratio: float = MARKER_VISUAL_MIN_INK_RATIO,
+    trim_margin_px: int = MARKER_VISUAL_TRIM_MARGIN_PX,
+    white_threshold: int = CLOUD_VISUAL_WHITE_THRESHOLD,
+) -> bool:
+    """
+    Filter out mini-artifacts / nearly blank Marker crops and gently trim whitespace.
+
+    Falls back to raw file copy if Pillow is unavailable or the file is not a raster image
+    (preserving compatibility with synthetic unit-test placeholders).
+    """
+    try:
+        from PIL import Image, UnidentifiedImageError
+    except ImportError:
+        shutil.copy2(source_path, destination_path)
+        return True
+
+    try:
+        with Image.open(source_path) as raw_image:
+            width, height = raw_image.size
+            if width < min_width or height < min_height:
+                return False
+
+            rgb_image = raw_image.convert("RGB")
+            gray = rgb_image.convert("L")
+            non_white_mask = gray.point(lambda pixel: 255 if pixel < white_threshold else 0)
+            content_bbox = non_white_mask.getbbox()
+            if content_bbox is None:
+                return False
+
+            non_white_pixels = non_white_mask.histogram()[255]
+            ink_ratio = non_white_pixels / float(max(1, width * height))
+            c_left, c_top, c_right, c_bottom = content_bbox
+            if ink_ratio < min_ink_ratio or (c_right - c_left) < 16 or (c_bottom - c_top) < 16:
+                return False
+
+            margin = max(0, int(trim_margin_px))
+            trimmed_box = (
+                max(0, c_left - margin),
+                max(0, c_top - margin),
+                min(width, c_right + margin),
+                min(height, c_bottom + margin),
+            )
+            trimmed = rgb_image.crop(trimmed_box)
+
+            destination_path.parent.mkdir(parents=True, exist_ok=True)
+            suffix = destination_path.suffix.lower()
+            if suffix in {".jpg", ".jpeg"}:
+                trimmed.save(destination_path, format="JPEG", quality=90)
+            elif suffix == ".png":
+                trimmed.save(destination_path, format="PNG")
+            elif suffix == ".webp":
+                trimmed.save(destination_path, format="WEBP", quality=90)
+            else:
+                trimmed.save(destination_path)
+            return True
+    except UnidentifiedImageError:
+        shutil.copy2(source_path, destination_path)
+        return True
+
+
 def copy_marker_visuals(
     marker_dir: Path,
     extracted_visual_dir: Path,
@@ -1710,8 +1917,15 @@ def copy_marker_visuals(
                             f"marker-visual-{visual_index:03d}{source_path.suffix.lower()}"
                         )
 
-                shutil.copy2(source_path, destination)
                 copied_sources.add(source_path)
+                if not clean_and_save_marker_visual(source_path, destination):
+                    if assigned_page is not None:
+                        page_visual_counts[assigned_page] = max(0, page_visual_counts.get(assigned_page, 1) - 1)
+                    else:
+                        unassigned_visual_count = max(0, unassigned_visual_count - 1)
+                    log(f"Filtered out blank or tiny Marker visual artifact: {source_path.name}")
+                    continue
+
                 visuals.append(
                     {
                         "copied_filename": destination.name,
@@ -1886,6 +2100,172 @@ def apply_marker_visuals_to_pages(
     return placed_count
 
 
+def qwen_detect_page_visuals(page_image_bytes: bytes, page_number: int) -> list[dict]:
+    """
+    Ask Qwen3-VL via Ollama /api/chat (think=false) to detect genuine drawings/diagrams
+    and return normalized 0..1000 bounding boxes. Returns [] cleanly on any error or invalid JSON.
+    """
+    encoded_image = base64.b64encode(page_image_bytes).decode("ascii")
+    request_url = local_ollama_chat_url(LOCAL_OLLAMA_URL)
+    payload = {
+        "model": LOCAL_OLLAMA_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": QWEN3_VL_VISUAL_FALLBACK_PROMPT,
+                "images": [encoded_image],
+            }
+        ],
+        "stream": False,
+        "think": False,
+        "format": "json",
+        "options": {"num_ctx": LOCAL_OLLAMA_NUM_CTX},
+    }
+
+    try:
+        response = requests.post(request_url, json=payload, timeout=300)
+        if not response.ok:
+            log(
+                f"Qwen3-VL visual fallback HTTP {response.status_code} on page {page_number}; "
+                "continuing with text only."
+            )
+            return []
+        response_data = response.json()
+    except Exception as exc:
+        log(f"Qwen3-VL visual fallback request failed on page {page_number}: {exc}")
+        return []
+
+    message_obj = response_data.get("message")
+    raw_content = (
+        message_obj.get("content")
+        if isinstance(message_obj, dict)
+        else response_data.get("response")
+    )
+    if not isinstance(raw_content, str) or not raw_content.strip():
+        return []
+
+    cleaned = _strip_json_code_fences(strip_thinking_blocks(raw_content))
+    try:
+        parsed = json.loads(cleaned)
+    except ValueError:
+        log(f"Qwen3-VL visual fallback returned invalid JSON on page {page_number}; ignoring.")
+        return []
+
+    if not isinstance(parsed, dict):
+        return []
+
+    raw_visuals = parsed.get("visuals", [])
+    if not isinstance(raw_visuals, list):
+        return []
+
+    valid_entries: list[dict] = []
+    for entry in raw_visuals:
+        if not isinstance(entry, dict):
+            continue
+        box_2d = entry.get("box_2d")
+        if normalize_visual_box_2d(box_2d) is None:
+            continue
+        valid_entries.append(
+            {
+                "id": str(entry.get("id", "")).strip(),
+                "box_2d": list(box_2d),
+                "marker_text_before": str(entry.get("anchor_before", "")).strip() or None,
+                "marker_text_after": str(entry.get("anchor_after", "")).strip() or None,
+            }
+        )
+    return valid_entries
+
+
+def extract_qwen_fallback_visuals_for_pages(
+    pdf_file: Path,
+    page_numbers: list[int],
+    page_transcriptions: list[str],
+    extracted_visual_dir: Path,
+    obsidian_image_folder: str,
+) -> tuple[int, int]:
+    """
+    Run Qwen3-VL bounding-box detection + Pillow cropping for pages where Marker
+    extracted no usable visuals. Never raises on malformed model output.
+    """
+    if not page_numbers:
+        return 0, 0
+
+    try:
+        import fitz  # PyMuPDF
+        from PIL import Image
+    except ImportError as exc:
+        log(f"Qwen3-VL visual fallback skipped (missing dependency): {exc}")
+        return 0, 0
+
+    render_scale = PAGE_HASH_DPI / 72
+    total_saved = 0
+    total_placed = 0
+
+    try:
+        document = fitz.open(pdf_file)
+    except Exception as exc:
+        log(f"Qwen3-VL visual fallback could not open PDF {pdf_file}: {exc}")
+        return 0, 0
+
+    try:
+        extracted_visual_dir.mkdir(parents=True, exist_ok=True)
+        for page_number in sorted(set(page_numbers)):
+            if not (1 <= page_number <= len(document) and page_number <= len(page_transcriptions)):
+                continue
+
+            page = document[page_number - 1]
+            pixmap = page.get_pixmap(
+                matrix=fitz.Matrix(render_scale, render_scale),
+                alpha=PAGE_HASH_ALPHA,
+            )
+            page_image_bytes = pixmap.tobytes("png")
+            detected = qwen_detect_page_visuals(page_image_bytes, page_number)
+            if not detected:
+                continue
+
+            remove_stale_page_visual_files(
+                extracted_visual_dir,
+                page_number,
+                page_transcriptions,
+            )
+            saved_visuals: list[dict] = []
+            visual_index = 0
+            with Image.open(io.BytesIO(page_image_bytes)) as raw_image:
+                page_image = raw_image.convert("RGB")
+                for item in detected:
+                    candidate_index = visual_index + 1
+                    filename = f"page-{page_number:03d}-visual-{candidate_index:03d}.jpeg"
+                    destination = extracted_visual_dir / filename
+                    if crop_and_save_visual_box(
+                        page_image,
+                        item["box_2d"],
+                        destination,
+                        padding_ratio=QWEN_FALLBACK_PADDING_RATIO,
+                        trim_margin_px=CLOUD_VISUAL_TRIM_MARGIN_PX,
+                    ):
+                        visual_index = candidate_index
+                        saved_visuals.append(
+                            {
+                                "copied_filename": filename,
+                                "assigned_page": page_number,
+                                "marker_text_before": item.get("marker_text_before"),
+                                "marker_text_after": item.get("marker_text_after"),
+                            }
+                        )
+
+            if saved_visuals:
+                total_saved += len(saved_visuals)
+                total_placed += apply_marker_visuals_to_pages(
+                    page_transcriptions,
+                    saved_visuals,
+                    obsidian_image_folder,
+                )
+    finally:
+        document.close()
+
+    return total_saved, total_placed
+
+
 def hybrid_marker_olmocr_pdf(
     pdf_file: Path,
     image_dir: Path,
@@ -1921,6 +2301,10 @@ def hybrid_marker_olmocr_pdf(
     ]
 
     extracted_visual_dir = image_dir / "extracted_visuals"
+    should_unload_before_marker = (
+        LOCAL_OLLAMA_UNLOAD_AFTER_NOTE or HYBRID_MARKER_DISABLE_MULTIPROCESSING
+    )
+
     if reconciliation is not None:
         marker_pages_to_process = reconciliation["changed_pages"]
         if not marker_pages_to_process:
@@ -1932,7 +2316,12 @@ def hybrid_marker_olmocr_pdf(
             update_page_cache_markdown(note_file, page_transcriptions)
             return format_ocr_pages(page_transcriptions, preamble=preamble)
 
+        if should_unload_before_marker:
+            log("Hybrid Marker + Ollama: unloading Ollama model before starting Marker (keep_alive=0)")
+            unload_local_ollama_model_via_api(LOCAL_OLLAMA_MODEL)
+
         log(f"Hybrid Marker page-scope: processing changed pages {marker_pages_to_process}")
+        pages_without_marker_visuals: list[int] = []
         with tempfile.TemporaryDirectory(prefix="supsidian-hybrid-marker-") as temporary_directory:
             total_visuals = 0
             placed_count = 0
@@ -1958,6 +2347,8 @@ def hybrid_marker_olmocr_pdf(
                         extracted_visual_dir,
                         assigned_page_override=page_number,
                     )
+                    if not visuals:
+                        pages_without_marker_visuals.append(page_number)
                     total_visuals += len(visuals)
                     placed_count += apply_marker_visuals_to_pages(
                         page_transcriptions,
@@ -1965,11 +2356,27 @@ def hybrid_marker_olmocr_pdf(
                         obsidian_image_folder,
                     )
                 except Exception as exc:
+                    pages_without_marker_visuals.append(page_number)
                     log(
                         f"Hybrid Marker page {page_number} failed; continuing without "
                         f"Marker visuals for this page: {exc}"
                     )
                     continue
+
+        if pages_without_marker_visuals and should_run_qwen_visual_fallback():
+            log(
+                "Hybrid Marker + Qwen3-VL fallback: checking pages without Marker visuals "
+                f"{pages_without_marker_visuals}"
+            )
+            fallback_saved, fallback_placed = extract_qwen_fallback_visuals_for_pages(
+                pdf_file,
+                pages_without_marker_visuals,
+                page_transcriptions,
+                extracted_visual_dir,
+                obsidian_image_folder,
+            )
+            total_visuals += fallback_saved
+            placed_count += fallback_placed
 
         for page_number in marker_pages_to_process:
             if 1 <= page_number <= len(page_transcriptions):
@@ -1988,22 +2395,27 @@ def hybrid_marker_olmocr_pdf(
         update_page_cache_markdown(note_file, page_transcriptions)
         return format_ocr_pages(page_transcriptions, preamble=preamble)
 
+    if should_unload_before_marker:
+        log("Hybrid Marker + Ollama: unloading Ollama model before starting Marker (keep_alive=0)")
+        unload_local_ollama_model_via_api(LOCAL_OLLAMA_MODEL)
+
+    marker_visuals: list[dict] = []
     try:
         with tempfile.TemporaryDirectory(prefix="supsidian-hybrid-marker-") as temporary_directory:
             marker_dir = Path(temporary_directory) / "marker_output"
             log("Hybrid Marker + Ollama: running Marker on the full current PDF")
             run_hybrid_marker(pdf_file, marker_dir)
 
-            visuals = copy_marker_visuals(marker_dir, extracted_visual_dir)
+            marker_visuals = copy_marker_visuals(marker_dir, extracted_visual_dir)
             placed_count = apply_marker_visuals_to_pages(
                 page_transcriptions,
-                visuals,
+                marker_visuals,
                 obsidian_image_folder,
             )
 
         log(
             f"Hybrid Marker + Ollama OCR finished: {pdf_file} "
-            f"({len(visuals)} visual(s), {placed_count} placed by Marker order)"
+            f"({len(marker_visuals)} visual(s), {placed_count} placed by Marker order)"
         )
     except Exception as exc:
         log(
@@ -2013,6 +2425,26 @@ def hybrid_marker_olmocr_pdf(
         log(
             f"Hybrid Marker + Ollama OCR finished without Marker visuals: {pdf_file}"
         )
+
+    if should_run_qwen_visual_fallback():
+        pages_with_marker = {
+            visual["assigned_page"]
+            for visual in marker_visuals
+            if isinstance(visual.get("assigned_page"), int)
+        }
+        pages_missing = [
+            page_number
+            for page_number in range(1, len(page_transcriptions) + 1)
+            if page_number not in pages_with_marker
+        ]
+        if pages_missing:
+            extract_qwen_fallback_visuals_for_pages(
+                pdf_file,
+                pages_missing,
+                page_transcriptions,
+                extracted_visual_dir,
+                obsidian_image_folder,
+            )
 
     return format_ocr_pages(page_transcriptions)
 

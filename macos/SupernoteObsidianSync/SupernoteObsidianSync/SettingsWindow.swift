@@ -1670,7 +1670,7 @@ final class SettingsViewModel: ObservableObject {
 
     // MARK: Utility
 
-    private var localOllamaModelName: String {
+    var localOllamaModelName: String {
         let trimmed = localOllamaModel.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? "richardyoung/olmocr2:7b-q8" : trimmed
     }
@@ -2347,21 +2347,21 @@ struct SettingsView: View {
                     providerExplanation([
                         "Local OCR on this Mac using Ollama.",
                         "Requires Ollama running locally.",
-                        "Requires model richardyoung/olmocr2:7b-q8.",
-                        "Does not send note pages to Mistral.",
+                        "Requires model \(model.localOllamaModelName).",
+                        "Does not send note pages to cloud APIs.",
                         "Heavier/slower than cloud OCR.",
-                        "Good for private/local handwriting OCR preview."
+                        "Good for private/local handwriting OCR."
                     ])
 
                     SettingField(title: "Ollama URL", text: $model.localOllamaURL)
-                    SettingField(title: "Ollama model", text: $model.localOllamaModel)
+                    localOllamaModelPickerField
                     SettingField(title: "Context size", text: $model.localOllamaNumCtx)
                     Toggle("Unload Ollama model after each note", isOn: $model.localOllamaUnloadAfterNote)
                     Text("Recommended for 16 GB Macs to free memory after each processed note. Disable for faster batch processing.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
 
-                    Text("Requires Ollama and:\nollama pull richardyoung/olmocr2:7b-q8")
+                    Text("Requires Ollama and:\nollama pull \(model.localOllamaModelName)")
                         .font(.system(.caption, design: .monospaced))
                         .foregroundColor(.secondary)
 
@@ -2373,8 +2373,8 @@ struct SettingsView: View {
                     providerExplanation(
                         [
                             "Experimental advanced mode.",
-                            "Uses Ollama for local OCR.",
-                            "Uses Marker to extract layout, visuals, tables, and diagrams.",
+                            "Uses Ollama for local OCR (with sequential RAM unload before Marker on 16 GB Macs).",
+                            "Uses Marker to extract layout, visuals, tables, and diagrams (plus Qwen3-VL sketch fallback when Marker finds none).",
                             "Best for visual notes with drawings or structure.",
                             "Hardest to install.",
                             "marker_single may need an absolute path."
@@ -2383,10 +2383,10 @@ struct SettingsView: View {
                     )
 
                     SettingField(title: "Ollama URL", text: $model.localOllamaURL)
-                    SettingField(title: "Ollama model", text: $model.localOllamaModel)
+                    localOllamaModelPickerField
                     SettingField(title: "Context size", text: $model.localOllamaNumCtx)
                     Toggle("Unload Ollama model after each note", isOn: $model.localOllamaUnloadAfterNote)
-                    Text("Recommended for 16 GB Macs to free memory after each processed note. Disable for faster batch processing.")
+                    Text("Recommended for 16 GB Macs to free memory before Marker runs and after each processed note.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
                     SettingField(title: "Marker command", text: $model.hybridMarkerCommand)
@@ -2399,7 +2399,7 @@ struct SettingsView: View {
                         .font(.footnote)
                         .foregroundColor(.secondary)
 
-                    Text("Also requires Ollama and:\nollama pull richardyoung/olmocr2:7b-q8")
+                    Text("Also requires Ollama and:\nollama pull \(model.localOllamaModelName)")
                         .font(.system(.caption, design: .monospaced))
                         .foregroundColor(.secondary)
 
@@ -2429,6 +2429,30 @@ struct SettingsView: View {
                         "Does not require a Mistral API key, Ollama, or Marker."
                     ])
                 }
+            }
+        }
+    }
+
+    private var localOllamaModelPickerField: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            SettingField(title: "Ollama model", text: $model.localOllamaModel)
+
+            HStack(spacing: 6) {
+                Text("Quick select:")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                Button("qwen3-vl:8b (Recommended — 16 GB)") {
+                    model.localOllamaModel = "qwen3-vl:8b"
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button("richardyoung/olmocr2:7b-q8") {
+                    model.localOllamaModel = "richardyoung/olmocr2:7b-q8"
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
         }
     }
