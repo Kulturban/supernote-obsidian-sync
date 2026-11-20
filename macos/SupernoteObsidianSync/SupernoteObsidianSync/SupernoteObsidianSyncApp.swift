@@ -10,13 +10,38 @@ import AppKit
 
 struct MenuSetupStatusView: View {
     @StateObject private var model = SettingsViewModel()
+    @ObservedObject private var runner = CommandRunner.shared
     private let refreshTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
     var body: some View {
         Group {
-            if model.setupReady {
+            if runner.isSyncing {
+                Button {
+                    runner.showActiveSyncWindow()
+                } label: {
+                    if let fraction = runner.syncFractionCompleted {
+                        Text("🔄 Syncing (\(Int((fraction * 100).rounded()))%) — Show Window")
+                    } else {
+                        Text("🔄 Syncing… — Show Window")
+                    }
+                }
+
+                if !runner.syncStageSummary.isEmpty {
+                    Text(runner.syncStageSummary)
+                }
+
+                if !runner.syncContextSummary.isEmpty {
+                    Text(runner.syncContextSummary)
+                }
+            } else if model.setupReady {
                 Button("✅ Ready to sync") {
                     SettingsWindowController.shared.showSetup()
+                }
+
+                if !runner.lastSyncSummary.isEmpty {
+                    Button(runner.lastSyncSummary) {
+                        runner.showActiveSyncWindow()
+                    }
                 }
             } else {
                 Button("⚠️ Not ready to sync — Open Setup…") {
@@ -30,7 +55,12 @@ struct MenuSetupStatusView: View {
 
             Divider()
 
-            Button("Sync Now") {
+            Button(runner.isSyncing ? "Sync Now (Running…)" : "Sync Now") {
+                if runner.isSyncing {
+                    runner.showActiveSyncWindow()
+                    return
+                }
+
                 let currentModel = SettingsViewModel()
 
                 if currentModel.setupReady {
@@ -52,6 +82,11 @@ struct MenuSetupStatusView: View {
                             : notebook.name.trimmingCharacters(in: .whitespacesAndNewlines)
 
                         Button(folderName) {
+                            if runner.isSyncing {
+                                runner.showActiveSyncWindow()
+                                return
+                            }
+
                             let currentModel = SettingsViewModel()
 
                             if currentModel.setupReady {
@@ -65,6 +100,11 @@ struct MenuSetupStatusView: View {
                     Divider()
 
                     Button("Sync All Folders") {
+                        if runner.isSyncing {
+                            runner.showActiveSyncWindow()
+                            return
+                        }
+
                         let currentModel = SettingsViewModel()
 
                         if currentModel.setupReady {
@@ -73,6 +113,12 @@ struct MenuSetupStatusView: View {
                             SettingsWindowController.shared.showSetup()
                         }
                     }
+                }
+            }
+
+            if runner.hasSyncWindow {
+                Button("Show Sync Status Window") {
+                    runner.showActiveSyncWindow()
                 }
             }
         }
@@ -87,8 +133,10 @@ struct MenuSetupStatusView: View {
 
 @main
 struct SupernoteObsidianSyncApp: App {
+    @StateObject private var runner = CommandRunner.shared
+
     var body: some Scene {
-        MenuBarExtra("Supsidian", systemImage: "long.text.page.and.pencil") {
+        MenuBarExtra {
             MenuSetupStatusView()
 
             Button("Settings…") {
@@ -122,18 +170,69 @@ struct SupernoteObsidianSyncApp: App {
             Button("Quit") {
                 NSApplication.shared.terminate(nil)
             }
+        } label: {
+            if runner.isSyncing {
+                if let fraction = runner.syncFractionCompleted {
+                    Label("Supsidian \(Int((fraction * 100).rounded()))%", systemImage: "arrow.triangle.2.circlepath")
+                } else {
+                    Label("Supsidian…", systemImage: "arrow.triangle.2.circlepath")
+                }
+            } else {
+                Label("Supsidian", systemImage: "long.text.page.and.pencil")
+            }
         }
     }
 }
 
 @MainActor
-final class CommandRunner {
+final class CommandRunner: ObservableObject {
     static let shared = CommandRunner()
 
-    private let cliPath = "/opt/homebrew/bin/supernote-obsidian-sync"
+    @Published var isSyncing = false
+    @Published var syncFractionCompleted: Double? = nil
+    @Published var syncStageSummary = ""
+    @Published var syncContextSummary = ""
+    @Published var lastSyncSummary = ""
+    @Published var hasSyncWindow = false
+
+    private var activeSyncWindow: OutputWindowController?
+    private var lastSyncTitle = "Sync Now"
+    private var lastSyncText = ""
     private var windowControllers: [OutputWindowController] = []
 
+    private var cliPath: String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let candidates = [
+            "\(home)/supernote-obsidian-sync/.venv/bin/supernote-obsidian-sync",
+            "/opt/homebrew/bin/supernote-obsidian-sync",
+            "/usr/local/bin/supernote-obsidian-sync"
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+            ?? "/opt/homebrew/bin/supernote-obsidian-sync"
+    }
+
     private init() {}
+
+    func showActiveSyncWindow() {
+        if let activeSyncWindow {
+            activeSyncWindow.bringToFront(floating: isSyncing)
+        } else if !lastSyncText.isEmpty {
+            let reopened = OutputWindowController.show(
+                title: lastSyncTitle,
+                output: lastSyncText,
+                reuseExisting: true
+            )
+            reopened.updateProgress(
+                isRunning: isSyncing,
+                fraction: syncFractionCompleted,
+                label: isSyncing ? syncStageSummary : lastSyncSummary,
+                context: syncContextSummary
+            )
+            reopened.bringToFront(floating: isSyncing)
+            activeSyncWindow = reopened
+            hasSyncWindow = true
+        }
+    }
 
     private func initialOutput(for arguments: [String], title: String) -> String {
         let command = "\(cliPath) \(arguments.joined(separator: " "))"
@@ -233,25 +332,40 @@ final class CommandRunner {
             title: windowTitle
         )
 
+        isSyncing = true
+        syncFractionCompleted = nil
+        syncStageSummary = "Preparing sync…"
+        syncContextSummary = trimmedFolder.map { "Folder: \($0)" } ?? "All configured folders"
+        lastSyncTitle = windowTitle
+        lastSyncText = syncRunningOutput
+        hasSyncWindow = true
+
         let outputWindow = OutputWindowController.show(
             title: windowTitle,
-            output: syncRunningOutput
+            output: syncRunningOutput,
+            reuseExisting: true
         )
+        activeSyncWindow = outputWindow
+        outputWindow.bringToFront(floating: true)
         outputWindow.updateProgress(
             isRunning: true,
             fraction: nil,
-            label: "Preparing sync…"
+            label: "Preparing sync…",
+            context: syncContextSummary
         )
 
         Task {
             if shouldOpenPartner {
                 await MainActor.run {
+                    let partnerWaitLabel = "Opening Supernote Partner and waiting \(delaySeconds)s…"
+                    self.syncStageSummary = partnerWaitLabel
                     outputWindow.updateProgress(
                         isRunning: true,
                         fraction: nil,
-                        label: "Opening Supernote Partner and waiting \(delaySeconds)s…"
+                        label: partnerWaitLabel,
+                        context: self.syncContextSummary
                     )
-                    outputWindow.update(text: """
+                    let waitingText = """
                     \(windowTitle)
 
                     Opening Supernote Partner…
@@ -259,20 +373,34 @@ final class CommandRunner {
                     \(partnerApp)
 
                     Waiting \(delaySeconds) second(s) before Supsidian sync starts.
-                    """)
+                    """
+                    self.lastSyncText = waitingText
+                    outputWindow.update(text: waitingText)
                 }
 
                 let openResult = await CommandRunner.openApplicationOrPath(partnerApp)
                 if !openResult.succeeded {
                     await MainActor.run {
+                        self.isSyncing = false
+                        self.syncFractionCompleted = nil
+                        self.syncStageSummary = ""
+                        self.lastSyncSummary = "❌ Could not open Supernote Partner"
+                        self.lastSyncText = openResult.displayText
                         outputWindow.updateProgress(
                             isRunning: false,
                             fraction: nil,
-                            label: "Could not open Supernote Partner"
+                            label: "Could not open Supernote Partner",
+                            context: self.syncContextSummary
                         )
                         outputWindow.update(text: openResult.displayText)
+                        outputWindow.bringToFront(floating: false)
                     }
                     return
+                }
+
+                // Keep the sync progress window visible after Supernote Partner opens.
+                await MainActor.run {
+                    outputWindow.bringToFront(floating: true)
                 }
 
                 let (sleepNanoseconds, overflow) = UInt64(delaySeconds).multipliedReportingOverflow(by: 1_000_000_000)
@@ -280,33 +408,51 @@ final class CommandRunner {
                     do {
                         try await Task.sleep(nanoseconds: sleepNanoseconds)
                     } catch {
+                        await MainActor.run {
+                            self.isSyncing = false
+                        }
                         return
                     }
                 }
 
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled else {
+                    await MainActor.run {
+                        self.isSyncing = false
+                    }
+                    return
+                }
 
                 await MainActor.run {
+                    let lookingLabel = "Looking for changed Supernote notes…"
+                    self.syncStageSummary = lookingLabel
+                    self.lastSyncText = syncRunningOutput
                     outputWindow.updateProgress(
                         isRunning: true,
                         fraction: nil,
-                        label: "Looking for changed Supernote notes…"
+                        label: lookingLabel,
+                        context: self.syncContextSummary
                     )
                     outputWindow.update(text: syncRunningOutput)
+                    outputWindow.bringToFront(floating: true)
                 }
             }
 
             let result = await CommandRunner.runCommand(
                 executablePath: cliPath,
                 arguments: syncArguments,
-                onProgress: { event in
-                    Task { @MainActor in
-                        guard !progressTracker.isFinished else { return }
+                onProgress: { [weak self] event in
+                    Task { @MainActor [weak self] in
+                        guard let self, !progressTracker.isFinished else { return }
                         let progressText = progressTracker.apply(event)
+                        self.syncFractionCompleted = progressTracker.fractionCompleted
+                        self.syncStageSummary = progressTracker.currentStageDescription
+                        self.syncContextSummary = progressTracker.currentContextSummary
+                        self.lastSyncText = progressText
                         outputWindow.updateProgress(
                             isRunning: true,
                             fraction: progressTracker.fractionCompleted,
-                            label: progressTracker.currentStageDescription
+                            label: progressTracker.currentStageDescription,
+                            context: progressTracker.currentContextSummary
                         )
                         outputWindow.update(text: progressText)
                     }
@@ -315,12 +461,34 @@ final class CommandRunner {
 
             await MainActor.run {
                 progressTracker.isFinished = true
+                self.isSyncing = false
+                self.syncFractionCompleted = result.succeeded ? 1.0 : nil
+                self.lastSyncText = result.displayText
+
+                let summaryLabel: String
+                if result.succeeded {
+                    if result.displayText.contains("Changes found and synced") {
+                        summaryLabel = "✅ Last sync: Changes found and synced"
+                    } else if result.displayText.contains("No changes found") {
+                        summaryLabel = "✅ Last sync: No changes found"
+                    } else {
+                        summaryLabel = "✅ Sync completed"
+                    }
+                } else {
+                    summaryLabel = "❌ Last sync failed — Show Details"
+                }
+
+                self.lastSyncSummary = summaryLabel
+                self.syncStageSummary = summaryLabel
+
                 outputWindow.updateProgress(
                     isRunning: false,
                     fraction: result.succeeded ? 1.0 : nil,
-                    label: result.succeeded ? "Sync completed" : "Sync failed"
+                    label: summaryLabel,
+                    context: progressTracker.currentContextSummary
                 )
                 outputWindow.update(text: result.displayText)
+                outputWindow.bringToFront(floating: false)
             }
         }
     }
@@ -667,6 +835,23 @@ final class SyncProgressTracker {
         stageDescription
     }
 
+    var currentContextSummary: String {
+        var parts: [String] = []
+        if let notebook {
+            if let notebookIndex, let notebookCount {
+                parts.append("Folder: \(notebook) (\(notebookIndex)/\(notebookCount))")
+            } else {
+                parts.append("Folder: \(notebook)")
+            }
+        }
+        if let noteName {
+            parts.append("Note: \(noteName)")
+        } else if let notePath {
+            parts.append("Note: \(notePath)")
+        }
+        return parts.joined(separator: "  ·  ")
+    }
+
     var fractionCompleted: Double? {
         let folderCount = max(notebookCount ?? 1, 1)
         let folderIndex = min(max(notebookIndex ?? 1, 1), folderCount)
@@ -850,6 +1035,7 @@ final class OutputWindowProgressModel: ObservableObject {
     @Published var isRunning = false
     @Published var fractionCompleted: Double? = nil
     @Published var label = ""
+    @Published var context = ""
 }
 
 struct OutputWindowProgressHeaderView: View {
@@ -857,11 +1043,11 @@ struct OutputWindowProgressHeaderView: View {
 
     var body: some View {
         if model.isVisible {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .firstTextBaseline) {
                     Text(model.label)
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
+                        .font(.headline)
+                        .foregroundColor(.primary)
                         .lineLimit(1)
                         .truncationMode(.tail)
 
@@ -869,9 +1055,17 @@ struct OutputWindowProgressHeaderView: View {
 
                     if let fraction = model.fractionCompleted {
                         Text("\(Int((fraction * 100).rounded()))%")
-                            .font(.system(.footnote, design: .monospaced))
-                            .foregroundColor(.secondary)
+                            .font(.system(.headline, design: .monospaced))
+                            .foregroundColor(.accentColor)
                     }
+                }
+
+                if !model.context.isEmpty {
+                    Text(model.context)
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
 
                 if let fraction = model.fractionCompleted {
@@ -882,10 +1076,10 @@ struct OutputWindowProgressHeaderView: View {
                         .progressViewStyle(.linear)
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 12)
-            .padding(.bottom, 8)
-            .background(Color(nsColor: .windowBackgroundColor))
+            .padding(.horizontal, 18)
+            .padding(.top, 14)
+            .padding(.bottom, 12)
+            .background(Color(nsColor: .controlBackgroundColor))
 
             Divider()
         }
@@ -895,19 +1089,32 @@ struct OutputWindowProgressHeaderView: View {
 @MainActor
 final class OutputWindowController: NSWindowController, NSWindowDelegate {
     private static var openControllers: [OutputWindowController] = []
+    private static var sharedSyncController: OutputWindowController?
 
-    static func show(title: String, output: String) -> OutputWindowController {
+    static func show(title: String, output: String, reuseExisting: Bool = false) -> OutputWindowController {
+        if reuseExisting, let existing = sharedSyncController {
+            existing.window?.title = title
+            existing.update(text: output)
+            existing.bringToFront(floating: false)
+            return existing
+        }
+
         let controller = OutputWindowController(title: title, text: output)
 
         openControllers.append(controller)
+        if reuseExisting {
+            sharedSyncController = controller
+        }
 
         controller.onClose = { [weak controller] in
             guard let controller else { return }
             openControllers.removeAll { $0 === controller }
+            if sharedSyncController === controller {
+                sharedSyncController = nil
+            }
         }
 
-        controller.showWindow(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        controller.bringToFront(floating: false)
 
         return controller
     }
@@ -921,11 +1128,21 @@ final class OutputWindowController: NSWindowController, NSWindowDelegate {
         textView.string = text
     }
 
-    func updateProgress(isRunning: Bool, fraction: Double?, label: String) {
-        progressModel.isVisible = isRunning || fraction != nil
+    func updateProgress(isRunning: Bool, fraction: Double?, label: String, context: String = "") {
+        progressModel.isVisible = isRunning || fraction != nil || !label.isEmpty
         progressModel.isRunning = isRunning
         progressModel.fractionCompleted = fraction
         progressModel.label = label
+        progressModel.context = context
+    }
+
+    func bringToFront(floating: Bool) {
+        guard let window else { return }
+        window.level = floating ? .floating : .normal
+        showWindow(nil)
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     init(title: String, text: String) {
@@ -951,7 +1168,7 @@ final class OutputWindowController: NSWindowController, NSWindowDelegate {
         let headerHost = NSHostingView(rootView: OutputWindowProgressHeaderView(model: progressModel))
         headerHost.translatesAutoresizingMaskIntoConstraints = false
 
-        let containerView = NSView(frame: NSRect(x: 0, y: 0, width: 760, height: 520))
+        let containerView = NSView(frame: NSRect(x: 0, y: 0, width: 780, height: 540))
         containerView.addSubview(headerHost)
         containerView.addSubview(scrollView)
 
@@ -967,13 +1184,17 @@ final class OutputWindowController: NSWindowController, NSWindowDelegate {
         ])
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 520),
+            contentRect: NSRect(x: 0, y: 0, width: 780, height: 540),
             styleMask: [.titled, .closable, .resizable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
 
         window.title = title
+        window.minSize = NSSize(width: 640, height: 420)
+        window.tabbingMode = .disallowed
+        window.hidesOnDeactivate = false
+        window.isReleasedWhenClosed = false
         window.contentView = containerView
         window.center()
 
