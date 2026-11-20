@@ -1,8 +1,10 @@
 import argparse
 import base64
 import hashlib
+import io
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -59,6 +61,10 @@ DEFAULT_CONFIG = {
     "task_tag": "#task",
     "open_requires_obsidian_running": True,
     "ocr_provider": "mistral",
+    "ocr_model": "",
+    "gemini_api_key": "",
+    "anthropic_api_key": "",
+    "openai_api_key": "",
     "local_ollama_url": "http://localhost:11434/api/generate",
     "local_ollama_model": "richardyoung/olmocr2:7b-q8",
     "local_ollama_num_ctx": 8192,
@@ -247,6 +253,35 @@ TASK_TAG = config.get("task_tag", "#task")
 OPEN_REQUIRES_OBSIDIAN_RUNNING = bool(config.get("open_requires_obsidian_running", True))
 CUSTOM_OCR_INSTRUCTION = str(config.get("custom_ocr_instruction", "")).strip()
 OCR_PROVIDER = str(config.get("ocr_provider", "mistral")).strip().lower() or "mistral"
+OCR_MODEL = str(config.get("ocr_model", "")).strip()
+GEMINI_API_KEY = str(config.get("gemini_api_key", "")).strip()
+ANTHROPIC_API_KEY = str(config.get("anthropic_api_key", "")).strip()
+OPENAI_API_KEY = str(config.get("openai_api_key", "")).strip()
+
+CLOUD_VLM_OCR_PROVIDERS = (
+    "gemini",
+    "claude",
+    "openai",
+)
+CLOUD_OCR_DEFAULT_MODELS = {
+    "gemini": "gemini-2.5-flash",
+    "claude": "claude-sonnet-4-5",
+    "openai": "gpt-4.1",
+}
+CLOUD_OCR_API_KEY_CONFIG_KEYS = {
+    "gemini": "gemini_api_key",
+    "claude": "anthropic_api_key",
+    "openai": "openai_api_key",
+}
+CLOUD_OCR_API_KEY_ENV_VARS = {
+    "gemini": "GEMINI_API_KEY",
+    "claude": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+}
+CLOUD_VISUAL_EXTRACTION_VERSION = "bbox-pillow-crop-v1"
+CLOUD_VISUAL_PADDING_RATIO = 0.035
+CLOUD_VISUAL_TRIM_MARGIN_PX = 8
+CLOUD_VISUAL_WHITE_THRESHOLD = 248
 LOCAL_OLLAMA_URL = (
     str(config.get("local_ollama_url", "http://localhost:11434/api/generate")).strip()
     or "http://localhost:11434/api/generate"
@@ -291,6 +326,9 @@ DISABLED_OCR_PROVIDERS = (
 )
 SUPPORTED_OCR_PROVIDERS = (
     "mistral",
+    "gemini",
+    "claude",
+    "openai",
     "local_ollama",
     "hybrid_marker_olmocr",
     "none",
@@ -519,6 +557,18 @@ def ocr_settings_fingerprint(provider: str | None = None) -> str:
         fingerprint_data["mistral"] = {
             "model": "mistral-ocr-latest",
             "custom_ocr_instruction": CUSTOM_OCR_INSTRUCTION,
+        }
+    elif selected_provider in CLOUD_VLM_OCR_PROVIDERS:
+        fingerprint_data["cloud_vlm"] = {
+            "ocr_provider": selected_provider,
+            "ocr_model": resolve_cloud_ocr_model(selected_provider),
+            "visual_extraction": CLOUD_VISUAL_EXTRACTION_VERSION,
+            "custom_ocr_instruction": CUSTOM_OCR_INSTRUCTION,
+            "prompt": build_cloud_vlm_ocr_prompt(),
+            "rendering": {
+                "dpi": PAGE_HASH_DPI,
+                "alpha": PAGE_HASH_ALPHA,
+            },
         }
     elif selected_provider == "local_ollama":
         fingerprint_data["local_ollama"] = {
@@ -1738,6 +1788,13 @@ def append_extracted_visuals(page_text: str, image_embeds: list[str]) -> str:
     return page_text.rstrip() + "\n\n" + "\n\n".join(image_embeds)
 
 
+def _visual_file_referenced(filename: str, text: str) -> bool:
+    return (
+        f"/extracted_visuals/{filename}]]" in text
+        or f"![[{filename}]]" in text
+    )
+
+
 def remove_stale_page_visual_files(
     extracted_visual_dir: Path,
     page_number: int,
@@ -1756,7 +1813,7 @@ def remove_stale_page_visual_files(
     for existing_file in sorted(extracted_visual_dir.iterdir()):
         if not existing_file.is_file() or not existing_file.name.startswith(prefix):
             continue
-        if f"/extracted_visuals/{existing_file.name}]]" in referenced_other_pages:
+        if _visual_file_referenced(existing_file.name, referenced_other_pages):
             continue
         existing_file.unlink(missing_ok=True)
 
@@ -1778,7 +1835,7 @@ def remove_unreferenced_extracted_visual_files(
             or existing_file.name.startswith("marker-visual-")
         ):
             continue
-        if f"/extracted_visuals/{existing_file.name}]]" in referenced_all_pages:
+        if _visual_file_referenced(existing_file.name, referenced_all_pages):
             continue
         existing_file.unlink(missing_ok=True)
 
@@ -1960,6 +2017,853 @@ def hybrid_marker_olmocr_pdf(
     return format_ocr_pages(page_transcriptions)
 
 
+# ------------------------------------------------------------
+# CLOUD VLM OCR (GEMINI / CLAUDE / OPENAI) + VISUAL EXTRACTION
+# ------------------------------------------------------------
+
+CLOUD_VLM_OCR_PROMPT = """You are performing high-accuracy OCR on a handwritten note page.
+
+Transcribe all handwritten text faithfully into clean Markdown:
+- Preserve spelling, grammar, wording, headings, lists, and meaningful line breaks.
+- Convert tables into Markdown tables (do not use HTML tables).
+- Transcribe clear mathematical notation accurately. Do not invent or summarize content.
+
+Visual / Sketch Extraction:
+- Identify ONLY genuine hand-drawn sketches, diagrams, charts, illustrations, or graphical tables.
+- Do NOT create visual boxes for normal body text, headings, bullet lists, or single underlines.
+- For each genuine visual, insert a placeholder token [[VISUAL_1]], [[VISUAL_2]], etc. on its own line in `markdown` at the exact vertical reading position where the visual appears on the page.
+- Return each visual in the `visuals` array with its matching `id` (e.g. "VISUAL_1") and tight bounding box `box_2d` as [ymin, xmin, ymax, xmax] in normalized integer coordinates from 0 to 1000 relative to the page height and width.
+- If the page has no drawings or diagrams, return an empty `visuals` array [].
+
+Return ONLY valid JSON matching the schema:
+{"markdown": "...", "visuals": [{"id": "VISUAL_1", "box_2d": [ymin, xmin, ymax, xmax]}]}"""
+
+CLOUD_OCR_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "markdown": {"type": "string"},
+        "visuals": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "box_2d": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                    },
+                },
+                "required": ["id", "box_2d"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["markdown", "visuals"],
+    "additionalProperties": False,
+}
+
+GEMINI_OCR_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "markdown": {"type": "STRING"},
+        "visuals": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "id": {"type": "STRING"},
+                    "box_2d": {
+                        "type": "ARRAY",
+                        "items": {"type": "INTEGER"},
+                    },
+                },
+                "required": ["id", "box_2d"],
+            },
+        },
+    },
+    "required": ["markdown", "visuals"],
+}
+
+
+def build_cloud_vlm_ocr_prompt() -> str:
+    if CUSTOM_OCR_INSTRUCTION:
+        return f"{CLOUD_VLM_OCR_PROMPT}\n\nAdditional user instructions:\n{CUSTOM_OCR_INSTRUCTION}"
+    return CLOUD_VLM_OCR_PROMPT
+
+
+def resolve_cloud_ocr_model(provider: str) -> str:
+    selected = provider.strip().lower()
+    if selected not in CLOUD_OCR_DEFAULT_MODELS:
+        raise RuntimeError(f"Unsupported cloud OCR provider '{provider}'.")
+    configured_model = OCR_MODEL.strip() or str(config.get("ocr_model", "")).strip()
+    return configured_model or CLOUD_OCR_DEFAULT_MODELS[selected]
+
+
+def resolve_cloud_api_key(provider: str) -> str:
+    selected = provider.strip().lower()
+    if selected not in CLOUD_OCR_API_KEY_CONFIG_KEYS:
+        raise RuntimeError(f"Unsupported cloud OCR provider '{provider}'.")
+
+    module_keys = {
+        "gemini": GEMINI_API_KEY,
+        "claude": ANTHROPIC_API_KEY,
+        "openai": OPENAI_API_KEY,
+    }
+    direct_key = str(module_keys.get(selected, "")).strip()
+    if direct_key:
+        return direct_key
+
+    config_key = CLOUD_OCR_API_KEY_CONFIG_KEYS[selected]
+    configured_key = str(config.get(config_key, "")).strip()
+    if configured_key:
+        return configured_key
+
+    env_var = CLOUD_OCR_API_KEY_ENV_VARS[selected]
+    return os.environ.get(env_var, "").strip()
+
+
+def require_cloud_api_key(provider: str) -> str:
+    selected = provider.strip().lower()
+    api_key = resolve_cloud_api_key(selected)
+    if not api_key:
+        config_key = CLOUD_OCR_API_KEY_CONFIG_KEYS[selected]
+        env_var = CLOUD_OCR_API_KEY_ENV_VARS[selected]
+        raise RuntimeError(
+            f"API key for '{selected}' not found. Set '{config_key}' in {CONFIG_FILE} "
+            f"or {env_var} in {ENV_FILE}."
+        )
+    return api_key
+
+
+def _strip_json_code_fences(raw_text: str) -> str:
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, count=1, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```\s*$", "", cleaned, count=1)
+    return cleaned.strip()
+
+
+def parse_cloud_vlm_json_response(
+    raw_response: object,
+    provider: str,
+    page_number: int,
+) -> tuple[str, list[dict]]:
+    if isinstance(raw_response, dict):
+        parsed = raw_response
+    elif isinstance(raw_response, str):
+        cleaned = _strip_json_code_fences(raw_response)
+        try:
+            parsed = json.loads(cleaned)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{provider} returned invalid JSON for page {page_number}: {raw_response[:500]}"
+            ) from exc
+    else:
+        raise RuntimeError(
+            f"{provider} returned unexpected OCR payload type for page {page_number}: "
+            f"{type(raw_response).__name__}"
+        )
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            f"{provider} OCR JSON for page {page_number} must be an object."
+        )
+
+    markdown = parsed.get("markdown")
+    if not isinstance(markdown, str):
+        raise RuntimeError(
+            f"{provider} OCR JSON for page {page_number} is missing a string 'markdown' field."
+        )
+
+    raw_visuals = parsed.get("visuals", [])
+    visuals: list[dict] = []
+    if isinstance(raw_visuals, list):
+        for entry in raw_visuals:
+            if not isinstance(entry, dict):
+                continue
+            visual_id = str(entry.get("id", "")).strip()
+            box_2d = entry.get("box_2d")
+            if not visual_id or not isinstance(box_2d, (list, tuple)):
+                continue
+            visuals.append({"id": visual_id, "box_2d": list(box_2d)})
+
+    return markdown.strip(), visuals
+
+
+def normalize_visual_box_2d(box_2d: object) -> tuple[float, float, float, float] | None:
+    if not isinstance(box_2d, (list, tuple)) or len(box_2d) != 4:
+        return None
+
+    coords: list[float] = []
+    for value in box_2d:
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(number):
+            return None
+        coords.append(max(0.0, min(1000.0, number)))
+
+    ymin, xmin, ymax, xmax = coords
+    if ymin >= ymax or xmin >= xmax:
+        return None
+    return (ymin, xmin, ymax, xmax)
+
+
+def crop_and_save_visual_box(
+    page_image,
+    box_2d: object,
+    destination_path: Path,
+    padding_ratio: float = CLOUD_VISUAL_PADDING_RATIO,
+    trim_margin_px: int = CLOUD_VISUAL_TRIM_MARGIN_PX,
+    white_threshold: int = CLOUD_VISUAL_WHITE_THRESHOLD,
+) -> bool:
+    normalized = normalize_visual_box_2d(box_2d)
+    if normalized is None:
+        return False
+
+    width, height = page_image.size
+    if width <= 0 or height <= 0:
+        return False
+
+    ymin, xmin, ymax, xmax = normalized
+    raw_left = (xmin / 1000.0) * width
+    raw_top = (ymin / 1000.0) * height
+    raw_right = (xmax / 1000.0) * width
+    raw_bottom = (ymax / 1000.0) * height
+
+    box_width = raw_right - raw_left
+    box_height = raw_bottom - raw_top
+    if box_width < 4.0 or box_height < 4.0:
+        return False
+
+    pad_x = max(2, int(round(box_width * padding_ratio)))
+    pad_y = max(2, int(round(box_height * padding_ratio)))
+
+    left = max(0, int(math.floor(raw_left)) - pad_x)
+    top = max(0, int(math.floor(raw_top)) - pad_y)
+    right = min(width, int(math.ceil(raw_right)) + pad_x)
+    bottom = min(height, int(math.ceil(raw_bottom)) + pad_y)
+
+    if right - left < 4 or bottom - top < 4:
+        return False
+
+    cropped = page_image.crop((left, top, right, bottom)).convert("RGB")
+
+    # Trim excess pure whitespace while preserving a small residual margin.
+    gray = cropped.convert("L")
+    non_white_mask = gray.point(lambda pixel: 255 if pixel < white_threshold else 0)
+    content_bbox = non_white_mask.getbbox()
+    if content_bbox is None:
+        return False
+
+    c_left, c_top, c_right, c_bottom = content_bbox
+    margin = max(0, int(trim_margin_px))
+    trimmed_box = (
+        max(0, c_left - margin),
+        max(0, c_top - margin),
+        min(cropped.width, c_right + margin),
+        min(cropped.height, c_bottom + margin),
+    )
+    if trimmed_box[2] - trimmed_box[0] < 2 or trimmed_box[3] - trimmed_box[1] < 2:
+        return False
+
+    final_crop = cropped.crop(trimmed_box)
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    final_crop.save(destination_path, format="JPEG", quality=90)
+    return True
+
+
+def apply_cloud_visuals_to_page_markdown(
+    page_markdown: str,
+    page_image_bytes: bytes,
+    visuals: list[dict],
+    page_number: int,
+    extracted_visual_dir: Path,
+    obsidian_image_folder: str,
+) -> tuple[str, list[str]]:
+    if not visuals:
+        return page_markdown, []
+
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError(
+            "Cloud VLM visual extraction requires Pillow. Install Pillow in the active Supsidian Python environment."
+        ) from exc
+
+    extracted_visual_dir.mkdir(parents=True, exist_ok=True)
+    saved_filenames: list[str] = []
+    fallback_embeds: list[str] = []
+    updated_markdown = page_markdown
+    visual_index = 0
+
+    with Image.open(io.BytesIO(page_image_bytes)) as raw_image:
+        page_image = raw_image.convert("RGB")
+        for visual in visuals:
+            visual_id = str(visual.get("id", "")).strip()
+            placeholder = f"[[{visual_id}]]" if visual_id else ""
+            candidate_index = visual_index + 1
+            filename = f"page-{page_number:03d}-visual-{candidate_index:03d}.jpeg"
+            destination_path = extracted_visual_dir / filename
+
+            saved = crop_and_save_visual_box(
+                page_image,
+                visual.get("box_2d"),
+                destination_path,
+            )
+            if not saved:
+                if placeholder and placeholder in updated_markdown:
+                    updated_markdown = updated_markdown.replace(placeholder, "")
+                continue
+
+            visual_index = candidate_index
+            saved_filenames.append(filename)
+            if obsidian_image_folder:
+                image_embed = f"![[{obsidian_image_folder}/extracted_visuals/{filename}]]"
+            else:
+                image_embed = f"![[{filename}]]"
+
+            if placeholder and placeholder in updated_markdown:
+                updated_markdown = updated_markdown.replace(placeholder, image_embed)
+            else:
+                fallback_embeds.append(image_embed)
+
+    if fallback_embeds:
+        updated_markdown = append_extracted_visuals(updated_markdown, fallback_embeds)
+
+    updated_markdown = re.sub(r"\n{3,}", "\n\n", updated_markdown).strip()
+    return updated_markdown, saved_filenames
+
+
+def call_gemini_ocr_page(
+    page_image_bytes: bytes,
+    page_number: int,
+    model: str,
+    api_key: str,
+) -> tuple[str, list[dict]]:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    encoded_image = base64.b64encode(page_image_bytes).decode("ascii")
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": build_cloud_vlm_ocr_prompt()},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/png",
+                            "data": encoded_image,
+                        }
+                    },
+                ],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.0,
+            "responseMimeType": "application/json",
+            "responseSchema": GEMINI_OCR_RESPONSE_SCHEMA,
+        },
+    }
+
+    try:
+        response = requests.post(
+            url,
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            json=payload,
+            timeout=180,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Gemini OCR request failed for page {page_number}: {exc}") from exc
+
+    if not response.ok:
+        raise RuntimeError(
+            f"Gemini OCR returned HTTP {response.status_code} for page {page_number}: "
+            f"{response.text.strip()[:500]}"
+        )
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Gemini OCR returned invalid HTTP JSON for page {page_number}: {response.text[:500]}"
+        ) from exc
+
+    candidates = data.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        raise RuntimeError(f"Gemini OCR returned no candidates for page {page_number}: {data}")
+
+    parts = candidates[0].get("content", {}).get("parts", [])
+    text_parts = [part.get("text", "") for part in parts if isinstance(part, dict) and isinstance(part.get("text"), str)]
+    raw_text = "".join(text_parts).strip()
+    if not raw_text:
+        raise RuntimeError(f"Gemini OCR returned empty content for page {page_number}.")
+
+    return parse_cloud_vlm_json_response(raw_text, "gemini", page_number)
+
+
+def call_claude_ocr_page(
+    page_image_bytes: bytes,
+    page_number: int,
+    model: str,
+    api_key: str,
+) -> tuple[str, list[dict]]:
+    url = "https://api.anthropic.com/v1/messages"
+    encoded_image = base64.b64encode(page_image_bytes).decode("ascii")
+    payload = {
+        "model": model,
+        "max_tokens": 4096,
+        "temperature": 0.0,
+        "tools": [
+            {
+                "name": "submit_page_ocr",
+                "description": (
+                    "Submit the transcribed Markdown and bounding boxes for extracted "
+                    "visuals on this page."
+                ),
+                "input_schema": CLOUD_OCR_JSON_SCHEMA,
+            }
+        ],
+        "tool_choice": {"type": "tool", "name": "submit_page_ocr"},
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": encoded_image,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": build_cloud_vlm_ocr_prompt(),
+                    },
+                ],
+            }
+        ],
+    }
+
+    try:
+        response = requests.post(
+            url,
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json=payload,
+            timeout=180,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Claude OCR request failed for page {page_number}: {exc}") from exc
+
+    if not response.ok:
+        raise RuntimeError(
+            f"Claude OCR returned HTTP {response.status_code} for page {page_number}: "
+            f"{response.text.strip()[:500]}"
+        )
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Claude OCR returned invalid HTTP JSON for page {page_number}: {response.text[:500]}"
+        ) from exc
+
+    content_blocks = data.get("content")
+    if not isinstance(content_blocks, list) or not content_blocks:
+        raise RuntimeError(f"Claude OCR returned empty content for page {page_number}: {data}")
+
+    for block in content_blocks:
+        if isinstance(block, dict) and block.get("type") == "tool_use" and isinstance(block.get("input"), dict):
+            return parse_cloud_vlm_json_response(block["input"], "claude", page_number)
+
+    text_parts = [
+        block.get("text", "")
+        for block in content_blocks
+        if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)
+    ]
+    raw_text = "".join(text_parts).strip()
+    if not raw_text:
+        raise RuntimeError(f"Claude OCR returned no tool_use or text payload for page {page_number}.")
+
+    return parse_cloud_vlm_json_response(raw_text, "claude", page_number)
+
+
+def call_openai_ocr_page(
+    page_image_bytes: bytes,
+    page_number: int,
+    model: str,
+    api_key: str,
+) -> tuple[str, list[dict]]:
+    url = "https://api.openai.com/v1/chat/completions"
+    encoded_image = base64.b64encode(page_image_bytes).decode("ascii")
+    payload = {
+        "model": model,
+        "temperature": 0.0,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "page_ocr_result",
+                "strict": True,
+                "schema": CLOUD_OCR_JSON_SCHEMA,
+            },
+        },
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": build_cloud_vlm_ocr_prompt()},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{encoded_image}",
+                            "detail": "high",
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+
+    try:
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=180,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"OpenAI OCR request failed for page {page_number}: {exc}") from exc
+
+    if not response.ok:
+        raise RuntimeError(
+            f"OpenAI OCR returned HTTP {response.status_code} for page {page_number}: "
+            f"{response.text.strip()[:500]}"
+        )
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"OpenAI OCR returned invalid HTTP JSON for page {page_number}: {response.text[:500]}"
+        ) from exc
+
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError(f"OpenAI OCR returned no choices for page {page_number}: {data}")
+
+    message = choices[0].get("message", {})
+    content = message.get("content")
+    if isinstance(content, list):
+        text_parts = [
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ]
+        raw_text = "".join(text_parts).strip()
+    elif isinstance(content, str):
+        raw_text = content.strip()
+    else:
+        raw_text = ""
+
+    if not raw_text:
+        raise RuntimeError(f"OpenAI OCR returned empty content for page {page_number}.")
+
+    return parse_cloud_vlm_json_response(raw_text, "openai", page_number)
+
+
+def call_cloud_vlm_ocr_page(
+    provider: str,
+    page_image_bytes: bytes,
+    page_number: int,
+    model: str,
+    api_key: str,
+) -> tuple[str, list[dict]]:
+    selected = provider.strip().lower()
+    if selected == "gemini":
+        return call_gemini_ocr_page(page_image_bytes, page_number, model, api_key)
+    if selected == "claude":
+        return call_claude_ocr_page(page_image_bytes, page_number, model, api_key)
+    if selected == "openai":
+        return call_openai_ocr_page(page_image_bytes, page_number, model, api_key)
+    raise RuntimeError(f"Unsupported cloud OCR provider '{provider}'.")
+
+
+def cloud_vlm_ocr_selected_pdf_pages(
+    pdf_file: Path,
+    page_numbers: list[int],
+    provider: str,
+    extracted_visual_dir: Path,
+    obsidian_image_folder: str,
+    existing_page_transcriptions: list[str] | None = None,
+) -> tuple[dict[int, str], dict[int, list[str]]]:
+    if not page_numbers:
+        return {}, {}
+
+    selected_provider = provider.strip().lower()
+    api_key = require_cloud_api_key(selected_provider)
+    model = resolve_cloud_ocr_model(selected_provider)
+
+    try:
+        import fitz  # PyMuPDF
+    except ImportError as exc:
+        raise RuntimeError(
+            f"{selected_provider} OCR requires PyMuPDF. Install it in the active Supsidian Python environment."
+        ) from exc
+
+    render_scale = PAGE_HASH_DPI / 72
+    selected_pages = sorted(set(page_numbers))
+    page_transcriptions: dict[int, str] = {}
+    page_assets: dict[int, list[str]] = {}
+
+    try:
+        document = fitz.open(pdf_file)
+    except Exception as exc:
+        raise RuntimeError(f"Could not open PDF for {selected_provider} OCR: {pdf_file}: {exc}") from exc
+
+    try:
+        if len(document) == 0:
+            raise RuntimeError(f"PDF has no pages for {selected_provider} OCR: {pdf_file}")
+        invalid_pages = [
+            page_number
+            for page_number in selected_pages
+            if page_number < 1 or page_number > len(document)
+        ]
+        if invalid_pages:
+            raise RuntimeError(
+                f"Invalid {selected_provider} OCR page number(s) for {pdf_file}: {invalid_pages}"
+            )
+
+        changed_index = 0
+        for page_number, page in enumerate(document, start=1):
+            if page_number not in selected_pages:
+                continue
+
+            changed_index += 1
+            progress_event(
+                "ocr",
+                provider=selected_provider,
+                model=model,
+                page=page_number,
+                total_pages=len(document),
+                changed_index=changed_index,
+                changed_count=len(selected_pages),
+            )
+            pixmap = page.get_pixmap(
+                matrix=fitz.Matrix(render_scale, render_scale),
+                alpha=PAGE_HASH_ALPHA,
+            )
+            page_image_bytes = pixmap.tobytes("png")
+            raw_markdown, visuals = call_cloud_vlm_ocr_page(
+                selected_provider,
+                page_image_bytes,
+                page_number,
+                model,
+                api_key,
+            )
+            remove_stale_page_visual_files(
+                extracted_visual_dir,
+                page_number,
+                existing_page_transcriptions or [],
+            )
+            page_markdown, saved_assets = apply_cloud_visuals_to_page_markdown(
+                raw_markdown,
+                page_image_bytes,
+                visuals,
+                page_number,
+                extracted_visual_dir,
+                obsidian_image_folder,
+            )
+            page_transcriptions[page_number] = page_markdown
+            page_assets[page_number] = saved_assets
+    finally:
+        document.close()
+
+    return page_transcriptions, page_assets
+
+
+def cloud_vlm_ocr_pdf(
+    pdf_file: Path,
+    image_dir: Path,
+    obsidian_image_folder: str,
+    note_file: Path | None = None,
+    provider: str | None = None,
+) -> str:
+    selected_provider = (provider or OCR_PROVIDER).strip().lower()
+    model = resolve_cloud_ocr_model(selected_provider)
+    extracted_visual_dir = image_dir / "extracted_visuals"
+
+    log(f"Starting {selected_provider} cloud OCR ({model}): {pdf_file}")
+
+    if note_file is not None:
+        current_page_hashes = render_pdf_page_hashes(pdf_file)
+        cache = load_page_cache(note_file) or {}
+        cached_pages = cache.get("pages", [])
+        if not isinstance(cached_pages, list):
+            cached_pages = []
+        cached_fingerprint = cache.get("ocr_fingerprint")
+        cached_fingerprint = cached_fingerprint if isinstance(cached_fingerprint, str) else None
+
+        fingerprint = ocr_settings_fingerprint(selected_provider)
+        md_file = OBSIDIAN_NOTE_DIR / f"{safe_name(note_file)}.md"
+        preamble, existing_md_pages = parse_existing_markdown_note(md_file)
+
+        if cached_fingerprint and cached_fingerprint != fingerprint:
+            log(f"{selected_provider} page cache invalidated due to OCR settings fingerprint change")
+
+        reconciliation = reconcile_page_cache(
+            current_page_hashes,
+            cached_pages,
+            fingerprint,
+            cached_fingerprint=cached_fingerprint,
+        )
+        pages_to_ocr = reconciliation["changed_pages"]
+
+        reused_page_texts = [
+            ordered_page["markdown"] or ""
+            for ordered_page in reconciliation["ordered_pages"]
+        ]
+        new_page_markdown, new_page_assets = (
+            cloud_vlm_ocr_selected_pdf_pages(
+                pdf_file,
+                pages_to_ocr,
+                selected_provider,
+                extracted_visual_dir,
+                obsidian_image_folder,
+                existing_page_transcriptions=reused_page_texts,
+            )
+            if pages_to_ocr
+            else ({}, {})
+        )
+
+        page_transcriptions: list[str] = []
+        updated_pages: list[dict] = []
+        updated_at = utc_now_iso()
+
+        for ordered_page in reconciliation["ordered_pages"]:
+            page_number = ordered_page["page_number"]
+            if ordered_page["reused"]:
+                same_position_hash = (
+                    page_number - 1 < len(cached_pages)
+                    and isinstance(cached_pages[page_number - 1], dict)
+                    and cached_pages[page_number - 1].get("page_hash") == ordered_page["page_hash"]
+                )
+                if (
+                    existing_md_pages
+                    and same_position_hash
+                    and page_number in existing_md_pages
+                ):
+                    markdown = existing_md_pages[page_number]
+                else:
+                    markdown = ordered_page["markdown"]
+                cached_assets = (
+                    cached_pages[page_number - 1].get("assets", [])
+                    if same_position_hash and isinstance(cached_pages[page_number - 1].get("assets"), list)
+                    else []
+                )
+                assets = list(cached_assets)
+            else:
+                if page_number not in new_page_markdown:
+                    raise RuntimeError(
+                        f"{selected_provider} did not return OCR text for changed page {page_number}"
+                    )
+                markdown = convert_html_tables(new_page_markdown[page_number], forgiving=True)[0]
+                markdown = convert_hash_lines_to_tasks(markdown)
+                assets = new_page_assets.get(page_number, [])
+
+            page_transcriptions.append(markdown)
+            updated_pages.append(
+                {
+                    "page_number": page_number,
+                    "page_hash": ordered_page["page_hash"],
+                    "markdown": markdown,
+                    "assets": assets,
+                    "updated_at": updated_at,
+                }
+            )
+
+        remove_unreferenced_extracted_visual_files(
+            extracted_visual_dir,
+            page_transcriptions,
+        )
+
+        cache_data = {
+            "schema_version": PAGE_CACHE_SCHEMA_VERSION,
+            "note_path": str(note_file.expanduser().resolve()),
+            "note_cache_id": note_page_cache_id(note_file),
+            "ocr_fingerprint": fingerprint,
+            "provider": selected_provider,
+            "model": model,
+            "visual_extraction": CLOUD_VISUAL_EXTRACTION_VERSION,
+            "updated_at": updated_at,
+            "pages": updated_pages,
+            "last_run": {
+                "page_count": len(current_page_hashes),
+                "changed_pages": pages_to_ocr,
+                "reused_pages_count": reconciliation["reused_pages_count"],
+                "pages_to_ocr_count": reconciliation["pages_to_ocr_count"],
+                "deleted_pages_count": reconciliation["deleted_pages_count"],
+            },
+        }
+        save_page_cache(note_file, cache_data)
+
+        log(
+            f"{selected_provider} page cache: "
+            f"reused {reconciliation['reused_pages_count']} page(s), "
+            f"OCRed {reconciliation['pages_to_ocr_count']} page(s), "
+            f"changed pages: {pages_to_ocr}"
+        )
+        log(f"{selected_provider} cloud OCR finished: {pdf_file}")
+        return format_ocr_pages(page_transcriptions, preamble=preamble)
+
+    try:
+        import fitz  # PyMuPDF
+    except ImportError as exc:
+        raise RuntimeError(
+            f"{selected_provider} OCR requires PyMuPDF. Install it in the active Supsidian Python environment."
+        ) from exc
+
+    try:
+        document = fitz.open(pdf_file)
+    except Exception as exc:
+        raise RuntimeError(f"Could not open PDF for {selected_provider} OCR: {pdf_file}: {exc}") from exc
+
+    try:
+        page_numbers = list(range(1, len(document) + 1))
+    finally:
+        document.close()
+
+    page_markdown_map, _ = cloud_vlm_ocr_selected_pdf_pages(
+        pdf_file,
+        page_numbers,
+        selected_provider,
+        extracted_visual_dir,
+        obsidian_image_folder,
+    )
+    page_transcriptions = [
+        convert_html_tables(page_markdown_map[page_number], forgiving=True)[0]
+        for page_number in page_numbers
+    ]
+    remove_unreferenced_extracted_visual_files(
+        extracted_visual_dir,
+        page_transcriptions,
+    )
+    log(f"{selected_provider} cloud OCR finished: {pdf_file}")
+    return format_ocr_pages(page_transcriptions)
+
+
 def is_ocr_disabled(provider: str | None = None) -> bool:
     if not bool(config.get("ocr_enabled", True)):
         return True
@@ -1991,6 +2895,13 @@ def ocr_pdf(pdf_file: Path, image_dir: Path, obsidian_image_folder: str) -> str:
         return ""
     if provider == "mistral":
         return mistral_ocr_pdf(pdf_file, image_dir, obsidian_image_folder)
+    if provider in CLOUD_VLM_OCR_PROVIDERS:
+        return cloud_vlm_ocr_pdf(
+            pdf_file,
+            image_dir,
+            obsidian_image_folder,
+            provider=provider,
+        )
     if provider == "local_ollama":
         return local_ollama_ocr_pdf(pdf_file, image_dir, obsidian_image_folder)
     if provider == "hybrid_marker_olmocr":
@@ -2154,6 +3065,14 @@ def process_note(note_file: Path) -> None:
                         staged_attachment_dir,
                         obsidian_image_folder,
                         note_file,
+                    )
+                elif OCR_PROVIDER in CLOUD_VLM_OCR_PROVIDERS:
+                    ocr_markdown = cloud_vlm_ocr_pdf(
+                        staged_pdf_file,
+                        staged_attachment_dir,
+                        obsidian_image_folder,
+                        note_file=note_file,
+                        provider=OCR_PROVIDER,
                     )
                 else:
                     ocr_markdown = ocr_pdf(
@@ -2918,6 +3837,36 @@ def diagnose() -> None:
                     "marker_single is on PATH"
                 ),
             )
+    elif OCR_PROVIDER in CLOUD_VLM_OCR_PROVIDERS:
+        cloud_api_key_set = bool(resolve_cloud_api_key(OCR_PROVIDER))
+        cloud_env_var = CLOUD_OCR_API_KEY_ENV_VARS[OCR_PROVIDER]
+        cloud_config_key = CLOUD_OCR_API_KEY_CONFIG_KEYS[OCR_PROVIDER]
+        cloud_model = resolve_cloud_ocr_model(OCR_PROVIDER)
+        add_check(
+            f"{cloud_env_var} is set",
+            cloud_api_key_set,
+            f"model '{cloud_model}'"
+            if cloud_api_key_set
+            else f"missing (set '{cloud_config_key}' in {CONFIG_FILE} or {cloud_env_var})",
+        )
+        try:
+            import fitz  # PyMuPDF  # noqa: F401
+            add_check("PyMuPDF is available", True, "available")
+        except ImportError:
+            add_check(
+                "PyMuPDF is available",
+                False,
+                "missing; install PyMuPDF in the active Supsidian Python environment",
+            )
+        try:
+            from PIL import Image  # noqa: F401
+            add_check("Pillow is available", True, "available")
+        except ImportError:
+            add_check(
+                "Pillow is available",
+                False,
+                "missing; install Pillow in the active Supsidian Python environment",
+            )
     elif provider_supported and OCR_PROVIDER != "mistral" and not is_ocr_disabled():
         add_check(
             "Selected OCR provider is available",
@@ -3061,6 +4010,9 @@ def show_status() -> None:
         print(f"Mistral API key:  {'yes' if os.environ.get('MISTRAL_API_KEY') else 'no'}")
     else:
         print("Mistral API key:  not required")
+    if OCR_PROVIDER in CLOUD_VLM_OCR_PROVIDERS:
+        print(f"Cloud OCR model:  {resolve_cloud_ocr_model(OCR_PROVIDER)}")
+        print(f"Cloud API key:    {'yes' if resolve_cloud_api_key(OCR_PROVIDER) else 'no'}")
     if OCR_PROVIDER in {"local_ollama", "hybrid_marker_olmocr"}:
         print(f"Ollama URL:       {LOCAL_OLLAMA_URL}")
         print(f"Ollama model:     {LOCAL_OLLAMA_MODEL}")
