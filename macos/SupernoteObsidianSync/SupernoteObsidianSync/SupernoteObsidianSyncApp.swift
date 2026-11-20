@@ -215,7 +215,7 @@ final class CommandRunner: ObservableObject {
 
     func showActiveSyncWindow() {
         if let activeSyncWindow {
-            activeSyncWindow.bringToFront(floating: isSyncing)
+            activeSyncWindow.bringToFront()
         } else if !lastSyncText.isEmpty {
             let reopened = OutputWindowController.show(
                 title: lastSyncTitle,
@@ -228,7 +228,7 @@ final class CommandRunner: ObservableObject {
                 label: isSyncing ? syncStageSummary : lastSyncSummary,
                 context: syncContextSummary
             )
-            reopened.bringToFront(floating: isSyncing)
+            reopened.bringToFront()
             activeSyncWindow = reopened
             hasSyncWindow = true
         }
@@ -346,7 +346,6 @@ final class CommandRunner: ObservableObject {
             reuseExisting: true
         )
         activeSyncWindow = outputWindow
-        outputWindow.bringToFront(floating: true)
         outputWindow.updateProgress(
             isRunning: true,
             fraction: nil,
@@ -393,14 +392,8 @@ final class CommandRunner: ObservableObject {
                             context: self.syncContextSummary
                         )
                         outputWindow.update(text: openResult.displayText)
-                        outputWindow.bringToFront(floating: false)
                     }
                     return
-                }
-
-                // Keep the sync progress window visible after Supernote Partner opens.
-                await MainActor.run {
-                    outputWindow.bringToFront(floating: true)
                 }
 
                 let (sleepNanoseconds, overflow) = UInt64(delaySeconds).multipliedReportingOverflow(by: 1_000_000_000)
@@ -433,7 +426,6 @@ final class CommandRunner: ObservableObject {
                         context: self.syncContextSummary
                     )
                     outputWindow.update(text: syncRunningOutput)
-                    outputWindow.bringToFront(floating: true)
                 }
             }
 
@@ -488,7 +480,6 @@ final class CommandRunner: ObservableObject {
                     context: progressTracker.currentContextSummary
                 )
                 outputWindow.update(text: result.displayText)
-                outputWindow.bringToFront(floating: false)
             }
         }
     }
@@ -682,6 +673,8 @@ nonisolated struct SyncProgressEvent: Decodable, Sendable {
     let provider: String?
     let page: Int?
     let total_pages: Int?
+    let changed_index: Int?
+    let changed_count: Int?
 }
 
 nonisolated final class StdoutStreamBuffer: @unchecked Sendable {
@@ -821,6 +814,8 @@ final class SyncProgressTracker {
     private var provider: String?
     private var page: Int?
     private var totalPages: Int?
+    private var changedIndex: Int?
+    private var changedCount: Int?
     private var stage: String = "scanning"
     private var stageDescription = "Looking for changed Supernote notes…"
     private var completedNotes: [String] = []
@@ -868,8 +863,14 @@ final class SyncProgressTracker {
             return nil
         }
 
-        let currentPage = min(max(page ?? 1, 1), totalPages)
-        let pageRatio = Double(currentPage) / Double(totalPages)
+        let pageRatio: Double
+        if let changedIndex, let changedCount, changedCount > 0 {
+            let currentChanged = min(max(changedIndex, 1), changedCount)
+            pageRatio = Double(currentChanged) / Double(changedCount)
+        } else {
+            let currentPage = min(max(page ?? 1, 1), totalPages)
+            pageRatio = Double(currentPage) / Double(totalPages)
+        }
         let isHybrid = (provider == "hybrid_marker_olmocr")
         let noteFraction: Double
 
@@ -916,6 +917,12 @@ final class SyncProgressTracker {
         if let totalPages = event.total_pages {
             self.totalPages = totalPages
         }
+        if let changedIndex = event.changed_index {
+            self.changedIndex = changedIndex
+        }
+        if let changedCount = event.changed_count {
+            self.changedCount = changedCount
+        }
 
         switch event.stage {
         case "scanning":
@@ -923,6 +930,8 @@ final class SyncProgressTracker {
             notePath = nil
             page = nil
             totalPages = nil
+            changedIndex = nil
+            changedCount = nil
             if let notebook, let notebookIndex, let notebookCount {
                 stageDescription = "Scanning folder \(notebookIndex) of \(notebookCount): \(notebook)…"
             } else if let notebook {
@@ -934,25 +943,40 @@ final class SyncProgressTracker {
         case "processing":
             page = nil
             totalPages = nil
+            changedIndex = nil
+            changedCount = nil
             let currentNote = noteName ?? notePath ?? "note"
             stageDescription = "Processing note: \(currentNote)…"
 
         case "converting":
             page = nil
             totalPages = nil
+            changedIndex = nil
+            changedCount = nil
             let currentNote = noteName ?? notePath ?? "note"
             stageDescription = "Converting \(currentNote) to PDF…"
 
         case "ocr_start":
             page = nil
             totalPages = nil
+            changedIndex = nil
+            changedCount = nil
             let activeProvider = provider ?? "configured provider"
             stageDescription = "OCR in progress… (\(activeProvider))"
 
         case "ocr":
             let activeProvider = provider ?? "local OCR"
             if let page = event.page, let totalPages = event.total_pages {
-                stageDescription = "OCR in progress… (\(activeProvider) — page \(page) of \(totalPages))"
+                if let changedIndex = event.changed_index,
+                   let changedCount = event.changed_count,
+                   changedCount < totalPages {
+                    let changedLabel = changedCount == 1
+                        ? "1 changed page"
+                        : "changed \(changedIndex) of \(changedCount)"
+                    stageDescription = "OCR in progress… (\(activeProvider) — page \(page) of \(totalPages), \(changedLabel))"
+                } else {
+                    stageDescription = "OCR in progress… (\(activeProvider) — page \(page) of \(totalPages))"
+                }
             } else if let page = event.page {
                 stageDescription = "OCR in progress… (\(activeProvider) — page \(page))"
             } else {
@@ -961,7 +985,16 @@ final class SyncProgressTracker {
 
         case "marker":
             if let page = event.page, let totalPages = event.total_pages {
-                stageDescription = "OCR in progress… (Marker layout & visuals — page \(page) of \(totalPages))"
+                if let changedIndex = event.changed_index,
+                   let changedCount = event.changed_count,
+                   changedCount < totalPages {
+                    let changedLabel = changedCount == 1
+                        ? "1 changed page"
+                        : "changed \(changedIndex) of \(changedCount)"
+                    stageDescription = "OCR in progress… (Marker layout & visuals — page \(page) of \(totalPages), \(changedLabel))"
+                } else {
+                    stageDescription = "OCR in progress… (Marker layout & visuals — page \(page) of \(totalPages))"
+                }
             } else if let page = event.page {
                 stageDescription = "OCR in progress… (Marker layout & visuals — page \(page))"
             } else {
@@ -1095,7 +1128,7 @@ final class OutputWindowController: NSWindowController, NSWindowDelegate {
         if reuseExisting, let existing = sharedSyncController {
             existing.window?.title = title
             existing.update(text: output)
-            existing.bringToFront(floating: false)
+            existing.bringToFront()
             return existing
         }
 
@@ -1114,7 +1147,7 @@ final class OutputWindowController: NSWindowController, NSWindowDelegate {
             }
         }
 
-        controller.bringToFront(floating: false)
+        controller.bringToFront()
 
         return controller
     }
@@ -1136,12 +1169,11 @@ final class OutputWindowController: NSWindowController, NSWindowDelegate {
         progressModel.context = context
     }
 
-    func bringToFront(floating: Bool) {
+    func bringToFront() {
         guard let window else { return }
-        window.level = floating ? .floating : .normal
+        window.level = .normal
         showWindow(nil)
         window.makeKeyAndOrderFront(nil)
-        window.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
     }
 

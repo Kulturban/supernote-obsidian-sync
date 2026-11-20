@@ -904,16 +904,20 @@ def ollama_ocr_selected_pdf_pages(pdf_file: Path, page_numbers: list[int]) -> di
 
         with tempfile.TemporaryDirectory(prefix="supsidian-local-ocr-") as temporary_directory:
             temporary_dir = Path(temporary_directory)
+            changed_index = 0
 
             for page_number, page in enumerate(document, start=1):
                 if page_number not in selected_pages:
                     continue
 
+                changed_index += 1
                 progress_event(
                     "ocr",
                     provider=OCR_PROVIDER,
                     page=page_number,
                     total_pages=len(document),
+                    changed_index=changed_index,
+                    changed_count=len(selected_pages),
                 )
                 page_path = temporary_dir / f"page-{page_number:03d}.png"
                 pixmap = page.get_pixmap(
@@ -1009,8 +1013,74 @@ def ollama_ocr_pdf_pages(pdf_file: Path) -> list[str]:
     return [page_transcriptions[page_number] for page_number in page_numbers]
 
 
-def format_ocr_pages(page_transcriptions: list[str]) -> str:
+EXISTING_PAGE_HEADING_PATTERN = re.compile(r"^## Page (\d+)\s*$")
+ORIGINAL_PDF_FOOTER_PATTERN = re.compile(
+    r"\n*---\n+## Original PDF\n+!\[\[.*?\]\]\s*\Z",
+    re.DOTALL,
+)
+
+
+def parse_existing_markdown_note(md_file: Path) -> tuple[str, dict[int, str]]:
+    """
+    Parse an existing Obsidian Markdown note into (preamble, {page_number: page_markdown}).
+    Preserves manual edits on unchanged pages when updating a note in place.
+    """
+    if not md_file.exists():
+        return "", {}
+
+    try:
+        raw_text = md_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "", {}
+
+    body_text = ORIGINAL_PDF_FOOTER_PATTERN.sub("", raw_text).strip("\n")
+    if not body_text.strip():
+        return "", {}
+
+    lines = body_text.splitlines()
+    heading_positions: list[tuple[int, int]] = []
+    for index, line in enumerate(lines):
+        match = EXISTING_PAGE_HEADING_PATTERN.match(line.strip())
+        if match:
+            heading_positions.append((index, int(match.group(1))))
+
+    if not heading_positions:
+        return "", {}
+
+    first_heading_line = heading_positions[0][0]
+    preamble = "\n".join(lines[:first_heading_line]).strip()
+    pages: dict[int, str] = {}
+
+    for pos_index, (start_line, page_number) in enumerate(heading_positions):
+        end_line = (
+            heading_positions[pos_index + 1][0]
+            if pos_index + 1 < len(heading_positions)
+            else len(lines)
+        )
+        section_lines = lines[start_line + 1 : end_line]
+        while section_lines and not section_lines[-1].strip():
+            section_lines.pop()
+        if (
+            pos_index + 1 < len(heading_positions)
+            and section_lines
+            and section_lines[-1].strip() == "---"
+        ):
+            section_lines.pop()
+            while section_lines and not section_lines[-1].strip():
+                section_lines.pop()
+        while section_lines and not section_lines[0].strip():
+            section_lines.pop(0)
+
+        pages[page_number] = "\n".join(section_lines)
+
+    return preamble, pages
+
+
+def format_ocr_pages(page_transcriptions: list[str], preamble: str = "") -> str:
     markdown_parts = []
+    clean_preamble = preamble.strip()
+    if clean_preamble:
+        markdown_parts.append(f"{clean_preamble}\n\n")
 
     for page_number, page_markdown in enumerate(page_transcriptions, start=1):
         if page_number == 1:
@@ -1067,6 +1137,7 @@ def incremental_ollama_page_transcriptions(
     note_file: Path,
     provider: str,
     fingerprint: str,
+    existing_md_pages: dict[int, str] | None = None,
 ) -> tuple[list[str], dict]:
     current_page_hashes = render_pdf_page_hashes(pdf_file)
     cache = load_page_cache(note_file) or {}
@@ -1076,14 +1147,41 @@ def incremental_ollama_page_transcriptions(
     cached_fingerprint = cache.get("ocr_fingerprint")
     cached_fingerprint = cached_fingerprint if isinstance(cached_fingerprint, str) else None
 
-    if cached_fingerprint and cached_fingerprint != fingerprint:
+    # Bootstrap cache from an existing Obsidian .md note when pages were appended
+    # and no page cache file existed yet.
+    if (
+        not cached_pages
+        and existing_md_pages
+        and len(current_page_hashes) > len(existing_md_pages)
+        and all(page_num in existing_md_pages for page_num in range(1, len(existing_md_pages) + 1))
+    ):
+        cached_pages = [
+            {
+                "page_number": page_num,
+                "page_hash": current_page_hashes[page_num - 1],
+                "markdown": existing_md_pages[page_num],
+            }
+            for page_num in range(1, len(existing_md_pages) + 1)
+        ]
+        cached_fingerprint = fingerprint
+
+    # When an existing Obsidian note is already present on disk, keep page-hash
+    # baselines across minor settings/version fingerprint updates so unchanged
+    # pages are never needlessly re-OCRed.
+    effective_cached_fingerprint = (
+        fingerprint
+        if (existing_md_pages and cached_pages)
+        else cached_fingerprint
+    )
+
+    if cached_fingerprint and effective_cached_fingerprint != fingerprint:
         log(f"{provider} page cache invalidated due to OCR settings fingerprint change")
 
     reconciliation = reconcile_page_cache(
         current_page_hashes,
         cached_pages,
         fingerprint,
-        cached_fingerprint=cached_fingerprint,
+        cached_fingerprint=effective_cached_fingerprint,
     )
     pages_to_ocr = reconciliation["changed_pages"]
     new_page_markdown = (
@@ -1099,7 +1197,19 @@ def incremental_ollama_page_transcriptions(
     for ordered_page in reconciliation["ordered_pages"]:
         page_number = ordered_page["page_number"]
         if ordered_page["reused"]:
-            markdown = ordered_page["markdown"]
+            same_position_hash = (
+                page_number - 1 < len(cached_pages)
+                and isinstance(cached_pages[page_number - 1], dict)
+                and cached_pages[page_number - 1].get("page_hash") == ordered_page["page_hash"]
+            )
+            if (
+                existing_md_pages
+                and same_position_hash
+                and page_number in existing_md_pages
+            ):
+                markdown = existing_md_pages[page_number]
+            else:
+                markdown = ordered_page["markdown"]
         else:
             if page_number not in new_page_markdown:
                 raise RuntimeError(
@@ -1178,14 +1288,22 @@ def local_ollama_ocr_pdf_incremental(
     note_file: Path,
 ) -> str:
     log(f"Starting incremental local Ollama OCR: {pdf_file}")
-    page_transcriptions, _reconciliation = incremental_ollama_page_transcriptions(
+    md_file = OBSIDIAN_NOTE_DIR / f"{safe_name(note_file)}.md"
+    preamble, existing_md_pages = parse_existing_markdown_note(md_file)
+    page_transcriptions, reconciliation = incremental_ollama_page_transcriptions(
         pdf_file,
         note_file,
         "local_ollama",
         ocr_settings_fingerprint("local_ollama"),
+        existing_md_pages=existing_md_pages,
     )
+    changed_set = set(reconciliation["changed_pages"])
+    for index, page_text in enumerate(page_transcriptions):
+        if (index + 1) in changed_set or not existing_md_pages:
+            page_transcriptions[index] = convert_hash_lines_to_tasks(page_text)
+    update_page_cache_markdown(note_file, page_transcriptions)
     log(f"Incremental local Ollama OCR finished: {pdf_file}")
-    return format_ocr_pages(page_transcriptions)
+    return format_ocr_pages(page_transcriptions, preamble=preamble)
 
 
 HTML_TABLE_PATTERN = re.compile(r"<table\b[^>]*>.*?</table\s*>", re.IGNORECASE | re.DOTALL)
@@ -1720,19 +1838,29 @@ def hybrid_marker_olmocr_pdf(
     log(f"Starting hybrid Marker + Ollama OCR: {pdf_file}")
 
     reconciliation = None
+    preamble = ""
+    existing_md_pages: dict[int, str] = {}
     if note_file is not None:
+        md_file = OBSIDIAN_NOTE_DIR / f"{safe_name(note_file)}.md"
+        preamble, existing_md_pages = parse_existing_markdown_note(md_file)
         page_transcriptions, reconciliation = incremental_ollama_page_transcriptions(
             pdf_file,
             note_file,
             "hybrid_marker_olmocr",
             ocr_settings_fingerprint("hybrid_marker_olmocr"),
+            existing_md_pages=existing_md_pages,
         )
     else:
         page_transcriptions = ollama_ocr_pdf_pages(pdf_file)
 
+    changed_set = set(reconciliation["changed_pages"]) if reconciliation is not None else set(
+        range(1, len(page_transcriptions) + 1)
+    )
     page_transcriptions = [
         convert_html_tables(page_text, forgiving=True)[0]
-        for page_text in page_transcriptions
+        if ((index + 1) in changed_set or not existing_md_pages)
+        else page_text
+        for index, page_text in enumerate(page_transcriptions)
     ]
 
     extracted_visual_dir = image_dir / "extracted_visuals"
@@ -1745,13 +1873,13 @@ def hybrid_marker_olmocr_pdf(
                 page_transcriptions,
             )
             update_page_cache_markdown(note_file, page_transcriptions)
-            return format_ocr_pages(page_transcriptions)
+            return format_ocr_pages(page_transcriptions, preamble=preamble)
 
         log(f"Hybrid Marker page-scope: processing changed pages {marker_pages_to_process}")
         with tempfile.TemporaryDirectory(prefix="supsidian-hybrid-marker-") as temporary_directory:
             total_visuals = 0
             placed_count = 0
-            for page_number in marker_pages_to_process:
+            for changed_index, page_number in enumerate(marker_pages_to_process, start=1):
                 marker_dir = Path(temporary_directory) / f"marker_page_{page_number:03d}"
                 try:
                     progress_event(
@@ -1759,6 +1887,8 @@ def hybrid_marker_olmocr_pdf(
                         provider="hybrid_marker_olmocr",
                         page=page_number,
                         total_pages=len(page_transcriptions),
+                        changed_index=changed_index,
+                        changed_count=len(marker_pages_to_process),
                     )
                     run_hybrid_marker_for_page(pdf_file, marker_dir, page_number)
                     remove_stale_page_visual_files(
@@ -1784,6 +1914,12 @@ def hybrid_marker_olmocr_pdf(
                     )
                     continue
 
+        for page_number in marker_pages_to_process:
+            if 1 <= page_number <= len(page_transcriptions):
+                page_transcriptions[page_number - 1] = convert_hash_lines_to_tasks(
+                    page_transcriptions[page_number - 1]
+                )
+
         log(
             f"Hybrid Marker + Ollama OCR finished: {pdf_file} "
             f"({total_visuals} visual(s), {placed_count} placed by Marker order)"
@@ -1793,7 +1929,7 @@ def hybrid_marker_olmocr_pdf(
             page_transcriptions,
         )
         update_page_cache_markdown(note_file, page_transcriptions)
-        return format_ocr_pages(page_transcriptions)
+        return format_ocr_pages(page_transcriptions, preamble=preamble)
 
     try:
         with tempfile.TemporaryDirectory(prefix="supsidian-hybrid-marker-") as temporary_directory:
@@ -2025,9 +2161,9 @@ def process_note(note_file: Path) -> None:
                         staged_attachment_dir,
                         obsidian_image_folder,
                     )
+                    ocr_markdown = convert_hash_lines_to_tasks(ocr_markdown)
 
                 progress_event("writing_markdown", note=str(note_file), note_name=name)
-                ocr_markdown = convert_hash_lines_to_tasks(ocr_markdown)
 
                 final_markdown = f"""{ocr_markdown}
 

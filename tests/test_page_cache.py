@@ -852,3 +852,115 @@ def test_incremental_hybrid_marker_failure_on_second_run_still_ocrs_only_changed
     assert cache["last_run"]["pages_to_ocr_count"] == 1
     assert cache["last_run"]["reused_pages_count"] == 2
     assert cache["last_run"]["deleted_pages_count"] == 0
+
+
+def test_process_note_preserves_existing_md_pages_and_only_ocrs_changed_page(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module({"ocr_provider": "local_ollama"})
+    source_dir = tmp_path / "source"
+    source_dir.mkdir(parents=True)
+    note_file = source_dir / "Notebook.note"
+    note_file.write_bytes(b"note")
+
+    vault_notes_dir = tmp_path / "vault" / "notes"
+    vault_notes_dir.mkdir(parents=True)
+    md_file = vault_notes_dir / "Notebook.md"
+    md_file.write_text(
+        "---\ntitle: Custom Frontmatter\n---\n\n"
+        "## Page 1\n\nOriginal page 1 with manual user note\n\n---\n\n"
+        "## Page 2\n\nOriginal page 2\n\n---\n\n"
+        "## Original PDF\n\n![[Attachments/Test/Notebook/Notebook.pdf]]\n",
+        encoding="utf-8",
+    )
+
+    module.save_page_cache(
+        note_file,
+        {
+            "ocr_fingerprint": "older-fingerprint-from-previous-version",
+            "pages": [
+                cached_page("hash-1", "Cached page 1"),
+                cached_page("hash-2", "Cached page 2"),
+            ],
+        },
+    )
+
+    monkeypatch.setattr(module, "SOURCE_DIR", source_dir)
+    monkeypatch.setattr(module, "OBSIDIAN_NOTE_DIR", vault_notes_dir)
+    monkeypatch.setattr(module, "PDF_DIR", tmp_path / "vault" / "attachments")
+    monkeypatch.setattr(module, "ACTIVE_ATTACHMENT_FOLDER", "Attachments/Test")
+    monkeypatch.setattr(module, "render_pdf_page_hashes", lambda _pdf: ["hash-1", "hash-2-edited"])
+
+    ocr_calls: list[list[int]] = []
+
+    def fake_convert(_note_file: Path, pdf_file: Path) -> None:
+        pdf_file.parent.mkdir(parents=True, exist_ok=True)
+        pdf_file.write_bytes(b"pdf")
+
+    def fake_selected_ocr(_pdf_file: Path, page_numbers: list[int]) -> dict[int, str]:
+        ocr_calls.append(page_numbers)
+        return {page_number: f"# Updated task on page {page_number}" for page_number in page_numbers}
+
+    monkeypatch.setattr(module, "convert_note_to_pdf", fake_convert)
+    monkeypatch.setattr(module, "ollama_ocr_selected_pdf_pages", fake_selected_ocr)
+    monkeypatch.setattr(module, "unload_local_ollama_model_after_note", lambda: None)
+
+    module.process_note(note_file)
+
+    assert ocr_calls == [[2]]
+    updated_md = md_file.read_text(encoding="utf-8")
+    assert "title: Custom Frontmatter" in updated_md
+    assert "Original page 1 with manual user note" in updated_md
+    assert "- [ ] #task Updated task on page 2" in updated_md
+
+
+def test_process_note_bootstraps_from_existing_md_when_new_page_appended_without_cache(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module({"ocr_provider": "local_ollama"})
+    source_dir = tmp_path / "source"
+    source_dir.mkdir(parents=True)
+    note_file = source_dir / "Appended.note"
+    note_file.write_bytes(b"note")
+
+    vault_notes_dir = tmp_path / "vault" / "notes"
+    vault_notes_dir.mkdir(parents=True)
+    md_file = vault_notes_dir / "Appended.md"
+    md_file.write_text(
+        "## Page 1\n\nExisting page 1\n\n---\n\n"
+        "## Page 2\n\nExisting page 2\n\n---\n\n"
+        "## Original PDF\n\n![[Attachments/Test/Appended/Appended.pdf]]\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(module, "SOURCE_DIR", source_dir)
+    monkeypatch.setattr(module, "OBSIDIAN_NOTE_DIR", vault_notes_dir)
+    monkeypatch.setattr(module, "PDF_DIR", tmp_path / "vault" / "attachments")
+    monkeypatch.setattr(module, "ACTIVE_ATTACHMENT_FOLDER", "Attachments/Test")
+    monkeypatch.setattr(module, "render_pdf_page_hashes", lambda _pdf: ["h1", "h2", "h3-new"])
+
+    ocr_calls: list[list[int]] = []
+
+    def fake_convert(_note_file: Path, pdf_file: Path) -> None:
+        pdf_file.parent.mkdir(parents=True, exist_ok=True)
+        pdf_file.write_bytes(b"pdf")
+
+    def fake_selected_ocr(_pdf_file: Path, page_numbers: list[int]) -> dict[int, str]:
+        ocr_calls.append(page_numbers)
+        return {page_number: f"Freshly OCRed page {page_number}" for page_number in page_numbers}
+
+    monkeypatch.setattr(module, "convert_note_to_pdf", fake_convert)
+    monkeypatch.setattr(module, "ollama_ocr_selected_pdf_pages", fake_selected_ocr)
+    monkeypatch.setattr(module, "unload_local_ollama_model_after_note", lambda: None)
+
+    module.process_note(note_file)
+
+    assert ocr_calls == [[3]]
+    updated_md = md_file.read_text(encoding="utf-8")
+    assert "Existing page 1" in updated_md
+    assert "Existing page 2" in updated_md
+    assert "## Page 3\n\nFreshly OCRed page 3" in updated_md
