@@ -69,6 +69,10 @@ DEFAULT_CONFIG = {
     "local_ollama_url": "http://localhost:11434/api/generate",
     "local_ollama_model": "richardyoung/olmocr2:7b-q8",
     "local_ollama_num_ctx": 8192,
+    "local_ollama_num_predict": 2048,
+    "local_ollama_repeat_penalty": 1.08,
+    "local_ollama_max_image_edge_px": 1680,
+    "local_ollama_page_timeout_seconds": 180,
     "local_ollama_unload_after_note": True,
     "hybrid_marker_command": "marker_single",
     "hybrid_marker_disable_multiprocessing": True,
@@ -304,6 +308,18 @@ LOCAL_OLLAMA_MODEL = (
     or "richardyoung/olmocr2:7b-q8"
 )
 LOCAL_OLLAMA_NUM_CTX = positive_int_or_default(config.get("local_ollama_num_ctx"), 8192)
+LOCAL_OLLAMA_NUM_PREDICT = positive_int_or_default(config.get("local_ollama_num_predict"), 2048)
+try:
+    _parsed_repeat_penalty = float(config.get("local_ollama_repeat_penalty", 1.08))
+    LOCAL_OLLAMA_REPEAT_PENALTY = _parsed_repeat_penalty if _parsed_repeat_penalty > 0 else 1.08
+except (TypeError, ValueError):
+    LOCAL_OLLAMA_REPEAT_PENALTY = 1.08
+LOCAL_OLLAMA_MAX_IMAGE_EDGE_PX = positive_int_or_default(
+    config.get("local_ollama_max_image_edge_px"), 1680
+)
+LOCAL_OLLAMA_PAGE_TIMEOUT_SECONDS = positive_int_or_default(
+    config.get("local_ollama_page_timeout_seconds"), 180
+)
 LOCAL_OLLAMA_UNLOAD_AFTER_NOTE = bool(config.get("local_ollama_unload_after_note", True))
 HYBRID_MARKER_COMMAND = (
     str(config.get("hybrid_marker_command", "marker_single")).strip() or "marker_single"
@@ -999,6 +1015,31 @@ def strip_thinking_blocks(text: str) -> str:
     return THINK_BLOCK_PATTERN.sub("", text).strip()
 
 
+def render_ollama_page_pixmap(
+    page,
+    dpi: int = 200,
+    max_long_edge_px: int | None = None,
+):
+    """
+    Render a PDF page for local Ollama vision models, capping the longest edge
+    to keep vision token counts bounded on 16 GB Macs while preserving legibility.
+    """
+    import fitz  # PyMuPDF
+
+    render_scale = dpi / 72.0
+    cap = LOCAL_OLLAMA_MAX_IMAGE_EDGE_PX if max_long_edge_px is None else int(max_long_edge_px)
+    rect = getattr(page, "rect", None)
+    if cap > 0 and rect is not None:
+        long_edge_pt = max(float(getattr(rect, "width", 0.0)), float(getattr(rect, "height", 0.0)))
+        if long_edge_pt > 0 and long_edge_pt * render_scale > cap:
+            render_scale = cap / long_edge_pt
+
+    return page.get_pixmap(
+        matrix=fitz.Matrix(render_scale, render_scale),
+        alpha=False,
+    )
+
+
 def unload_local_ollama_model_via_api(model_name: str | None = None) -> bool:
     target_model = (model_name or LOCAL_OLLAMA_MODEL).strip()
     if not target_model:
@@ -1022,9 +1063,16 @@ def unload_local_ollama_model_via_api(model_name: str | None = None) -> bool:
                 "keep_alive": 0,
             }
 
-        response = requests.post(endpoint, json=payload, timeout=30)
+        started = time.monotonic()
+        response = requests.post(
+            endpoint,
+            headers={"Connection": "close"},
+            json=payload,
+            timeout=(10, 30),
+        )
+        elapsed = time.monotonic() - started
         if response.ok:
-            log(f"Unloaded Ollama model via keep_alive=0: {target_model}")
+            log(f"Unloaded Ollama model via keep_alive=0 in {elapsed:.1f}s: {target_model}")
             return True
 
         detail = response.text.strip().replace("\n", " ")[:300]
@@ -1089,14 +1137,16 @@ def ollama_ocr_selected_pdf_pages(pdf_file: Path, page_numbers: list[int]) -> di
                     changed_count=len(selected_pages),
                 )
                 page_path = temporary_dir / f"page-{page_number:03d}.png"
-                pixmap = page.get_pixmap(
-                    matrix=fitz.Matrix(render_scale, render_scale),
-                    alpha=False,
-                )
+                pixmap = render_ollama_page_pixmap(page, dpi=200)
                 pixmap.save(page_path)
 
                 encoded_image = base64.b64encode(page_path.read_bytes()).decode("ascii")
                 use_qwen_chat = is_qwen3_vl_model(LOCAL_OLLAMA_MODEL)
+                ollama_options: dict[str, object] = {
+                    "num_ctx": LOCAL_OLLAMA_NUM_CTX,
+                    "num_predict": LOCAL_OLLAMA_NUM_PREDICT,
+                    "repeat_penalty": LOCAL_OLLAMA_REPEAT_PENALTY,
+                }
                 if use_qwen_chat:
                     request_url = local_ollama_chat_url(LOCAL_OLLAMA_URL)
                     payload = {
@@ -1110,7 +1160,7 @@ def ollama_ocr_selected_pdf_pages(pdf_file: Path, page_numbers: list[int]) -> di
                         ],
                         "stream": False,
                         "think": False,
-                        "options": {"num_ctx": LOCAL_OLLAMA_NUM_CTX},
+                        "options": ollama_options,
                     }
                 else:
                     request_url = LOCAL_OLLAMA_URL
@@ -1119,11 +1169,22 @@ def ollama_ocr_selected_pdf_pages(pdf_file: Path, page_numbers: list[int]) -> di
                         "prompt": resolve_local_ollama_prompt(LOCAL_OLLAMA_MODEL),
                         "stream": False,
                         "images": [encoded_image],
-                        "options": {"num_ctx": LOCAL_OLLAMA_NUM_CTX},
+                        "options": ollama_options,
                     }
 
+                page_started = time.monotonic()
                 try:
-                    response = requests.post(request_url, json=payload, timeout=600)
+                    response = requests.post(
+                        request_url,
+                        headers={"Connection": "close"},
+                        json=payload,
+                        timeout=(10, LOCAL_OLLAMA_PAGE_TIMEOUT_SECONDS),
+                    )
+                except requests.Timeout as exc:
+                    raise RuntimeError(
+                        f"Ollama timed out after {LOCAL_OLLAMA_PAGE_TIMEOUT_SECONDS}s "
+                        f"on page {page_number} (model='{LOCAL_OLLAMA_MODEL}')."
+                    ) from exc
                 except requests.ConnectionError as exc:
                     raise RuntimeError(
                         f"Could not connect to Ollama at {request_url}. "
@@ -1134,6 +1195,7 @@ def ollama_ocr_selected_pdf_pages(pdf_file: Path, page_numbers: list[int]) -> di
                     raise RuntimeError(
                         f"Ollama request failed for page {page_number}: {exc}"
                     ) from exc
+                page_elapsed = time.monotonic() - page_started
 
                 if not response.ok:
                     detail = response.text.strip()
@@ -1164,6 +1226,16 @@ def ollama_ocr_selected_pdf_pages(pdf_file: Path, page_numbers: list[int]) -> di
                     raise RuntimeError(
                         f"Ollama returned invalid JSON for page {page_number}: {response.text}"
                     ) from exc
+
+                prompt_eval_count = response_data.get("prompt_eval_count")
+                eval_count = response_data.get("eval_count")
+                done_reason = response_data.get("done_reason")
+                log(
+                    f"Ollama OCR page {page_number}/{len(document)} finished in {page_elapsed:.1f}s "
+                    f"(model={LOCAL_OLLAMA_MODEL}, prompt_eval_count={prompt_eval_count}, "
+                    f"eval_count={eval_count}, done_reason={done_reason}, "
+                    f"image={pixmap.width}x{pixmap.height})"
+                )
 
                 if use_qwen_chat:
                     message_obj = response_data.get("message")
@@ -2132,18 +2204,34 @@ def qwen_detect_page_visuals(page_image_bytes: bytes, page_number: int) -> list[
         "stream": False,
         "think": False,
         "format": "json",
-        "options": {"num_ctx": LOCAL_OLLAMA_NUM_CTX},
+        "options": {
+            "num_ctx": LOCAL_OLLAMA_NUM_CTX,
+            "num_predict": min(1024, LOCAL_OLLAMA_NUM_PREDICT),
+            "repeat_penalty": LOCAL_OLLAMA_REPEAT_PENALTY,
+        },
     }
 
+    started = time.monotonic()
     try:
-        response = requests.post(request_url, json=payload, timeout=300)
+        response = requests.post(
+            request_url,
+            headers={"Connection": "close"},
+            json=payload,
+            timeout=(10, LOCAL_OLLAMA_PAGE_TIMEOUT_SECONDS),
+        )
+        elapsed = time.monotonic() - started
         if not response.ok:
             log(
-                f"Qwen3-VL visual fallback HTTP {response.status_code} on page {page_number}; "
-                "continuing with text only."
+                f"Qwen3-VL visual fallback HTTP {response.status_code} on page {page_number} "
+                f"after {elapsed:.1f}s; continuing with text only."
             )
             return []
         response_data = response.json()
+        log(
+            f"Qwen3-VL visual fallback page {page_number} finished in {elapsed:.1f}s "
+            f"(prompt_eval_count={response_data.get('prompt_eval_count')}, "
+            f"eval_count={response_data.get('eval_count')})"
+        )
     except Exception as exc:
         log(f"Qwen3-VL visual fallback request failed on page {page_number}: {exc}")
         return []
@@ -2227,10 +2315,7 @@ def extract_qwen_fallback_visuals_for_pages(
                 continue
 
             page = document[page_number - 1]
-            pixmap = page.get_pixmap(
-                matrix=fitz.Matrix(render_scale, render_scale),
-                alpha=PAGE_HASH_ALPHA,
-            )
+            pixmap = render_ollama_page_pixmap(page, dpi=PAGE_HASH_DPI)
             page_image_bytes = pixmap.tobytes("png")
             detected = qwen_detect_page_visuals(page_image_bytes, page_number)
             if not detected:
@@ -2349,7 +2434,9 @@ def hybrid_marker_olmocr_pdf(
                         changed_index=changed_index,
                         changed_count=len(marker_pages_to_process),
                     )
+                    marker_started = time.monotonic()
                     run_hybrid_marker_for_page(pdf_file, marker_dir, page_number)
+                    marker_elapsed = time.monotonic() - marker_started
                     remove_stale_page_visual_files(
                         extracted_visual_dir,
                         page_number,
@@ -2359,6 +2446,10 @@ def hybrid_marker_olmocr_pdf(
                         marker_dir,
                         extracted_visual_dir,
                         assigned_page_override=page_number,
+                    )
+                    log(
+                        f"Hybrid Marker page {page_number} finished in {marker_elapsed:.1f}s "
+                        f"({len(visuals)} visual(s))"
                     )
                     if not visuals:
                         pages_without_marker_visuals.append(page_number)
@@ -2417,7 +2508,9 @@ def hybrid_marker_olmocr_pdf(
         with tempfile.TemporaryDirectory(prefix="supsidian-hybrid-marker-") as temporary_directory:
             marker_dir = Path(temporary_directory) / "marker_output"
             log("Hybrid Marker + Ollama: running Marker on the full current PDF")
+            marker_started = time.monotonic()
             run_hybrid_marker(pdf_file, marker_dir)
+            marker_elapsed = time.monotonic() - marker_started
 
             marker_visuals = copy_marker_visuals(marker_dir, extracted_visual_dir)
             placed_count = apply_marker_visuals_to_pages(
@@ -2427,7 +2520,7 @@ def hybrid_marker_olmocr_pdf(
             )
 
         log(
-            f"Hybrid Marker + Ollama OCR finished: {pdf_file} "
+            f"Hybrid Marker + Ollama OCR finished in {marker_elapsed:.1f}s: {pdf_file} "
             f"({len(marker_visuals)} visual(s), {placed_count} placed by Marker order)"
         )
     except Exception as exc:

@@ -76,6 +76,7 @@ def test_qwen3_vl_uses_chat_endpoint_with_think_false_and_strips_think_blocks(
     load_sync_module,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     module = load_sync_module(
         {
@@ -87,17 +88,20 @@ def test_qwen3_vl_uses_chat_endpoint_with_think_false_and_strips_think_blocks(
     pdf_file = tmp_path / "note.pdf"
     write_test_pdf(pdf_file, ["Hallo Welt"])
 
-    captured: list[tuple[str, dict]] = []
+    captured: list[tuple[str, dict, dict | None, object]] = []
 
-    def fake_post(url: str, json: dict, timeout: int):
-        captured.append((url, json))
+    def fake_post(url: str, json: dict, timeout, headers: dict | None = None):
+        captured.append((url, json, headers, timeout))
         return FakeHTTPResponse(
             200,
             {
                 "message": {
                     "role": "assistant",
                     "content": "<think>internal reasoning</think>\n\n# Titel\n\nHallo Welt",
-                }
+                },
+                "prompt_eval_count": 1420,
+                "eval_count": 87,
+                "done_reason": "stop",
             },
         )
 
@@ -105,14 +109,24 @@ def test_qwen3_vl_uses_chat_endpoint_with_think_false_and_strips_think_blocks(
     result = module.ollama_ocr_selected_pdf_pages(pdf_file, [1])
 
     assert len(captured) == 1
-    url, payload = captured[0]
+    url, payload, headers, timeout = captured[0]
     assert url == "http://localhost:11434/api/chat"
+    assert headers == {"Connection": "close"}
+    assert timeout == (10, 180)
     assert payload["model"] == "qwen3-vl:8b"
     assert payload["think"] is False
     assert payload["stream"] is False
+    assert payload["options"]["num_ctx"] == 8192
+    assert payload["options"]["num_predict"] == 2048
+    assert payload["options"]["repeat_penalty"] == 1.08
     assert payload["messages"][0]["content"] == module.QWEN3_VL_OCR_PROMPT
     assert len(payload["messages"][0]["images"]) == 1
     assert result == {1: "# Titel\n\nHallo Welt"}
+
+    output = capsys.readouterr().out
+    assert "prompt_eval_count=1420" in output
+    assert "eval_count=87" in output
+    assert "finished in " in output
 
 
 def test_switching_model_from_olmocr2_to_qwen3_vl_invalidates_cache_even_with_existing_md(
@@ -206,7 +220,7 @@ def test_hybrid_mode_unloads_ollama_via_keep_alive_zero_before_running_marker(
 
     events: list[str] = []
 
-    def fake_post(url: str, json: dict, timeout: int):
+    def fake_post(url: str, json: dict, timeout, headers: dict | None = None):
         if json.get("keep_alive") == 0:
             events.append(f"unload:{url}:{json['model']}")
             return FakeHTTPResponse(200, {"done": True})
@@ -315,13 +329,14 @@ def test_hybrid_mode_qwen3_vl_visual_fallback_crops_and_places_sketch_when_marke
 
     call_log: list[str] = []
 
-    def fake_post(url: str, json: dict, timeout: int):
+    def fake_post(url: str, json: dict, timeout, headers: dict | None = None):
         if json.get("keep_alive") == 0:
             call_log.append("unload")
             return FakeHTTPResponse(200, {"done": True})
         if json.get("format") == "json":
             call_log.append("qwen_fallback")
             assert json["think"] is False
+            assert json["options"]["num_predict"] == 1024
             return FakeHTTPResponse(
                 200,
                 {
@@ -380,7 +395,7 @@ def test_qwen_visual_fallback_handles_invalid_json_gracefully_without_crashing(
     pdf_file = tmp_path / "note.pdf"
     write_test_pdf(pdf_file, ["Plain text"], draw_sketch_on_page_1=True)
 
-    def fake_post(url: str, json: dict, timeout: int):
+    def fake_post(url: str, json: dict, timeout, headers: dict | None = None):
         return FakeHTTPResponse(
             200,
             {"message": {"content": "NOT VALID JSON {{{ broken"}},
@@ -399,3 +414,52 @@ def test_qwen_visual_fallback_handles_invalid_json_gracefully_without_crashing(
     assert saved == 0
     assert placed == 0
     assert pages == ["Plain text only"]
+
+
+def test_render_ollama_page_pixmap_caps_long_edge_to_limit_vision_tokens(
+    load_sync_module,
+    tmp_path: Path,
+) -> None:
+    fitz = pytest.importorskip("fitz")
+    module = load_sync_module({"local_ollama_max_image_edge_px": 1680})
+
+    pdf_file = tmp_path / "large.pdf"
+    document = fitz.open()
+    try:
+        # 900x1200 pt at 200 DPI would be 2500x3333 px without capping
+        page = document.new_page(width=900, height=1200)
+        page.insert_text((50, 80), "High-res Supernote page", fontsize=18)
+        document.save(pdf_file)
+    finally:
+        document.close()
+
+    doc = fitz.open(pdf_file)
+    try:
+        pixmap = module.render_ollama_page_pixmap(doc[0], dpi=200)
+        assert max(pixmap.width, pixmap.height) <= 1680
+        assert max(pixmap.width, pixmap.height) >= 1670
+    finally:
+        doc.close()
+
+
+def test_ollama_ocr_raises_clear_timeout_error(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module(
+        {
+            "ocr_provider": "local_ollama",
+            "local_ollama_model": "qwen3-vl:8b",
+            "local_ollama_page_timeout_seconds": 180,
+        }
+    )
+    pdf_file = tmp_path / "slow.pdf"
+    write_test_pdf(pdf_file, ["Slow page"])
+
+    def fake_timeout(*_args, **_kwargs):
+        raise module.requests.Timeout("read timed out")
+
+    monkeypatch.setattr(module.requests, "post", fake_timeout)
+    with pytest.raises(RuntimeError, match="Ollama timed out after 180s on page 1"):
+        module.ollama_ocr_selected_pdf_pages(pdf_file, [1])
