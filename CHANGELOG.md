@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.13.1
+
+- Organized the **Synced Supernote Folders** settings section into horizontal folder tabs with an inline **+ New Folder** tab button so each synced folder gets its own tab.
+
 ## v0.13.0
 
 - Added Cloud VLM OCR providers (`gemini`, `claude`, `openai`) with bounding-box sketch/diagram detection and local Pillow cropping + whitespace trimming.

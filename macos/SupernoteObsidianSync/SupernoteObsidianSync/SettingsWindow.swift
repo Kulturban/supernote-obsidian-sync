@@ -537,6 +537,7 @@ final class SettingsViewModel: ObservableObject {
     @Published var hybridMarkerCommand = "marker_single"
     @Published var mistralApiKey = ""
     @Published var notebooks: [NotebookConfig] = []
+    @Published var selectedNotebookID: UUID? = nil
     @Published var statusMessage = ""
     @Published var localOCRStatusMessage = ""
     @Published var isRunningLocalOCRCommand = false
@@ -698,6 +699,12 @@ final class SettingsViewModel: ObservableObject {
         localOllamaUnloadAfterNote = config.local_ollama_unload_after_note
         hybridMarkerCommand = config.hybrid_marker_command.isEmpty ? "marker_single" : config.hybrid_marker_command
         notebooks = config.notebooks
+        if let currentID = selectedNotebookID,
+           notebooks.contains(where: { $0.id == currentID }) {
+            selectedNotebookID = currentID
+        } else {
+            selectedNotebookID = notebooks.first?.id
+        }
     }
 
     // MARK: Validation
@@ -1350,12 +1357,30 @@ final class SettingsViewModel: ObservableObject {
             )
 
             self.notebooks.append(notebook)
+            self.selectedNotebookID = notebook.id
             self.statusMessage = "Added folder: \(safeName)"
         }
     }
 
+    var selectedNotebook: NotebookConfig? {
+        if let id = selectedNotebookID,
+           let match = notebooks.first(where: { $0.id == id }) {
+            return match
+        }
+        return notebooks.first
+    }
+
     func removeNotebook(_ notebook: NotebookConfig) {
+        let removedIndex = notebooks.firstIndex(where: { $0.id == notebook.id })
         notebooks.removeAll { $0.id == notebook.id }
+        if selectedNotebookID == notebook.id {
+            if let idx = removedIndex, !notebooks.isEmpty {
+                let nextIndex = min(idx, notebooks.count - 1)
+                selectedNotebookID = notebooks[nextIndex].id
+            } else {
+                selectedNotebookID = notebooks.first?.id
+            }
+        }
         statusMessage = "Removed folder."
     }
 
@@ -2415,17 +2440,9 @@ struct SettingsView: View {
                 title: "Add a Supernote folder",
                 description: "Choose which Supernote folder should sync, and where it should appear in Obsidian."
             ) {
-                if model.notebooks.isEmpty {
-                    EmptyStateView(
-                        icon: "folder.badge.plus",
-                        title: "No folders configured",
-                        message: "Add at least one Supernote folder to finish setup."
-                    )
-                }
-
-                ForEach(model.notebooks) { notebook in
-                    notebookCard(notebook)
-                }
+                tabbedNotebooksSection(
+                    emptyMessage: "Add at least one Supernote folder to finish setup."
+                )
 
                 Text("Suggested Supernote Partner folder:")
                     .font(.footnote)
@@ -2436,10 +2453,6 @@ struct SettingsView: View {
                     .foregroundColor(.secondary)
                     .lineLimit(2)
                     .truncationMode(.middle)
-
-                Button("+ Add Supernote Folder") {
-                    model.addNotebook()
-                }
 
                 Text("After adding at least one folder, setup is complete.")
                     .font(.footnote)
@@ -2490,22 +2503,100 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 18) {
             SettingsCard(
                 title: "Synced Supernote Folders",
-                description: "Add each Supernote folder you want to sync. For every source folder, choose where Markdown files and attachments should go inside your Obsidian vault."
+                description: "Each tab represents one synced Supernote folder. Click + to add a new folder tab."
             ) {
-                if model.notebooks.isEmpty {
-                    EmptyStateView(
-                        icon: "folder.badge.plus",
-                        title: "No folders configured",
-                        message: "Add a Supernote folder to start syncing it to Obsidian."
-                    )
-                }
+                tabbedNotebooksSection(
+                    emptyMessage: "Add a Supernote folder to start syncing it to Obsidian."
+                )
+            }
+        }
+    }
 
-                ForEach(model.notebooks) { notebook in
-                    notebookCard(notebook)
-                }
+    @ViewBuilder
+    private func tabbedNotebooksSection(emptyMessage: String) -> some View {
+        if model.notebooks.isEmpty {
+            VStack(alignment: .leading, spacing: 12) {
+                EmptyStateView(
+                    icon: "folder.badge.plus",
+                    title: "No folders configured",
+                    message: emptyMessage
+                )
 
                 Button("+ Add Supernote Folder") {
                     model.addNotebook()
+                }
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 12) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(model.notebooks) { notebook in
+                            let isSelected = model.selectedNotebook?.id == notebook.id
+                            let tabTitle = notebook.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                ? "Unnamed Folder"
+                                : notebook.name
+
+                            Button {
+                                model.selectedNotebookID = notebook.id
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: isSelected ? "folder.fill" : "folder")
+                                        .font(.caption)
+                                    Text(tabTitle)
+                                        .font(.subheadline)
+                                        .fontWeight(isSelected ? .semibold : .regular)
+                                        .lineLimit(1)
+                                }
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 7)
+                                .foregroundColor(isSelected ? .accentColor : .primary)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .fill(
+                                            isSelected
+                                                ? Color.accentColor.opacity(0.14)
+                                                : Color.secondary.opacity(0.08)
+                                        )
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .stroke(
+                                            isSelected ? Color.accentColor.opacity(0.45) : Color.clear,
+                                            lineWidth: 1
+                                        )
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        }
+
+                        Button {
+                            model.addNotebook()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "plus")
+                                    .font(.caption.weight(.semibold))
+                                Text("New Folder")
+                                    .font(.subheadline)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 7)
+                            .foregroundColor(.secondary)
+                            .background(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .strokeBorder(
+                                        Color.secondary.opacity(0.35),
+                                        style: StrokeStyle(lineWidth: 1, dash: [4, 3])
+                                    )
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .help("Add a new Supernote folder tab")
+                    }
+                    .padding(.vertical, 2)
+                }
+
+                if let activeNotebook = model.selectedNotebook {
+                    notebookCard(activeNotebook)
                 }
             }
         }
