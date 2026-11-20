@@ -793,8 +793,10 @@ final class SyncProgressTracker {
             noteFraction = (isHybrid ? 0.7 : 0.9) * pageRatio
         case "marker":
             noteFraction = 0.7 + 0.25 * pageRatio
+        case "visual_fallback":
+            noteFraction = 0.95 + 0.04 * pageRatio
         case "writing_markdown":
-            noteFraction = 0.95
+            noteFraction = 0.99
         case "done":
             noteFraction = 1.0
         default:
@@ -913,6 +915,24 @@ final class SyncProgressTracker {
                 stageDescription = "OCR in progress… (Marker layout & visuals — page \(page))"
             } else {
                 stageDescription = "OCR in progress… (Marker layout & visuals)"
+            }
+
+        case "visual_fallback":
+            if let page = event.page, let totalPages = event.total_pages {
+                if let changedIndex = event.changed_index,
+                   let changedCount = event.changed_count,
+                   changedCount < totalPages {
+                    let checkLabel = changedCount == 1
+                        ? "1 page"
+                        : "\(changedIndex) of \(changedCount)"
+                    stageDescription = "Checking visuals… (page \(page) of \(totalPages), \(checkLabel))"
+                } else {
+                    stageDescription = "Checking visuals… (page \(page) of \(totalPages))"
+                }
+            } else if let page = event.page {
+                stageDescription = "Checking visuals… (page \(page))"
+            } else {
+                stageDescription = "Checking visuals…"
             }
 
         case "writing_markdown":

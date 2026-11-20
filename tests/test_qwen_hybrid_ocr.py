@@ -336,7 +336,7 @@ def test_hybrid_mode_qwen3_vl_visual_fallback_crops_and_places_sketch_when_marke
         if json.get("format") == "json":
             call_log.append("qwen_fallback")
             assert json["think"] is False
-            assert json["options"]["num_predict"] == 1024
+            assert json["options"]["num_predict"] == 384
             return FakeHTTPResponse(
                 200,
                 {
@@ -463,3 +463,94 @@ def test_ollama_ocr_raises_clear_timeout_error(
     monkeypatch.setattr(module.requests, "post", fake_timeout)
     with pytest.raises(RuntimeError, match="Ollama timed out after 180s on page 1"):
         module.ollama_ocr_selected_pdf_pages(pdf_file, [1])
+
+
+def test_ollama_empty_content_after_thinking_tokens_aborts_without_overwriting_md_or_cache(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module(
+        {
+            "ocr_provider": "local_ollama",
+            "local_ollama_model": "qwen3-vl:8b",
+            "local_ollama_unload_after_note": False,
+        }
+    )
+    monkeypatch.setattr(module, "OBSIDIAN_NOTE_DIR", tmp_path / "vault" / "notes")
+    monkeypatch.setattr(module, "PDF_DIR", tmp_path / "vault" / "attachments")
+    monkeypatch.setattr(module, "ACTIVE_ATTACHMENT_FOLDER", "Attachments/Test")
+
+    note_file = tmp_path / "source" / "Important.note"
+    note_file.parent.mkdir(parents=True)
+    note_file.write_bytes(b"note")
+
+    existing_md = module.OBSIDIAN_NOTE_DIR / "Important.md"
+    existing_md.parent.mkdir(parents=True, exist_ok=True)
+    existing_md.write_text("## Page 1\n\nValuable existing transcription\n", encoding="utf-8")
+
+    def fake_convert(_note: Path, pdf_path: Path) -> None:
+        write_test_pdf(pdf_path, ["Page 1"])
+
+    def fake_post_thinking_only(url: str, json: dict, timeout, headers: dict | None = None):
+        return FakeHTTPResponse(
+            200,
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "thinking": "Long chain of thought that hit the token limit...",
+                },
+                "prompt_eval_count": 1200,
+                "eval_count": 2048,
+                "done_reason": "length",
+            },
+        )
+
+    monkeypatch.setattr(module, "convert_note_to_pdf", fake_convert)
+    monkeypatch.setattr(module.requests, "post", fake_post_thinking_only)
+
+    with pytest.raises(RuntimeError, match="qwen3-vl:8b-instruct"):
+        module.process_note(note_file)
+
+    # Existing Obsidian note must remain untouched and no empty page cache written
+    assert existing_md.read_text(encoding="utf-8") == "## Page 1\n\nValuable existing transcription\n"
+    assert module.load_page_cache(note_file) is None
+
+
+def test_visual_fallback_emits_progress_events_per_page(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = load_sync_module(
+        {
+            "ocr_provider": "hybrid_marker_olmocr",
+            "local_ollama_model": "qwen3-vl:8b-instruct",
+            "hybrid_qwen_visual_fallback": True,
+        }
+    )
+    pdf_file = tmp_path / "two_pages.pdf"
+    write_test_pdf(pdf_file, ["Page 1", "Page 2"])
+
+    def fake_post(url: str, json: dict, timeout, headers: dict | None = None):
+        assert json["format"] == "json"
+        assert json["options"]["num_predict"] == 384
+        return FakeHTTPResponse(200, {"message": {"content": '{"visuals": []}'}})
+
+    monkeypatch.setattr(module.requests, "post", fake_post)
+    pages = ["Page 1 text", "Page 2 text"]
+    module.extract_qwen_fallback_visuals_for_pages(
+        pdf_file,
+        [1, 2],
+        pages,
+        tmp_path / "extracted_visuals",
+        "Attachments/TwoPages",
+    )
+
+    output = capsys.readouterr().out
+    assert '"stage": "visual_fallback"' in output
+    assert '"changed_index": 1' in output
+    assert '"changed_index": 2' in output
+    assert '"changed_count": 2' in output

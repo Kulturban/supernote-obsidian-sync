@@ -984,6 +984,11 @@ def is_qwen3_vl_model(model_name: str | None = None) -> bool:
     return "qwen3-vl" in candidate
 
 
+def is_qwen3_vl_thinking_model(model_name: str | None = None) -> bool:
+    candidate = (model_name if model_name is not None else LOCAL_OLLAMA_MODEL).strip().lower()
+    return "qwen3-vl" in candidate and "-instruct" not in candidate
+
+
 def should_run_qwen_visual_fallback(model_name: str | None = None) -> bool:
     return bool(HYBRID_QWEN_VISUAL_FALLBACK) and is_qwen3_vl_model(model_name)
 
@@ -1237,8 +1242,8 @@ def ollama_ocr_selected_pdf_pages(pdf_file: Path, page_numbers: list[int]) -> di
                     f"image={pixmap.width}x{pixmap.height})"
                 )
 
+                message_obj = response_data.get("message") if use_qwen_chat else None
                 if use_qwen_chat:
-                    message_obj = response_data.get("message")
                     page_markdown = (
                         message_obj.get("content")
                         if isinstance(message_obj, dict)
@@ -1253,7 +1258,29 @@ def ollama_ocr_selected_pdf_pages(pdf_file: Path, page_numbers: list[int]) -> di
                         f"{json.dumps(response_data)}"
                     )
 
-                page_transcriptions[page_number] = strip_thinking_blocks(page_markdown)
+                cleaned_markdown = strip_thinking_blocks(page_markdown)
+                if not cleaned_markdown:
+                    thinking_text = (
+                        message_obj.get("thinking")
+                        if isinstance(message_obj, dict)
+                        else response_data.get("thinking")
+                    )
+                    has_thinking = isinstance(thinking_text, str) and bool(thinking_text.strip())
+                    eval_count_int = eval_count if isinstance(eval_count, int) else 0
+                    hit_length = str(done_reason or "").strip().lower() == "length"
+                    if eval_count_int > 0 or has_thinking or hit_length:
+                        suggestion = (
+                            " Use 'qwen3-vl:8b-instruct' instead of 'qwen3-vl:8b' to avoid thinking-only output."
+                            if is_qwen3_vl_thinking_model(LOCAL_OLLAMA_MODEL)
+                            else " Use a non-thinking instruct model or increase local_ollama_num_predict."
+                        )
+                        raise RuntimeError(
+                            f"Ollama returned empty OCR content on page {page_number} after generating "
+                            f"{eval_count_int} token(s) (done_reason={done_reason}, model='{LOCAL_OLLAMA_MODEL}'). "
+                            f"The model spent its output tokens in thinking mode.{suggestion}"
+                        )
+
+                page_transcriptions[page_number] = cleaned_markdown
     finally:
         document.close()
 
@@ -2206,7 +2233,7 @@ def qwen_detect_page_visuals(page_image_bytes: bytes, page_number: int) -> list[
         "format": "json",
         "options": {
             "num_ctx": LOCAL_OLLAMA_NUM_CTX,
-            "num_predict": min(1024, LOCAL_OLLAMA_NUM_PREDICT),
+            "num_predict": min(384, LOCAL_OLLAMA_NUM_PREDICT),
             "repeat_penalty": LOCAL_OLLAMA_REPEAT_PENALTY,
         },
     }
@@ -2310,10 +2337,20 @@ def extract_qwen_fallback_visuals_for_pages(
 
     try:
         extracted_visual_dir.mkdir(parents=True, exist_ok=True)
-        for page_number in sorted(set(page_numbers)):
-            if not (1 <= page_number <= len(document) and page_number <= len(page_transcriptions)):
-                continue
-
+        target_pages = [
+            page_number
+            for page_number in sorted(set(page_numbers))
+            if 1 <= page_number <= len(document) and page_number <= len(page_transcriptions)
+        ]
+        for fallback_index, page_number in enumerate(target_pages, start=1):
+            progress_event(
+                "visual_fallback",
+                provider="hybrid_marker_olmocr",
+                page=page_number,
+                total_pages=len(document),
+                changed_index=fallback_index,
+                changed_count=len(target_pages),
+            )
             page = document[page_number - 1]
             pixmap = render_ollama_page_pixmap(page, dpi=PAGE_HASH_DPI)
             page_image_bytes = pixmap.tobytes("png")
@@ -4432,6 +4469,13 @@ def diagnose() -> None:
             model_ok,
             model_detail,
         )
+        if is_qwen3_vl_thinking_model(LOCAL_OLLAMA_MODEL):
+            add_check(
+                "Ollama model uses non-thinking -instruct variant",
+                False,
+                f"'{LOCAL_OLLAMA_MODEL}' can burn all output tokens in thinking mode; "
+                "use 'qwen3-vl:8b-instruct' instead",
+            )
         if OCR_PROVIDER == "hybrid_marker_olmocr":
             marker_command_path = shutil.which(HYBRID_MARKER_COMMAND)
             add_check(

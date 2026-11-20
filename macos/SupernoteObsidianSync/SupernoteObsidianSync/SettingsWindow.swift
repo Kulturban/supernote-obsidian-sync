@@ -1741,6 +1741,10 @@ final class SettingsViewModel: ObservableObject {
             }
         }
 
+        if isQwen3VLThinkingModelWarning {
+            lines.append("⚠️ '\(model)' is a thinking variant that can burn all output tokens and return empty OCR pages. Use 'qwen3-vl:8b-instruct' instead.")
+        }
+
         localOCRStatusMessage = lines.joined(separator: "\n")
     }
 
@@ -1915,6 +1919,11 @@ final class SettingsViewModel: ObservableObject {
     var localOllamaModelName: String {
         let trimmed = localOllamaModel.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? "richardyoung/olmocr2:7b-q8" : trimmed
+    }
+
+    var isQwen3VLThinkingModelWarning: Bool {
+        let lower = localOllamaModelName.lowercased()
+        return lower.contains("qwen3-vl") && !lower.contains("-instruct")
     }
 
     private var markerProjectDirectory: String {
@@ -2750,8 +2759,8 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
 
-                Button("qwen3-vl:8b (Recommended — 16 GB)") {
-                    model.localOllamaModel = "qwen3-vl:8b"
+                Button("qwen3-vl:8b-instruct (Recommended — 16 GB)") {
+                    model.localOllamaModel = "qwen3-vl:8b-instruct"
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
@@ -2761,6 +2770,25 @@ struct SettingsView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+            }
+
+            if model.isQwen3VLThinkingModelWarning {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("⚠️ '\(model.localOllamaModelName)' is a thinking variant that can spend all output tokens in thinking mode and return empty pages. Use 'qwen3-vl:8b-instruct' instead.")
+                        .font(.footnote)
+                        .foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Button("Switch to qwen3-vl:8b-instruct") {
+                        model.localOllamaModel = "qwen3-vl:8b-instruct"
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.orange.opacity(0.08))
+                .cornerRadius(8)
             }
         }
     }
