@@ -77,6 +77,23 @@ def test_provider_dispatch_rejects_unknown_provider(load_sync_module, monkeypatc
         module.ocr_pdf(Path("note.pdf"), Path("images"), "Attachments/Test")
 
 
+def test_progress_event_emits_machine_readable_json(load_sync_module, capsys: pytest.CaptureFixture[str]) -> None:
+    module = load_sync_module()
+
+    event = module.progress_event("ocr", provider="local_ollama", page=2, total_pages=5)
+
+    captured = capsys.readouterr().out.strip()
+    assert event == {
+        "stage": "ocr",
+        "provider": "local_ollama",
+        "page": 2,
+        "total_pages": 5,
+    }
+    assert captured.startswith("SUSPIDIAN_PROGRESS:")
+    assert '"stage": "ocr"' in captured
+    assert '"page": 2' in captured
+
+
 def test_process_note_non_local_provider_uses_existing_dispatcher(
     load_sync_module,
     monkeypatch: pytest.MonkeyPatch,
@@ -634,7 +651,68 @@ def test_marker_order_ambiguous_anchor_uses_page_local_fallback(load_sync_module
 
     assert placed is False
     assert fallback.count(embed) == 1
-    assert "### Extracted visuals" in fallback
+    assert "Extracted visuals" not in fallback
+    assert fallback.rstrip().endswith(embed)
+
+
+def test_visual_fallback_is_silent_and_filters_generated_descriptions(load_sync_module) -> None:
+    module = load_sync_module()
+    page_text = "\n".join(
+        [
+            "Real note text",
+            "This image shows a diagram of the process.",
+            "[drawing visible] simple sketch",
+            "More note text",
+        ]
+    )
+    embed = "![[Attachments/Test/extracted_visuals/page-001-visual-001.jpeg]]"
+
+    pages = [page_text]
+    placed = module.apply_marker_visuals_to_pages(
+        pages,
+        [
+            {
+                "copied_filename": "page-001-visual-001.jpeg",
+                "assigned_page": 1,
+                "marker_text_before": None,
+                "marker_text_after": None,
+            }
+        ],
+        "Attachments/Test",
+    )
+
+    assert placed == 0
+    assert embed in pages[0]
+    assert "Extracted visuals" not in pages[0]
+    assert "This image shows" not in pages[0]
+    assert "[drawing visible]" not in pages[0]
+    assert "Real note text" in pages[0]
+    assert "More note text" in pages[0]
+
+
+def test_task_conversion_does_not_convert_generated_visual_or_markdown_lines(load_sync_module) -> None:
+    module = load_sync_module()
+    text = "\n".join(
+        [
+            "## Extracted visuals",
+            "# Extracted visuals",
+            "### Some heading",
+            "![[Attachments/Test/extracted_visuals/page-001-visual-001.jpeg]]",
+            "This image shows a diagram.",
+            "# Buy milk",
+            "#call mum",
+        ]
+    )
+
+    converted = module.convert_hash_lines_to_tasks(text)
+
+    assert "Extracted visuals" not in converted
+    assert "### Some heading" in converted
+    assert "- [ ] #task ### Some heading" not in converted
+    assert "![[Attachments/Test/extracted_visuals/page-001-visual-001.jpeg]]" in converted
+    assert "This image shows" not in converted
+    assert "- [ ] #task Buy milk" in converted
+    assert "- [ ] #task call mum" in converted
 
 
 def test_forgiving_html_table_conversion_pads_irregular_rows(load_sync_module) -> None:

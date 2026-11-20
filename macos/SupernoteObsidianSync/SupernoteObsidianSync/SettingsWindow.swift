@@ -75,6 +75,9 @@ struct SyncConfig: Codable {
     var task_tag: String
     var custom_ocr_instruction: String?
     var open_requires_obsidian_running: Bool
+    var open_supernote_partner_before_sync: Bool
+    var supernote_partner_app: String
+    var supernote_partner_sync_delay_seconds: Int
     var ocr_provider: String
     var local_ollama_url: String
     var local_ollama_model: String
@@ -92,6 +95,9 @@ struct SyncConfig: Codable {
         task_tag: "#task",
         custom_ocr_instruction: "",
         open_requires_obsidian_running: true,
+        open_supernote_partner_before_sync: false,
+        supernote_partner_app: "Supernote Partner",
+        supernote_partner_sync_delay_seconds: 15,
         ocr_provider: OCRProvider.localOllama.rawValue,
         local_ollama_url: "http://localhost:11434/api/generate",
         local_ollama_model: "richardyoung/olmocr2:7b-q8",
@@ -110,6 +116,9 @@ struct SyncConfig: Codable {
         case task_tag
         case custom_ocr_instruction
         case open_requires_obsidian_running
+        case open_supernote_partner_before_sync
+        case supernote_partner_app
+        case supernote_partner_sync_delay_seconds
         case ocr_provider
         case local_ollama_url
         case local_ollama_model
@@ -128,6 +137,9 @@ struct SyncConfig: Codable {
         task_tag: String,
         custom_ocr_instruction: String?,
         open_requires_obsidian_running: Bool,
+        open_supernote_partner_before_sync: Bool,
+        supernote_partner_app: String,
+        supernote_partner_sync_delay_seconds: Int,
         ocr_provider: String,
         local_ollama_url: String,
         local_ollama_model: String,
@@ -144,6 +156,9 @@ struct SyncConfig: Codable {
         self.task_tag = task_tag
         self.custom_ocr_instruction = custom_ocr_instruction
         self.open_requires_obsidian_running = open_requires_obsidian_running
+        self.open_supernote_partner_before_sync = open_supernote_partner_before_sync
+        self.supernote_partner_app = supernote_partner_app
+        self.supernote_partner_sync_delay_seconds = supernote_partner_sync_delay_seconds
         self.ocr_provider = ocr_provider
         self.local_ollama_url = local_ollama_url
         self.local_ollama_model = local_ollama_model
@@ -164,6 +179,9 @@ struct SyncConfig: Codable {
         self.task_tag = try container.decodeIfPresent(String.self, forKey: .task_tag) ?? "#task"
         self.custom_ocr_instruction = try container.decodeIfPresent(String.self, forKey: .custom_ocr_instruction)
         self.open_requires_obsidian_running = try container.decodeIfPresent(Bool.self, forKey: .open_requires_obsidian_running) ?? true
+        self.open_supernote_partner_before_sync = try container.decodeIfPresent(Bool.self, forKey: .open_supernote_partner_before_sync) ?? false
+        self.supernote_partner_app = try container.decodeIfPresent(String.self, forKey: .supernote_partner_app) ?? "Supernote Partner"
+        self.supernote_partner_sync_delay_seconds = try container.decodeIfPresent(Int.self, forKey: .supernote_partner_sync_delay_seconds) ?? 15
         self.ocr_provider = try container.decodeIfPresent(String.self, forKey: .ocr_provider) ?? OCRProvider.mistral.rawValue
         self.local_ollama_url = try container.decodeIfPresent(String.self, forKey: .local_ollama_url) ?? "http://localhost:11434/api/generate"
         self.local_ollama_model = try container.decodeIfPresent(String.self, forKey: .local_ollama_model) ?? "richardyoung/olmocr2:7b-q8"
@@ -324,6 +342,9 @@ final class SettingsViewModel: ObservableObject {
     @Published var taskTag = "#task"
     @Published var customOcrInstruction = ""
     @Published var openRequiresObsidianRunning = true
+    @Published var openSupernotePartnerBeforeSync = false
+    @Published var supernotePartnerApp = "Supernote Partner"
+    @Published var supernotePartnerSyncDelaySeconds = "15"
     @Published var ocrProvider = OCRProvider.localOllama.rawValue
     @Published var localOllamaURL = "http://localhost:11434/api/generate"
     @Published var localOllamaModel = "richardyoung/olmocr2:7b-q8"
@@ -406,6 +427,11 @@ final class SettingsViewModel: ObservableObject {
                 task_tag: taskTag,
                 custom_ocr_instruction: customOcrInstruction,
                 open_requires_obsidian_running: openRequiresObsidianRunning,
+                open_supernote_partner_before_sync: openSupernotePartnerBeforeSync,
+                supernote_partner_app: supernotePartnerApp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? "Supernote Partner"
+                    : supernotePartnerApp.trimmingCharacters(in: .whitespacesAndNewlines),
+                supernote_partner_sync_delay_seconds: parsedSupernotePartnerSyncDelaySeconds ?? 15,
                 ocr_provider: selectedOCRProvider.rawValue,
                 local_ollama_url: localOllamaURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     ? "http://localhost:11434/api/generate"
@@ -452,6 +478,15 @@ final class SettingsViewModel: ObservableObject {
         taskTag = config.task_tag
         customOcrInstruction = config.custom_ocr_instruction ?? ""
         openRequiresObsidianRunning = config.open_requires_obsidian_running
+        let trimmedPartnerApp = config.supernote_partner_app.trimmingCharacters(in: .whitespacesAndNewlines)
+        openSupernotePartnerBeforeSync = config.open_supernote_partner_before_sync
+        supernotePartnerApp = trimmedPartnerApp.isEmpty ? "Supernote Partner" : trimmedPartnerApp
+        supernotePartnerSyncDelaySeconds = String(
+            config.supernote_partner_sync_delay_seconds > 0
+                && !UInt64(config.supernote_partner_sync_delay_seconds).multipliedReportingOverflow(by: 1_000_000_000).overflow
+                ? config.supernote_partner_sync_delay_seconds
+                : 15
+        )
         ocrProvider = OCRProvider(rawValue: config.ocr_provider)?.rawValue ?? OCRProvider.mistral.rawValue
         localOllamaURL = config.local_ollama_url.isEmpty ? "http://localhost:11434/api/generate" : config.local_ollama_url
         localOllamaModel = config.local_ollama_model.isEmpty ? "richardyoung/olmocr2:7b-q8" : config.local_ollama_model
@@ -507,6 +542,16 @@ final class SettingsViewModel: ObservableObject {
 
         if notebooks.isEmpty {
             errors.append("At least one Supernote folder must be configured.")
+        }
+
+        if openSupernotePartnerBeforeSync {
+            if supernotePartnerApp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                errors.append("Supernote Partner app name/path is missing.")
+            }
+
+            if parsedSupernotePartnerSyncDelaySeconds == nil {
+                errors.append("Supernote Partner sync delay must be a positive number.")
+            }
         }
 
         for notebook in notebooks {
@@ -619,6 +664,17 @@ final class SettingsViewModel: ObservableObject {
 
     private var parsedLocalOllamaNumCtx: Int? {
         Int(localOllamaNumCtx.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private var parsedSupernotePartnerSyncDelaySeconds: Int? {
+        guard let value = Int(supernotePartnerSyncDelaySeconds.trimmingCharacters(in: .whitespacesAndNewlines)),
+              value > 0,
+              !UInt64(value).multipliedReportingOverflow(by: 1_000_000_000).overflow
+        else {
+            return nil
+        }
+
+        return value
     }
 
     private func isValidDirectory(_ path: String) -> Bool {
@@ -2114,6 +2170,42 @@ struct SettingsView: View {
                                 .foregroundColor(.secondary)
                         }
                         .frame(width: 170, alignment: .trailing)
+                    }
+
+                    Divider()
+
+                    Toggle(
+                        "Open Supernote Partner before Sync Now",
+                        isOn: $model.openSupernotePartnerBeforeSync
+                    )
+
+                    Text("Optional: open Supernote Partner first, wait briefly for it to sync notes locally, then run Supsidian.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if model.openSupernotePartnerBeforeSync {
+                        SettingField(
+                            title: "Supernote Partner app name or path",
+                            text: $model.supernotePartnerApp
+                        )
+
+                        HStack(alignment: .center) {
+                            Text("Delay before Supsidian sync")
+                                .font(.headline)
+
+                            Spacer()
+
+                            HStack(spacing: 8) {
+                                TextField("15", text: $model.supernotePartnerSyncDelaySeconds)
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(width: 70)
+
+                                Text("seconds")
+                                    .foregroundColor(.secondary)
+                            }
+                            .frame(width: 170, alignment: .trailing)
+                        }
                     }
 
                     Divider()

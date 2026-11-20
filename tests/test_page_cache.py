@@ -624,6 +624,112 @@ def test_incremental_hybrid_changed_middle_page_ocrs_only_that_page_and_runs_mar
     assert cache["last_run"]["deleted_pages_count"] == 0
 
 
+def test_incremental_hybrid_reused_page_preserves_cached_visual_embed(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module({"ocr_provider": "hybrid_marker_olmocr"})
+    note_file = tmp_path / "source" / "Hybrid.note"
+    current_hashes = ["a", "b"]
+    ocr_calls: list[list[int]] = []
+    marker_calls: list[str | None] = []
+
+    monkeypatch.setattr(module, "render_pdf_page_hashes", lambda _pdf_file: current_hashes)
+
+    def fake_selected_ocr(_pdf_file: Path, page_numbers: list[int]) -> dict[int, str]:
+        ocr_calls.append(page_numbers)
+        result = {}
+        for page_number in page_numbers:
+            if page_number == 1:
+                result[page_number] = "Page 1 text\n\nAfter visual"
+            elif current_hashes[page_number - 1] == "changed":
+                result[page_number] = "Page 2 changed"
+            else:
+                result[page_number] = "Page 2 text"
+        return result
+
+    def fake_marker(_pdf_file: Path, marker_dir: Path, page_range: str | None = None) -> None:
+        marker_calls.append(page_range)
+        marker_dir.mkdir(parents=True, exist_ok=True)
+        if page_range == "0":
+            (marker_dir / "_page_0_Picture_6.jpeg").write_bytes(b"visual")
+            (marker_dir / "result.md").write_text(
+                "Page 1 text\n\n![](_page_0_Picture_6.jpeg)\n\nAfter visual",
+                encoding="utf-8",
+            )
+        else:
+            (marker_dir / "result.md").write_text("No visuals", encoding="utf-8")
+
+    monkeypatch.setattr(module, "ollama_ocr_selected_pdf_pages", fake_selected_ocr)
+    monkeypatch.setattr(module, "run_hybrid_marker", fake_marker)
+
+    first_markdown = module.hybrid_marker_olmocr_pdf(
+        tmp_path / "hybrid.pdf",
+        tmp_path / "attachments",
+        "Attachments/Test",
+        note_file,
+    )
+    embed = "![[Attachments/Test/extracted_visuals/page-001-visual-001.jpeg]]"
+    assert embed in first_markdown
+    assert first_markdown.count(embed) == 1
+    assert "Extracted visuals" not in first_markdown
+
+    current_hashes = ["a", "changed"]
+    second_markdown = module.hybrid_marker_olmocr_pdf(
+        tmp_path / "hybrid.pdf",
+        tmp_path / "attachments",
+        "Attachments/Test",
+        note_file,
+    )
+    cache = module.load_page_cache(note_file)
+
+    assert ocr_calls == [[1, 2], [2]]
+    assert marker_calls == ["0", "1", "1"]
+    assert embed in second_markdown
+    assert second_markdown.count(embed) == 1
+    assert "Page 1 text" in second_markdown
+    assert "Page 2 changed" in second_markdown
+    assert "Extracted visuals" not in second_markdown
+    assert cache["last_run"]["changed_pages"] == [2]
+    assert cache["last_run"]["reused_pages_count"] == 1
+    assert cache["pages"][0]["markdown"].count(embed) == 1
+
+    current_hashes = ["a-changed", "changed"]
+    third_markdown = module.hybrid_marker_olmocr_pdf(
+        tmp_path / "hybrid.pdf",
+        tmp_path / "attachments",
+        "Attachments/Test",
+        note_file,
+    )
+    extracted_files = sorted(
+        path.name for path in (tmp_path / "attachments" / "extracted_visuals").iterdir()
+    )
+
+    assert ocr_calls == [[1, 2], [2], [1]]
+    assert marker_calls == ["0", "1", "1", "0"]
+    assert embed in third_markdown
+    assert third_markdown.count(embed) == 1
+    assert "page-001-visual-002.jpeg" not in third_markdown
+    assert extracted_files == ["page-001-visual-001.jpeg"]
+
+    current_hashes = ["changed"]
+    fourth_markdown = module.hybrid_marker_olmocr_pdf(
+        tmp_path / "hybrid.pdf",
+        tmp_path / "attachments",
+        "Attachments/Test",
+        note_file,
+    )
+    remaining_files = sorted(
+        path.name for path in (tmp_path / "attachments" / "extracted_visuals").iterdir()
+    )
+
+    assert ocr_calls == [[1, 2], [2], [1]]
+    assert marker_calls == ["0", "1", "1", "0"]
+    assert embed not in fourth_markdown
+    assert remaining_files == []
+
+
 def test_incremental_hybrid_does_not_reuse_local_ollama_cache(
     load_sync_module,
     monkeypatch: pytest.MonkeyPatch,

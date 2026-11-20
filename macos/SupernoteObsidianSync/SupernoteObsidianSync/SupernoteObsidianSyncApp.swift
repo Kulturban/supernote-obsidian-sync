@@ -49,7 +49,7 @@ struct SupernoteObsidianSyncApp: App {
                 let model = SettingsViewModel()
 
                 if model.setupReady {
-                    CommandRunner.shared.runAndShow(["--once"], title: "Sync Now")
+                    CommandRunner.shared.runSyncNow(model: model)
                 } else {
                     SettingsWindowController.shared.showSetup()
                 }
@@ -165,6 +165,76 @@ final class CommandRunner {
         }
     }
 
+    func runSyncNow(model: SettingsViewModel) {
+        let shouldOpenPartner = model.openSupernotePartnerBeforeSync
+        let partnerApp = model.supernotePartnerApp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "Supernote Partner"
+            : model.supernotePartnerApp.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parsedDelay = Int(model.supernotePartnerSyncDelaySeconds.trimmingCharacters(in: .whitespacesAndNewlines))
+        let delaySeconds: Int
+        if let parsedDelay,
+           parsedDelay > 0,
+           !UInt64(parsedDelay).multipliedReportingOverflow(by: 1_000_000_000).overflow {
+            delaySeconds = parsedDelay
+        } else {
+            delaySeconds = 15
+        }
+        let syncRunningOutput = initialOutput(for: ["--once"], title: "Sync Now")
+
+        let outputWindow = OutputWindowController.show(
+            title: "Sync Now",
+            output: syncRunningOutput
+        )
+
+        Task {
+            if shouldOpenPartner {
+                await MainActor.run {
+                    outputWindow.update(text: """
+                    Sync Now
+
+                    Opening Supernote Partner…
+                    App/path:
+                    \(partnerApp)
+
+                    Waiting \(delaySeconds) second(s) before Supsidian sync starts.
+                    """)
+                }
+
+                let openResult = await CommandRunner.openApplicationOrPath(partnerApp)
+                if !openResult.succeeded {
+                    await MainActor.run {
+                        outputWindow.update(text: openResult.displayText)
+                    }
+                    return
+                }
+
+                let (sleepNanoseconds, overflow) = UInt64(delaySeconds).multipliedReportingOverflow(by: 1_000_000_000)
+                if !overflow && sleepNanoseconds > 0 {
+                    do {
+                        try await Task.sleep(nanoseconds: sleepNanoseconds)
+                    } catch {
+                        return
+                    }
+                }
+
+                guard !Task.isCancelled else { return }
+
+                await MainActor.run {
+                    outputWindow.update(text: syncRunningOutput)
+                }
+            }
+
+            let result = await CommandRunner.runCommand(
+                executablePath: cliPath,
+                arguments: ["--once"]
+            )
+
+            await MainActor.run {
+                outputWindow.update(text: result.displayText)
+            }
+        }
+    }
+
     func runSilently(_ arguments: [String], title: String) {
         Task {
             let result = await CommandRunner.runCommand(
@@ -196,6 +266,37 @@ final class CommandRunner {
 
     private func commandDescription(_ arguments: [String]) -> String {
         "\(cliPath) \(arguments.joined(separator: " "))"
+    }
+
+    private nonisolated static func openApplicationOrPath(_ appOrPath: String) async -> CommandResult {
+        let trimmed = appOrPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let arguments: [String]
+
+        if trimmed.contains("/") || trimmed.hasPrefix("~") {
+            let expandedPath = (trimmed as NSString).expandingTildeInPath
+            var isDirectory: ObjCBool = false
+            let exists = FileManager.default.fileExists(atPath: expandedPath, isDirectory: &isDirectory)
+
+            if exists && isDirectory.boolValue && !expandedPath.lowercased().hasSuffix(".app") {
+                arguments = ["-a", expandedPath]
+            } else {
+                arguments = [expandedPath]
+            }
+        } else {
+            arguments = ["-a", trimmed]
+        }
+
+        return await runCommand(
+            executablePath: "/usr/bin/open",
+            arguments: arguments
+        )
+    }
+
+    private nonisolated static func stripProgressLines(from output: String) -> String {
+        output
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.hasPrefix("SUSPIDIAN_PROGRESS:") }
+            .joined(separator: "\n")
     }
 
     private nonisolated static func runCommand(
@@ -232,12 +333,13 @@ final class CommandRunner {
 
             do {
                 try task.run()
-                task.waitUntilExit()
 
                 let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
                 let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                task.waitUntilExit()
 
-                let output = String(data: outputData, encoding: .utf8) ?? ""
+                let rawOutput = String(data: outputData, encoding: .utf8) ?? ""
+                let output = stripProgressLines(from: rawOutput)
                 let error = String(data: errorData, encoding: .utf8) ?? ""
 
                 if task.terminationStatus == 0 {

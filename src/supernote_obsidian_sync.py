@@ -88,6 +88,12 @@ def log(message: str) -> None:
     logging.info(message)
 
 
+def progress_event(stage: str, **fields: object) -> dict:
+    event = {"stage": stage, **fields}
+    print(f"SUSPIDIAN_PROGRESS:{json.dumps(event, sort_keys=True)}", flush=True)
+    return event
+
+
 # ------------------------------------------------------------
 # CONFIG
 # ------------------------------------------------------------
@@ -472,7 +478,7 @@ def ocr_settings_fingerprint(provider: str | None = None) -> str:
                 "disable_tqdm": HYBRID_MARKER_DISABLE_TQDM,
             },
             "table_conversion": "forgiving-html-v1",
-            "visual_placement": "marker-order-v1",
+            "visual_placement": "marker-order-v2",
             "rendering": {
                 "dpi": 200,
                 "alpha": False,
@@ -834,6 +840,12 @@ def ollama_ocr_selected_pdf_pages(pdf_file: Path, page_numbers: list[int]) -> di
                 if page_number not in selected_pages:
                     continue
 
+                progress_event(
+                    "ocr",
+                    provider=OCR_PROVIDER,
+                    page=page_number,
+                    total_pages=len(document),
+                )
                 page_path = temporary_dir / f"page-{page_number:03d}.png"
                 pixmap = page.get_pixmap(
                     matrix=fitz.Matrix(render_scale, render_scale),
@@ -1064,6 +1076,32 @@ def incremental_ollama_page_transcriptions(
     return page_transcriptions, reconciliation
 
 
+def update_page_cache_markdown(note_file: Path, page_transcriptions: list[str]) -> None:
+    """
+    Update cached page Markdown after provider-specific enrichment.
+
+    Incremental Ollama caches raw page text first. Hybrid Marker + Ollama can then
+    add silent image embeds to changed pages. Persisting that final page Markdown
+    lets unchanged pages keep their previously extracted visuals on later syncs.
+    """
+    cache = load_page_cache(note_file)
+    if not cache:
+        return
+
+    cached_pages = cache.get("pages")
+    if not isinstance(cached_pages, list) or len(cached_pages) != len(page_transcriptions):
+        return
+
+    updated_at = utc_now_iso()
+    for page, page_markdown in zip(cached_pages, page_transcriptions):
+        if isinstance(page, dict):
+            page["markdown"] = page_markdown
+            page["updated_at"] = updated_at
+
+    cache["updated_at"] = updated_at
+    save_page_cache(note_file, cache)
+
+
 def local_ollama_ocr_pdf_incremental(
     pdf_file: Path,
     image_dir: Path,
@@ -1083,6 +1121,19 @@ def local_ollama_ocr_pdf_incremental(
 
 HTML_TABLE_PATTERN = re.compile(r"<table\b[^>]*>.*?</table\s*>", re.IGNORECASE | re.DOTALL)
 MARKER_IMAGE_LINK_PATTERN = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+OBSIDIAN_IMAGE_EMBED_PATTERN = re.compile(r"!\[\[[^\]]+\]\]")
+GENERATED_VISUAL_DESCRIPTION_PATTERN = re.compile(
+    r"^(?:"
+    r"\[drawing visible\].*|"
+    r"(?:this|the)\s+(?:image|drawing|diagram|picture|visual)\s+"
+    r"(?:shows|contains|depicts|is)\b.*"
+    r")$",
+    re.IGNORECASE,
+)
+GENERATED_VISUAL_HEADING_PATTERN = re.compile(
+    r"^#{1,6}\s+Extracted visuals\s*$",
+    re.IGNORECASE,
+)
 MARKER_PAGE_FILENAME_PATTERN = re.compile(
     r"(?:^|[-_ ])page[-_ ]?0*(\d+)(?:[-_ ].*)?$",
     re.IGNORECASE,
@@ -1476,10 +1527,73 @@ def place_visual_by_marker_order(page_text: str, visual: dict, image_embed: str)
     return page_text, False
 
 
+def remove_generated_visual_description_lines(page_text: str) -> str:
+    """
+    Remove conservative, machine-generated visual description lines.
+
+    Marker visuals are embedded silently. Obvious generated visual labels from OCR
+    should not become captions, headings, or task-conversion input.
+    """
+    kept_lines = []
+    for line in page_text.splitlines():
+        clean = line.strip()
+        if GENERATED_VISUAL_HEADING_PATTERN.match(clean):
+            continue
+        if GENERATED_VISUAL_DESCRIPTION_PATTERN.match(clean):
+            continue
+        kept_lines.append(line)
+    return "\n".join(kept_lines)
+
+
 def append_extracted_visuals(page_text: str, image_embeds: list[str]) -> str:
     if not image_embeds:
         return page_text
-    return page_text.rstrip() + "\n\n### Extracted visuals\n\n" + "\n\n".join(image_embeds)
+    return page_text.rstrip() + "\n\n" + "\n\n".join(image_embeds)
+
+
+def remove_stale_page_visual_files(
+    extracted_visual_dir: Path,
+    page_number: int,
+    page_transcriptions: list[str],
+) -> None:
+    """Remove old visual files for a reprocessed page unless referenced by another page."""
+    if not extracted_visual_dir.exists():
+        return
+
+    referenced_other_pages = "\n".join(
+        page_text
+        for index, page_text in enumerate(page_transcriptions, start=1)
+        if index != page_number
+    )
+    prefix = f"page-{page_number:03d}-visual-"
+    for existing_file in sorted(extracted_visual_dir.iterdir()):
+        if not existing_file.is_file() or not existing_file.name.startswith(prefix):
+            continue
+        if f"/extracted_visuals/{existing_file.name}]]" in referenced_other_pages:
+            continue
+        existing_file.unlink(missing_ok=True)
+
+
+def remove_unreferenced_extracted_visual_files(
+    extracted_visual_dir: Path,
+    page_transcriptions: list[str],
+) -> None:
+    """Remove extracted visual files that are no longer referenced by any current page."""
+    if not extracted_visual_dir.exists():
+        return
+
+    referenced_all_pages = "\n".join(page_transcriptions)
+    for existing_file in sorted(extracted_visual_dir.iterdir()):
+        if not existing_file.is_file():
+            continue
+        if not (
+            existing_file.name.startswith("page-")
+            or existing_file.name.startswith("marker-visual-")
+        ):
+            continue
+        if f"/extracted_visuals/{existing_file.name}]]" in referenced_all_pages:
+            continue
+        existing_file.unlink(missing_ok=True)
 
 
 def apply_marker_visuals_to_pages(
@@ -1504,6 +1618,9 @@ def apply_marker_visuals_to_pages(
             f"![[{obsidian_image_folder}/extracted_visuals/{visual['copied_filename']}]]"
         )
         page_index = assigned_page - 1
+        page_transcriptions[page_index] = remove_generated_visual_description_lines(
+            page_transcriptions[page_index]
+        )
         updated_text, was_placed = place_visual_by_marker_order(
             page_transcriptions[page_index],
             visual,
@@ -1554,6 +1671,11 @@ def hybrid_marker_olmocr_pdf(
         marker_pages_to_process = reconciliation["changed_pages"]
         if not marker_pages_to_process:
             log("Hybrid Marker page-scope: no changed pages; skipping Marker")
+            remove_unreferenced_extracted_visual_files(
+                extracted_visual_dir,
+                page_transcriptions,
+            )
+            update_page_cache_markdown(note_file, page_transcriptions)
             return format_ocr_pages(page_transcriptions)
 
         log(f"Hybrid Marker page-scope: processing changed pages {marker_pages_to_process}")
@@ -1563,7 +1685,18 @@ def hybrid_marker_olmocr_pdf(
             for page_number in marker_pages_to_process:
                 marker_dir = Path(temporary_directory) / f"marker_page_{page_number:03d}"
                 try:
+                    progress_event(
+                        "marker",
+                        provider="hybrid_marker_olmocr",
+                        page=page_number,
+                        total_pages=len(page_transcriptions),
+                    )
                     run_hybrid_marker_for_page(pdf_file, marker_dir, page_number)
+                    remove_stale_page_visual_files(
+                        extracted_visual_dir,
+                        page_number,
+                        page_transcriptions,
+                    )
                     visuals = copy_marker_visuals(
                         marker_dir,
                         extracted_visual_dir,
@@ -1586,6 +1719,11 @@ def hybrid_marker_olmocr_pdf(
             f"Hybrid Marker + Ollama OCR finished: {pdf_file} "
             f"({total_visuals} visual(s), {placed_count} placed by Marker order)"
         )
+        remove_unreferenced_extracted_visual_files(
+            extracted_visual_dir,
+            page_transcriptions,
+        )
+        update_page_cache_markdown(note_file, page_transcriptions)
         return format_ocr_pages(page_transcriptions)
 
     try:
@@ -1662,6 +1800,20 @@ def convert_hash_lines_to_tasks(ocr_text: str) -> str:
             converted_lines.append(line)
             continue
 
+        if OBSIDIAN_IMAGE_EMBED_PATTERN.fullmatch(clean):
+            converted_lines.append(line)
+            continue
+
+        if GENERATED_VISUAL_HEADING_PATTERN.match(clean):
+            continue
+
+        if GENERATED_VISUAL_DESCRIPTION_PATTERN.match(clean):
+            continue
+
+        if re.match(r"^#{2,6}\s+", clean):
+            converted_lines.append(line)
+            continue
+
         if clean == "---":
             converted_lines.append(line)
             continue
@@ -1699,14 +1851,22 @@ def process_note(note_file: Path) -> None:
     pdf_file = note_attachment_dir / f"{name}.pdf"
 
     log(f"Processing note: {note_file}")
+    progress_event("processing", note=str(note_file), note_name=name)
 
     shutil.copy2(note_file, obsidian_note_copy)
     log(f"Copied .note temporarily to Obsidian: {obsidian_note_copy}")
     started_local_ollama_ocr = False
 
     try:
+        progress_event("converting", note=str(note_file), note_name=name)
         convert_note_to_pdf(note_file, pdf_file)
 
+        progress_event(
+            "ocr_start",
+            note=str(note_file),
+            note_name=name,
+            provider=OCR_PROVIDER,
+        )
         if OCR_PROVIDER == "local_ollama":
             started_local_ollama_ocr = True
             ocr_markdown = local_ollama_ocr_pdf_incremental(
@@ -1730,6 +1890,7 @@ def process_note(note_file: Path) -> None:
                 obsidian_image_folder,
             )
 
+        progress_event("writing_markdown", note=str(note_file), note_name=name)
         ocr_markdown = convert_hash_lines_to_tasks(ocr_markdown)
 
         final_markdown = f"""{ocr_markdown}
@@ -1743,6 +1904,7 @@ def process_note(note_file: Path) -> None:
 
         md_file.write_text(final_markdown, encoding="utf-8")
         log(f"Markdown written: {md_file}")
+        progress_event("done", note=str(note_file), note_name=name)
 
     finally:
         if started_local_ollama_ocr:
@@ -1796,9 +1958,16 @@ def scan_once() -> None:
     """
     Scan all configured Supernote notebooks once.
     """
-    for notebook in NOTEBOOKS:
+    for index, notebook in enumerate(NOTEBOOKS, start=1):
         use_notebook(notebook)
-        log(f"Scanning notebook: {ACTIVE_NOTEBOOK.get('name', 'Unnamed notebook')}")
+        notebook_name = ACTIVE_NOTEBOOK.get("name", "Unnamed notebook")
+        log(f"Scanning notebook: {notebook_name}")
+        progress_event(
+            "scanning",
+            notebook=notebook_name,
+            notebook_index=index,
+            notebook_count=len(NOTEBOOKS),
+        )
         scan_active_notebook_once()
 
 
