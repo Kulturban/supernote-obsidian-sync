@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.13.2
+
+- Recommended `qwen3-vl:8b-instruct` (the non-thinking instruct variant) in macOS Settings and added a warning banner with a one-click switch when a non-instruct `qwen3-vl` thinking tag is configured.
+- Added an empty-thinking-output guard in `ollama_ocr_selected_pdf_pages()` so pages where Ollama spends all output tokens in thinking mode (`eval_count > 0` / `done_reason=length` / `message.thinking`) abort with a clear error instead of overwriting existing Obsidian notes or caching blank pages.
+- Hardened local Ollama requests with `num_predict` (`2048` for OCR, `384` for JSON visual fallback), `repeat_penalty` (`1.08`), `1680 px` max image edge capping, `Connection: close`, and a `(10, 180)` second timeout.
+- Added per-page timing and token telemetry (`prompt_eval_count`, `eval_count`, `done_reason`, image size, Marker duration) to the sync log.
+- Streamed per-page `visual_fallback` progress events (`95%`–`99%`) so the macOS menu bar indicator visibly advances during the Qwen3-VL visual fallback pass.
+
 ## v0.13.1
 
 - Organized the **Synced Supernote Folders** settings section into horizontal folder tabs with an inline **+ New Folder** tab button so each synced folder gets its own tab.
