@@ -27,6 +27,54 @@ struct MenuSetupStatusView: View {
                     Text("Next: \(step.title)")
                 }
             }
+
+            Divider()
+
+            Button("Sync Now") {
+                let currentModel = SettingsViewModel()
+
+                if currentModel.setupReady {
+                    CommandRunner.shared.runSyncNow(model: currentModel)
+                } else {
+                    SettingsWindowController.shared.showSetup()
+                }
+            }
+
+            Menu("Sync Folder") {
+                if model.notebooks.isEmpty {
+                    Button("No folders configured — Open Settings…") {
+                        SettingsWindowController.shared.show()
+                    }
+                } else {
+                    ForEach(model.notebooks) { notebook in
+                        let folderName = notebook.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            ? "Unnamed Folder"
+                            : notebook.name.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                        Button(folderName) {
+                            let currentModel = SettingsViewModel()
+
+                            if currentModel.setupReady {
+                                CommandRunner.shared.runSyncNow(model: currentModel, folderName: folderName)
+                            } else {
+                                SettingsWindowController.shared.showSetup()
+                            }
+                        }
+                    }
+
+                    Divider()
+
+                    Button("Sync All Folders") {
+                        let currentModel = SettingsViewModel()
+
+                        if currentModel.setupReady {
+                            CommandRunner.shared.runSyncNow(model: currentModel)
+                        } else {
+                            SettingsWindowController.shared.showSetup()
+                        }
+                    }
+                }
+            }
         }
         .onAppear {
             model.load()
@@ -42,18 +90,6 @@ struct SupernoteObsidianSyncApp: App {
     var body: some Scene {
         MenuBarExtra("Supsidian", systemImage: "long.text.page.and.pencil") {
             MenuSetupStatusView()
-
-            Divider()
-
-            Button("Sync Now") {
-                let model = SettingsViewModel()
-
-                if model.setupReady {
-                    CommandRunner.shared.runSyncNow(model: model)
-                } else {
-                    SettingsWindowController.shared.showSetup()
-                }
-            }
 
             Button("Settings…") {
                 SettingsWindowController.shared.show()
@@ -104,7 +140,7 @@ final class CommandRunner {
 
         if arguments.contains("--once") {
             return """
-            Sync Now
+            \(title)
 
             Looking for changed Supernote notes…
             This can take a moment if OCR is needed.
@@ -165,7 +201,7 @@ final class CommandRunner {
         }
     }
 
-    func runSyncNow(model: SettingsViewModel) {
+    func runSyncNow(model: SettingsViewModel, folderName: String? = nil) {
         let shouldOpenPartner = model.openSupernotePartnerBeforeSync
         let partnerApp = model.supernotePartnerApp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? "Supernote Partner"
@@ -179,19 +215,44 @@ final class CommandRunner {
         } else {
             delaySeconds = 15
         }
-        let syncRunningOutput = initialOutput(for: ["--once"], title: "Sync Now")
-        let progressTracker = SyncProgressTracker(command: commandDescription(["--once"]))
+
+        let trimmedFolder = folderName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let syncArguments: [String]
+        let windowTitle: String
+        if let trimmedFolder, !trimmedFolder.isEmpty {
+            syncArguments = ["--once", "--folder", trimmedFolder]
+            windowTitle = "Sync Folder — \(trimmedFolder)"
+        } else {
+            syncArguments = ["--once"]
+            windowTitle = "Sync Now"
+        }
+
+        let syncRunningOutput = initialOutput(for: syncArguments, title: windowTitle)
+        let progressTracker = SyncProgressTracker(
+            command: commandDescription(syncArguments),
+            title: windowTitle
+        )
 
         let outputWindow = OutputWindowController.show(
-            title: "Sync Now",
+            title: windowTitle,
             output: syncRunningOutput
+        )
+        outputWindow.updateProgress(
+            isRunning: true,
+            fraction: nil,
+            label: "Preparing sync…"
         )
 
         Task {
             if shouldOpenPartner {
                 await MainActor.run {
+                    outputWindow.updateProgress(
+                        isRunning: true,
+                        fraction: nil,
+                        label: "Opening Supernote Partner and waiting \(delaySeconds)s…"
+                    )
                     outputWindow.update(text: """
-                    Sync Now
+                    \(windowTitle)
 
                     Opening Supernote Partner…
                     App/path:
@@ -204,6 +265,11 @@ final class CommandRunner {
                 let openResult = await CommandRunner.openApplicationOrPath(partnerApp)
                 if !openResult.succeeded {
                     await MainActor.run {
+                        outputWindow.updateProgress(
+                            isRunning: false,
+                            fraction: nil,
+                            label: "Could not open Supernote Partner"
+                        )
                         outputWindow.update(text: openResult.displayText)
                     }
                     return
@@ -221,17 +287,27 @@ final class CommandRunner {
                 guard !Task.isCancelled else { return }
 
                 await MainActor.run {
+                    outputWindow.updateProgress(
+                        isRunning: true,
+                        fraction: nil,
+                        label: "Looking for changed Supernote notes…"
+                    )
                     outputWindow.update(text: syncRunningOutput)
                 }
             }
 
             let result = await CommandRunner.runCommand(
                 executablePath: cliPath,
-                arguments: ["--once"],
+                arguments: syncArguments,
                 onProgress: { event in
                     Task { @MainActor in
                         guard !progressTracker.isFinished else { return }
                         let progressText = progressTracker.apply(event)
+                        outputWindow.updateProgress(
+                            isRunning: true,
+                            fraction: progressTracker.fractionCompleted,
+                            label: progressTracker.currentStageDescription
+                        )
                         outputWindow.update(text: progressText)
                     }
                 }
@@ -239,6 +315,11 @@ final class CommandRunner {
 
             await MainActor.run {
                 progressTracker.isFinished = true
+                outputWindow.updateProgress(
+                    isRunning: false,
+                    fraction: result.succeeded ? 1.0 : nil,
+                    label: result.succeeded ? "Sync completed" : "Sync failed"
+                )
                 outputWindow.update(text: result.displayText)
             }
         }
@@ -563,21 +644,69 @@ nonisolated final class DataStreamBuffer: @unchecked Sendable {
 @MainActor
 final class SyncProgressTracker {
     private let command: String
+    private let title: String
     private var notebook: String?
     private var notebookIndex: Int?
     private var notebookCount: Int?
     private var noteName: String?
     private var notePath: String?
     private var provider: String?
+    private var page: Int?
+    private var totalPages: Int?
+    private var stage: String = "scanning"
     private var stageDescription = "Looking for changed Supernote notes…"
     private var completedNotes: [String] = []
     var isFinished = false
 
-    init(command: String) {
+    init(command: String, title: String = "Sync Now") {
         self.command = command
+        self.title = title
+    }
+
+    var currentStageDescription: String {
+        stageDescription
+    }
+
+    var fractionCompleted: Double? {
+        let folderCount = max(notebookCount ?? 1, 1)
+        let folderIndex = min(max(notebookIndex ?? 1, 1), folderCount)
+        let folderBase = Double(folderIndex - 1) / Double(folderCount)
+        let folderSpan = 1.0 / Double(folderCount)
+
+        guard let totalPages, totalPages > 0 else {
+            if stage == "writing_markdown" {
+                return min(max(folderBase + folderSpan * 0.95, 0.0), 1.0)
+            }
+            if stage == "done" {
+                return min(max(folderBase + folderSpan, 0.0), 1.0)
+            }
+            return nil
+        }
+
+        let currentPage = min(max(page ?? 1, 1), totalPages)
+        let pageRatio = Double(currentPage) / Double(totalPages)
+        let isHybrid = (provider == "hybrid_marker_olmocr")
+        let noteFraction: Double
+
+        switch stage {
+        case "ocr":
+            noteFraction = (isHybrid ? 0.7 : 0.9) * pageRatio
+        case "marker":
+            noteFraction = 0.7 + 0.25 * pageRatio
+        case "writing_markdown":
+            noteFraction = 0.95
+        case "done":
+            noteFraction = 1.0
+        default:
+            return nil
+        }
+
+        return min(max(folderBase + folderSpan * noteFraction, 0.0), 1.0)
     }
 
     func apply(_ event: SyncProgressEvent) -> String {
+        stage = event.stage
+
         if let notebook = event.notebook, !notebook.isEmpty {
             self.notebook = notebook
         }
@@ -596,11 +725,19 @@ final class SyncProgressTracker {
         if let provider = event.provider, !provider.isEmpty {
             self.provider = provider
         }
+        if let page = event.page {
+            self.page = page
+        }
+        if let totalPages = event.total_pages {
+            self.totalPages = totalPages
+        }
 
         switch event.stage {
         case "scanning":
             noteName = nil
             notePath = nil
+            page = nil
+            totalPages = nil
             if let notebook, let notebookIndex, let notebookCount {
                 stageDescription = "Scanning folder \(notebookIndex) of \(notebookCount): \(notebook)…"
             } else if let notebook {
@@ -610,34 +747,40 @@ final class SyncProgressTracker {
             }
 
         case "processing":
+            page = nil
+            totalPages = nil
             let currentNote = noteName ?? notePath ?? "note"
             stageDescription = "Processing note: \(currentNote)…"
 
         case "converting":
+            page = nil
+            totalPages = nil
             let currentNote = noteName ?? notePath ?? "note"
             stageDescription = "Converting \(currentNote) to PDF…"
 
         case "ocr_start":
+            page = nil
+            totalPages = nil
             let activeProvider = provider ?? "configured provider"
-            stageDescription = "Starting OCR (\(activeProvider))…"
+            stageDescription = "OCR in progress… (\(activeProvider))"
 
         case "ocr":
             let activeProvider = provider ?? "local OCR"
             if let page = event.page, let totalPages = event.total_pages {
-                stageDescription = "Running OCR (\(activeProvider)) — page \(page) of \(totalPages)…"
+                stageDescription = "OCR in progress… (\(activeProvider) — page \(page) of \(totalPages))"
             } else if let page = event.page {
-                stageDescription = "Running OCR (\(activeProvider)) — page \(page)…"
+                stageDescription = "OCR in progress… (\(activeProvider) — page \(page))"
             } else {
-                stageDescription = "Running OCR (\(activeProvider))…"
+                stageDescription = "OCR in progress… (\(activeProvider))"
             }
 
         case "marker":
             if let page = event.page, let totalPages = event.total_pages {
-                stageDescription = "Extracting layout & visuals (Marker) — page \(page) of \(totalPages)…"
+                stageDescription = "OCR in progress… (Marker layout & visuals — page \(page) of \(totalPages))"
             } else if let page = event.page {
-                stageDescription = "Extracting layout & visuals (Marker) — page \(page)…"
+                stageDescription = "OCR in progress… (Marker layout & visuals — page \(page))"
             } else {
-                stageDescription = "Extracting layout & visuals (Marker)…"
+                stageDescription = "OCR in progress… (Marker layout & visuals)"
             }
 
         case "writing_markdown":
@@ -660,7 +803,7 @@ final class SyncProgressTracker {
     }
 
     private func formattedText() -> String {
-        var lines: [String] = ["Sync Now", ""]
+        var lines: [String] = [title, ""]
 
         if let notebook {
             if let notebookIndex, let notebookCount {
@@ -702,6 +845,54 @@ struct CommandResult {
 }
 
 @MainActor
+final class OutputWindowProgressModel: ObservableObject {
+    @Published var isVisible = false
+    @Published var isRunning = false
+    @Published var fractionCompleted: Double? = nil
+    @Published var label = ""
+}
+
+struct OutputWindowProgressHeaderView: View {
+    @ObservedObject var model: OutputWindowProgressModel
+
+    var body: some View {
+        if model.isVisible {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text(model.label)
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+
+                    Spacer()
+
+                    if let fraction = model.fractionCompleted {
+                        Text("\(Int((fraction * 100).rounded()))%")
+                            .font(.system(.footnote, design: .monospaced))
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                if let fraction = model.fractionCompleted {
+                    ProgressView(value: fraction, total: 1.0)
+                        .progressViewStyle(.linear)
+                } else if model.isRunning {
+                    ProgressView()
+                        .progressViewStyle(.linear)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+            .padding(.bottom, 8)
+            .background(Color(nsColor: .windowBackgroundColor))
+
+            Divider()
+        }
+    }
+}
+
+@MainActor
 final class OutputWindowController: NSWindowController, NSWindowDelegate {
     private static var openControllers: [OutputWindowController] = []
 
@@ -724,9 +915,17 @@ final class OutputWindowController: NSWindowController, NSWindowDelegate {
     var onClose: (() -> Void)?
 
     private let textView: NSTextView
+    private let progressModel = OutputWindowProgressModel()
 
     func update(text: String) {
         textView.string = text
+    }
+
+    func updateProgress(isRunning: Bool, fraction: Double?, label: String) {
+        progressModel.isVisible = isRunning || fraction != nil
+        progressModel.isRunning = isRunning
+        progressModel.fractionCompleted = fraction
+        progressModel.label = label
     }
 
     init(title: String, text: String) {
@@ -747,6 +946,25 @@ final class OutputWindowController: NSWindowController, NSWindowDelegate {
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = true
         scrollView.autohidesScrollers = false
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+
+        let headerHost = NSHostingView(rootView: OutputWindowProgressHeaderView(model: progressModel))
+        headerHost.translatesAutoresizingMaskIntoConstraints = false
+
+        let containerView = NSView(frame: NSRect(x: 0, y: 0, width: 760, height: 520))
+        containerView.addSubview(headerHost)
+        containerView.addSubview(scrollView)
+
+        NSLayoutConstraint.activate([
+            headerHost.topAnchor.constraint(equalTo: containerView.topAnchor),
+            headerHost.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
+            headerHost.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
+
+            scrollView.topAnchor.constraint(equalTo: headerHost.bottomAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: containerView.bottomAnchor)
+        ])
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 760, height: 520),
@@ -756,7 +974,7 @@ final class OutputWindowController: NSWindowController, NSWindowDelegate {
         )
 
         window.title = title
-        window.contentView = scrollView
+        window.contentView = containerView
         window.center()
 
         super.init(window: window)

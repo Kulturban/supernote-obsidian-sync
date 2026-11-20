@@ -282,10 +282,18 @@ HYBRID_MARKER_HIGHRES_IMAGE_DPI = positive_int_or_default(
     config.get("hybrid_marker_highres_image_dpi"), 144
 )
 HYBRID_MARKER_DISABLE_TQDM = bool(config.get("hybrid_marker_disable_tqdm", True))
+DISABLED_OCR_PROVIDERS = (
+    "none",
+    "disabled",
+    "no_ocr",
+    "off",
+    "pdf_only",
+)
 SUPPORTED_OCR_PROVIDERS = (
     "mistral",
     "local_ollama",
     "hybrid_marker_olmocr",
+    "none",
 )
 
 ACTIVE_NOTEBOOK = {}
@@ -371,11 +379,72 @@ def save_state(state: dict) -> None:
 # HELPERS
 # ------------------------------------------------------------
 
-def is_file_stable(path: Path, wait_seconds: int) -> bool:
-    first_size = path.stat().st_size
-    time.sleep(wait_seconds)
-    second_size = path.stat().st_size
-    return first_size == second_size
+def _file_stability_snapshot(path: Path) -> tuple[int, int, str] | None:
+    try:
+        stat = path.stat()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+    return (stat.st_size, stat.st_mtime_ns, digest)
+
+
+def is_file_stable(path: Path, wait_seconds: int, max_attempts: int = 5) -> bool:
+    previous = _file_stability_snapshot(path)
+    if previous is None:
+        return False
+
+    attempts = max(1, int(max_attempts))
+    for _ in range(attempts):
+        time.sleep(max(0, wait_seconds))
+        current = _file_stability_snapshot(path)
+        if current is None:
+            return False
+        if current == previous:
+            return True
+        previous = current
+
+    return False
+
+
+def note_state_signature(note_file: Path) -> str:
+    stat = note_file.stat()
+    return f"{stat.st_mtime_ns}:{stat.st_size}"
+
+
+def write_text_atomically(destination: Path, content: str) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path_str = tempfile.mkstemp(
+        prefix=".supsidian-tmp-",
+        suffix=".tmp",
+        dir=str(destination.parent),
+    )
+    temp_path = Path(temp_path_str)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, destination)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def replace_file_atomically(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path_str = tempfile.mkstemp(
+        prefix=".supsidian-tmp-",
+        suffix=".tmp",
+        dir=str(destination.parent),
+    )
+    os.close(fd)
+    temp_path = Path(temp_path_str)
+    try:
+        shutil.copy2(source, temp_path)
+        os.replace(temp_path, destination)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 def safe_name(note_file: Path) -> str:
@@ -1755,9 +1824,35 @@ def hybrid_marker_olmocr_pdf(
     return format_ocr_pages(page_transcriptions)
 
 
+def is_ocr_disabled(provider: str | None = None) -> bool:
+    if not bool(config.get("ocr_enabled", True)):
+        return True
+    selected = (provider if provider is not None else OCR_PROVIDER).strip().lower()
+    return selected in DISABLED_OCR_PROVIDERS
+
+
+def build_no_ocr_markdown(note_file: Path, name: str, pdf_file: Path) -> str:
+    attachment_path = (
+        f"{ACTIVE_ATTACHMENT_FOLDER}/{name}/{pdf_file.name}"
+        if ACTIVE_ATTACHMENT_FOLDER
+        else pdf_file.name
+    )
+    return (
+        "---\n"
+        f'title: "{name}"\n'
+        f'source_note: "{note_file.name}"\n'
+        f'pdf_attachment: "{attachment_path}"\n'
+        "ocr: false\n"
+        "---\n\n"
+        f"![[{pdf_file.name}]]\n"
+    )
+
+
 def ocr_pdf(pdf_file: Path, image_dir: Path, obsidian_image_folder: str) -> str:
     provider = OCR_PROVIDER
 
+    if is_ocr_disabled(provider):
+        return ""
     if provider == "mistral":
         return mistral_ocr_pdf(pdf_file, image_dir, obsidian_image_folder)
     if provider == "local_ollama":
@@ -1837,15 +1932,34 @@ def convert_hash_lines_to_tasks(ocr_text: str) -> str:
 # PROCESSING
 # ------------------------------------------------------------
 
+def _sync_staged_attachments(staged_dir: Path, destination_dir: Path) -> None:
+    destination_dir.mkdir(parents=True, exist_ok=True)
+
+    for source_path in sorted(staged_dir.rglob("*")):
+        relative = source_path.relative_to(staged_dir)
+        target_path = destination_dir / relative
+        if source_path.is_dir():
+            target_path.mkdir(parents=True, exist_ok=True)
+        elif source_path.is_file():
+            replace_file_atomically(source_path, target_path)
+
+    staged_extracted_dir = staged_dir / "extracted_visuals"
+    dest_extracted_dir = destination_dir / "extracted_visuals"
+    if dest_extracted_dir.exists():
+        staged_names = (
+            {path.name for path in staged_extracted_dir.iterdir() if path.is_file()}
+            if staged_extracted_dir.exists()
+            else set()
+        )
+        for existing in list(dest_extracted_dir.iterdir()):
+            if existing.is_file() and existing.name not in staged_names:
+                existing.unlink(missing_ok=True)
+
+
 def process_note(note_file: Path) -> None:
     name = safe_name(note_file)
 
-    OBSIDIAN_NOTE_DIR.mkdir(parents=True, exist_ok=True)
-    PDF_DIR.mkdir(parents=True, exist_ok=True)
-
-    obsidian_note_copy = OBSIDIAN_NOTE_DIR / note_file.name
     md_file = OBSIDIAN_NOTE_DIR / f"{name}.md"
-
     note_attachment_dir = PDF_DIR / name
     obsidian_image_folder = f"{ACTIVE_ATTACHMENT_FOLDER}/{name}"
     pdf_file = note_attachment_dir / f"{name}.pdf"
@@ -1853,47 +1967,69 @@ def process_note(note_file: Path) -> None:
     log(f"Processing note: {note_file}")
     progress_event("processing", note=str(note_file), note_name=name)
 
-    shutil.copy2(note_file, obsidian_note_copy)
-    log(f"Copied .note temporarily to Obsidian: {obsidian_note_copy}")
     started_local_ollama_ocr = False
 
     try:
-        progress_event("converting", note=str(note_file), note_name=name)
-        convert_note_to_pdf(note_file, pdf_file)
+        with tempfile.TemporaryDirectory(prefix="supsidian-stage-") as stage_root:
+            staged_attachment_dir = Path(stage_root) / name
+            staged_attachment_dir.mkdir(parents=True, exist_ok=True)
+            staged_pdf_file = staged_attachment_dir / f"{name}.pdf"
 
-        progress_event(
-            "ocr_start",
-            note=str(note_file),
-            note_name=name,
-            provider=OCR_PROVIDER,
-        )
-        if OCR_PROVIDER == "local_ollama":
-            started_local_ollama_ocr = True
-            ocr_markdown = local_ollama_ocr_pdf_incremental(
-                pdf_file,
-                note_attachment_dir,
-                obsidian_image_folder,
-                note_file,
-            )
-        elif OCR_PROVIDER == "hybrid_marker_olmocr":
-            started_local_ollama_ocr = True
-            ocr_markdown = hybrid_marker_olmocr_pdf(
-                pdf_file,
-                note_attachment_dir,
-                obsidian_image_folder,
-                note_file,
-            )
-        else:
-            ocr_markdown = ocr_pdf(
-                pdf_file,
-                note_attachment_dir,
-                obsidian_image_folder,
-            )
+            existing_visuals_dir = note_attachment_dir / "extracted_visuals"
+            if existing_visuals_dir.is_dir():
+                shutil.copytree(
+                    existing_visuals_dir,
+                    staged_attachment_dir / "extracted_visuals",
+                    dirs_exist_ok=True,
+                )
 
-        progress_event("writing_markdown", note=str(note_file), note_name=name)
-        ocr_markdown = convert_hash_lines_to_tasks(ocr_markdown)
+            progress_event("converting", note=str(note_file), note_name=name)
+            convert_note_to_pdf(note_file, staged_pdf_file)
 
-        final_markdown = f"""{ocr_markdown}
+            if is_ocr_disabled():
+                _sync_staged_attachments(staged_attachment_dir, note_attachment_dir)
+                if md_file.exists() and md_file.read_text(encoding="utf-8", errors="replace").strip():
+                    log(f"Preserved existing Markdown note (OCR disabled): {md_file}")
+                else:
+                    progress_event("writing_markdown", note=str(note_file), note_name=name)
+                    final_markdown = build_no_ocr_markdown(note_file, name, pdf_file)
+                    write_text_atomically(md_file, final_markdown)
+                    log(f"Markdown written: {md_file}")
+                progress_event("done", note=str(note_file), note_name=name)
+            else:
+                progress_event(
+                    "ocr_start",
+                    note=str(note_file),
+                    note_name=name,
+                    provider=OCR_PROVIDER,
+                )
+                if OCR_PROVIDER == "local_ollama":
+                    started_local_ollama_ocr = True
+                    ocr_markdown = local_ollama_ocr_pdf_incremental(
+                        staged_pdf_file,
+                        staged_attachment_dir,
+                        obsidian_image_folder,
+                        note_file,
+                    )
+                elif OCR_PROVIDER == "hybrid_marker_olmocr":
+                    started_local_ollama_ocr = True
+                    ocr_markdown = hybrid_marker_olmocr_pdf(
+                        staged_pdf_file,
+                        staged_attachment_dir,
+                        obsidian_image_folder,
+                        note_file,
+                    )
+                else:
+                    ocr_markdown = ocr_pdf(
+                        staged_pdf_file,
+                        staged_attachment_dir,
+                        obsidian_image_folder,
+                    )
+
+                progress_event("writing_markdown", note=str(note_file), note_name=name)
+                ocr_markdown = convert_hash_lines_to_tasks(ocr_markdown)
+
+                final_markdown = f"""{ocr_markdown}
 
 ---
 
@@ -1902,17 +2038,14 @@ def process_note(note_file: Path) -> None:
 ![[{ACTIVE_ATTACHMENT_FOLDER}/{name}/{name}.pdf]]
 """
 
-        md_file.write_text(final_markdown, encoding="utf-8")
-        log(f"Markdown written: {md_file}")
-        progress_event("done", note=str(note_file), note_name=name)
+                _sync_staged_attachments(staged_attachment_dir, note_attachment_dir)
+                write_text_atomically(md_file, final_markdown)
+                log(f"Markdown written: {md_file}")
+                progress_event("done", note=str(note_file), note_name=name)
 
     finally:
         if started_local_ollama_ocr:
             unload_local_ollama_model_after_note()
-
-        if obsidian_note_copy.exists():
-            obsidian_note_copy.unlink()
-            log(f"Deleted copied .note file: {obsidian_note_copy}")
 
     log(f"Done: {md_file}")
 
@@ -1930,12 +2063,12 @@ def scan_active_notebook_once() -> None:
 
     state = load_state()
 
-    for note_file in SOURCE_DIR.rglob("*.note"):
-        stat = note_file.stat()
+    for note_file in sorted(SOURCE_DIR.rglob("*.note")):
         key = str(note_file)
-        current_signature = f"{stat.st_mtime_ns}:{stat.st_size}"
+        current_signature = note_state_signature(note_file)
+        md_file = OBSIDIAN_NOTE_DIR / f"{safe_name(note_file)}.md"
 
-        if state.get(key) == current_signature:
+        if state.get(key) == current_signature and md_file.exists():
             continue
 
         log(f"Found new or changed note: {note_file}")
@@ -1945,8 +2078,9 @@ def scan_active_notebook_once() -> None:
             continue
 
         try:
+            stable_signature = note_state_signature(note_file)
             process_note(note_file)
-            state[key] = current_signature
+            state[key] = stable_signature
             save_state(state)
         except Exception as exc:
             logging.exception("Error processing %s", note_file)
@@ -1954,11 +2088,45 @@ def scan_active_notebook_once() -> None:
 
 
 
-def scan_once() -> None:
+def select_notebooks(folder_name: str | None = None) -> list[dict]:
+    """Return all configured notebooks or filter by a specific folder name/path."""
+    if folder_name is None or not str(folder_name).strip():
+        return list(NOTEBOOKS)
+
+    target = str(folder_name).strip()
+    exact_matches = [
+        notebook
+        for notebook in NOTEBOOKS
+        if str(notebook.get("name", "")).strip() == target
+    ]
+    if exact_matches:
+        return exact_matches
+
+    target_folded = target.casefold()
+    folded_matches = [
+        notebook
+        for notebook in NOTEBOOKS
+        if str(notebook.get("name", "")).strip().casefold() == target_folded
+        or str(notebook.get("source_dir", "")).strip() == target
+        or Path(str(notebook.get("source_dir", "")).strip()).name.casefold() == target_folded
+        or str(notebook.get("obsidian_note_folder", "")).strip().casefold() == target_folded
+    ]
+    if folded_matches:
+        return folded_matches
+
+    available = [str(notebook.get("name", "Unnamed notebook")) for notebook in NOTEBOOKS]
+    available_text = ", ".join(available) if available else "none configured"
+    raise SystemExit(
+        f"❌ Configured folder not found: '{target}'. Available folders: {available_text}"
+    )
+
+
+def scan_once(folder_name: str | None = None) -> None:
     """
-    Scan all configured Supernote notebooks once.
+    Scan all configured Supernote notebooks (or a single selected folder) once.
     """
-    for index, notebook in enumerate(NOTEBOOKS, start=1):
+    selected_notebooks = select_notebooks(folder_name)
+    for index, notebook in enumerate(selected_notebooks, start=1):
         use_notebook(notebook)
         notebook_name = ACTIVE_NOTEBOOK.get("name", "Unnamed notebook")
         log(f"Scanning notebook: {notebook_name}")
@@ -1966,7 +2134,7 @@ def scan_once() -> None:
             "scanning",
             notebook=notebook_name,
             notebook_index=index,
-            notebook_count=len(NOTEBOOKS),
+            notebook_count=len(selected_notebooks),
         )
         scan_active_notebook_once()
 
@@ -2534,7 +2702,7 @@ def diagnose() -> None:
     config_exists = CONFIG_FILE.exists()
     env_exists = ENV_FILE.exists()
     api_key_set = bool(os.environ.get("MISTRAL_API_KEY"))
-    provider_supported = OCR_PROVIDER in SUPPORTED_OCR_PROVIDERS
+    provider_supported = OCR_PROVIDER in SUPPORTED_OCR_PROVIDERS or is_ocr_disabled()
 
     vault_configured = config_exists and not is_placeholder_path(str(VAULT_DIR))
     vault_exists = vault_configured and VAULT_DIR.exists()
@@ -2614,7 +2782,7 @@ def diagnose() -> None:
                     "marker_single is on PATH"
                 ),
             )
-    elif provider_supported and OCR_PROVIDER != "mistral":
+    elif provider_supported and OCR_PROVIDER != "mistral" and not is_ocr_disabled():
         add_check(
             "Selected OCR provider is available",
             False,
@@ -2835,7 +3003,7 @@ def watch_loop() -> None:
 
 
 
-def _sync_output_snapshot() -> dict:
+def _sync_output_snapshot(notebooks: list[dict] | None = None) -> dict:
     """
     Take a lightweight snapshot of state files and generated Markdown files.
     Used to tell the user whether Sync Now actually changed anything.
@@ -2845,7 +3013,9 @@ def _sync_output_snapshot() -> dict:
         "markdown_files": {},
     }
 
-    for index, notebook in enumerate(NOTEBOOKS, start=1):
+    target_notebooks = NOTEBOOKS if notebooks is None else notebooks
+
+    for index, notebook in enumerate(target_notebooks, start=1):
         use_notebook(notebook)
         name = ACTIVE_NOTEBOOK.get("name", f"Folder {index}")
 
@@ -2875,22 +3045,26 @@ def _sync_output_snapshot() -> dict:
     return snapshot
 
 
-def sync_now_with_summary() -> None:
+def sync_now_with_summary(folder_name: str | None = None) -> None:
     """
     Run a one-time sync and print a user-friendly summary for the GUI window.
     """
-    print("\nSync Now\n")
+    if folder_name and folder_name.strip():
+        print(f"\nSync Folder: {folder_name.strip()}\n")
+    else:
+        print("\nSync Now\n")
 
     if not NOTEBOOKS:
         print("❌ No Supernote folders configured yet.")
         print("Open Settings and add at least one Supernote folder first.\n")
         return
 
-    before = _sync_output_snapshot()
+    selected_notebooks = select_notebooks(folder_name)
+    before = _sync_output_snapshot(selected_notebooks)
 
-    scan_once()
+    scan_once(folder_name=folder_name)
 
-    after = _sync_output_snapshot()
+    after = _sync_output_snapshot(selected_notebooks)
 
     print("")
     if before != after:
@@ -2922,6 +3096,13 @@ def main() -> None:
         "--once",
         action="store_true",
         help="Run one sync scan and exit.",
+    )
+
+    parser.add_argument(
+        "--folder",
+        type=str,
+        default=None,
+        help="Sync only the specified configured Supernote folder.",
     )
 
     parser.add_argument(
@@ -2990,8 +3171,8 @@ def main() -> None:
         setup()
     elif args.diagnose:
         diagnose()
-    elif args.once:
-        sync_now_with_summary()
+    elif args.once or args.folder:
+        sync_now_with_summary(folder_name=args.folder)
     elif args.status:
         show_status()
     elif args.open_settings:

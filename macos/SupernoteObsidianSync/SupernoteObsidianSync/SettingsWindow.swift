@@ -51,6 +51,7 @@ enum OCRProvider: String, CaseIterable, Identifiable {
     case mistral
     case localOllama = "local_ollama"
     case hybridMarkerOlmocr = "hybrid_marker_olmocr"
+    case none = "none"
 
     var id: String { rawValue }
 
@@ -62,7 +63,17 @@ enum OCRProvider: String, CaseIterable, Identifiable {
             return "Local Ollama"
         case .hybridMarkerOlmocr:
             return "Hybrid Marker + Ollama — Experimental"
+        case .none:
+            return "No OCR (PDF Embed Only)"
         }
+    }
+
+    static func normalized(from rawValue: String) -> OCRProvider {
+        let cleaned = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if ["none", "disabled", "no_ocr", "off", "pdf_only"].contains(cleaned) {
+            return .none
+        }
+        return OCRProvider(rawValue: cleaned) ?? .mistral
     }
 }
 
@@ -356,6 +367,8 @@ final class SettingsViewModel: ObservableObject {
     @Published var statusMessage = ""
     @Published var localOCRStatusMessage = ""
     @Published var isRunningLocalOCRCommand = false
+    @Published var isInstallingOllamaModel = false
+    @Published var ollamaInstallProgress: Double? = nil
     @Published var startAtLoginEnabled = false
     @Published var selectedSection: SettingsSection = .setup
 
@@ -487,7 +500,7 @@ final class SettingsViewModel: ObservableObject {
                 ? config.supernote_partner_sync_delay_seconds
                 : 15
         )
-        ocrProvider = OCRProvider(rawValue: config.ocr_provider)?.rawValue ?? OCRProvider.mistral.rawValue
+        ocrProvider = OCRProvider.normalized(from: config.ocr_provider).rawValue
         localOllamaURL = config.local_ollama_url.isEmpty ? "http://localhost:11434/api/generate" : config.local_ollama_url
         localOllamaModel = config.local_ollama_model.isEmpty ? "richardyoung/olmocr2:7b-q8" : config.local_ollama_model
         localOllamaNumCtx = String(config.local_ollama_num_ctx > 0 ? config.local_ollama_num_ctx : 8192)
@@ -501,7 +514,8 @@ final class SettingsViewModel: ObservableObject {
     func validateSettings() -> [String] {
         var errors: [String] = []
 
-        if selectedOCRProvider == .mistral {
+        switch selectedOCRProvider {
+        case .mistral:
             let trimmedKey = mistralApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
 
             if trimmedKey.isEmpty {
@@ -509,7 +523,7 @@ final class SettingsViewModel: ObservableObject {
             } else if trimmedKey.contains(" ") || trimmedKey.count < 20 {
                 errors.append("Mistral AI API key does not look valid.")
             }
-        } else {
+        case .localOllama, .hybridMarkerOlmocr:
             if localOllamaURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 errors.append("Ollama URL is missing.")
             }
@@ -526,6 +540,8 @@ final class SettingsViewModel: ObservableObject {
                 hybridMarkerCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 errors.append("Marker command is missing.")
             }
+        case .none:
+            break
         }
 
         if vaultDir.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -647,6 +663,8 @@ final class SettingsViewModel: ObservableObject {
                     && !localOllamaModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     && (parsedLocalOllamaNumCtx ?? 0) > 0
                     && !hybridMarkerCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            case .none:
+                return true
             }
         case .folders:
             return !notebooks.isEmpty
@@ -655,7 +673,7 @@ final class SettingsViewModel: ObservableObject {
 
     var selectedOCRProvider: OCRProvider {
         get {
-            OCRProvider(rawValue: ocrProvider) ?? .mistral
+            OCRProvider.normalized(from: ocrProvider)
         }
         set {
             ocrProvider = newValue.rawValue
@@ -1172,11 +1190,6 @@ final class SettingsViewModel: ObservableObject {
     func installOllamaModel() async {
         guard !isRunningLocalOCRCommand else { return }
 
-        isRunningLocalOCRCommand = true
-        defer {
-            isRunningLocalOCRCommand = false
-        }
-
         let model = localOllamaModelName
 
         guard let ollamaPath = resolveExecutable("ollama") else {
@@ -1187,19 +1200,72 @@ final class SettingsViewModel: ObservableObject {
             return
         }
 
+        isRunningLocalOCRCommand = true
+        isInstallingOllamaModel = true
+        ollamaInstallProgress = nil
         localOCRStatusMessage = "Installing Ollama model… This can take a while.\n\(model)"
+
+        final class PullStateGuard: @unchecked Sendable {
+            private let lock = NSLock()
+            private var finished = false
+
+            nonisolated init() {}
+
+            nonisolated var isFinished: Bool {
+                lock.lock()
+                defer { lock.unlock() }
+                return finished
+            }
+
+            nonisolated func markFinished() {
+                lock.lock()
+                finished = true
+                lock.unlock()
+            }
+        }
+
+        let stateGuard = PullStateGuard()
 
         let result = await runProcessCapture(
             executable: ollamaPath,
-            arguments: ["pull", model]
+            arguments: ["pull", model],
+            onOutputChunk: { [weak self] recentChunk in
+                guard !stateGuard.isFinished,
+                      let snapshot = Self.parseOllamaPullProgress(from: recentChunk)
+                else {
+                    return
+                }
+
+                Task { @MainActor [weak self] in
+                    guard let self, !stateGuard.isFinished else { return }
+                    if let fraction = snapshot.fractionCompleted {
+                        if let current = self.ollamaInstallProgress {
+                            self.ollamaInstallProgress = max(current, fraction)
+                        } else {
+                            self.ollamaInstallProgress = fraction
+                        }
+                    }
+                    if !snapshot.statusLine.isEmpty {
+                        self.localOCRStatusMessage = "Installing Ollama model: \(model)\n\(snapshot.statusLine)"
+                    }
+                }
+            }
         )
 
+        stateGuard.markFinished()
+        isInstallingOllamaModel = false
+        isRunningLocalOCRCommand = false
+
         if result.exitCode == 0 {
+            ollamaInstallProgress = 1.0
             localOCRStatusMessage = "✅ Ollama model installed: \(model)"
         } else {
+            ollamaInstallProgress = nil
+            let cleanOutput = Self.stripANSIEscapeCodes(from: result.output)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             localOCRStatusMessage = """
             ❌ Failed to install Ollama model: \(model)
-            \(result.output)
+            \(cleanOutput)
             """
         }
     }
@@ -1373,7 +1439,8 @@ final class SettingsViewModel: ObservableObject {
 
     private nonisolated func runProcessCapture(
         executable: String,
-        arguments: [String]
+        arguments: [String],
+        onOutputChunk: (@Sendable (String) -> Void)? = nil
     ) async -> (exitCode: Int32, output: String) {
         await Task.detached(priority: .userInitiated) {
             let task = Process()
@@ -1385,28 +1452,140 @@ final class SettingsViewModel: ObservableObject {
             task.standardOutput = outputPipe
             task.standardError = errorPipe
 
+            let stdoutCollector = ProcessChunkCollector(onOutputChunk: onOutputChunk)
+            let stderrCollector = ProcessChunkCollector(onOutputChunk: onOutputChunk)
+            let outputHandle = outputPipe.fileHandleForReading
+            let errorHandle = errorPipe.fileHandleForReading
+
+            outputHandle.readabilityHandler = { handle in
+                let chunk = handle.availableData
+                if chunk.isEmpty {
+                    handle.readabilityHandler = nil
+                } else {
+                    stdoutCollector.append(chunk)
+                }
+            }
+
+            errorHandle.readabilityHandler = { handle in
+                let chunk = handle.availableData
+                if chunk.isEmpty {
+                    handle.readabilityHandler = nil
+                } else {
+                    stderrCollector.append(chunk)
+                }
+            }
+
+            defer {
+                outputHandle.readabilityHandler = nil
+                errorHandle.readabilityHandler = nil
+            }
+
             do {
                 try task.run()
                 task.waitUntilExit()
 
-                let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-                let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                outputHandle.readabilityHandler = nil
+                errorHandle.readabilityHandler = nil
 
-                let output = String(data: outputData, encoding: .utf8) ?? ""
-                let error = String(data: errorData, encoding: .utf8) ?? ""
+                let remainingOut = outputHandle.readDataToEndOfFile()
+                let remainingErr = errorHandle.readDataToEndOfFile()
+
+                let output = stdoutCollector.finish(remainingChunk: remainingOut)
+                let error = stderrCollector.finish(remainingChunk: remainingErr)
                 let combined = [output, error]
                     .joined(separator: "\n")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
 
                 if combined.count > 3000 {
-                    return (task.terminationStatus, String(combined.prefix(3000)) + "\n…")
+                    return (task.terminationStatus, String(combined.suffix(3000)))
                 }
 
                 return (task.terminationStatus, combined)
             } catch {
+                outputHandle.readabilityHandler = nil
+                errorHandle.readabilityHandler = nil
                 return (-1, error.localizedDescription)
             }
         }.value
+    }
+
+    nonisolated static func stripANSIEscapeCodes(from text: String) -> String {
+        var result = text
+        let patterns = [
+            "\\u{001B}\\[[0-9;?]*[ -/]*[@-~]",
+            "\\u{001B}\\][^\\u{0007}\\u{001B}]*(?:\\u{0007}|\\u{001B}\\\\)",
+            "\\u{001B}[@-Z\\\\-_]"
+        ]
+        for pattern in patterns {
+            if let regex = try? NSRegularExpression(pattern: pattern) {
+                let range = NSRange(result.startIndex..<result.endIndex, in: result)
+                result = regex.stringByReplacingMatches(in: result, range: range, withTemplate: "")
+            }
+        }
+        return result
+    }
+
+    nonisolated static func parseOllamaPullProgress(
+        from rawChunk: String
+    ) -> (fractionCompleted: Double?, statusLine: String)? {
+        // Turn cursor-positioning CSI sequences into carriage returns so line updates split cleanly.
+        var normalized = rawChunk
+        if let cursorRegex = try? NSRegularExpression(pattern: "\\u{001B}\\[[0-9;]*[GKJ]") {
+            let range = NSRange(normalized.startIndex..<normalized.endIndex, in: normalized)
+            normalized = cursorRegex.stringByReplacingMatches(in: normalized, range: range, withTemplate: "\r")
+        }
+
+        let stripped = stripANSIEscapeCodes(from: normalized)
+        let rawSegments = stripped.components(separatedBy: CharacterSet(charactersIn: "\r\n"))
+
+        var latestStatusLine = ""
+        var latestFraction: Double? = nil
+        let percentRegex = try? NSRegularExpression(pattern: "(?:^|\\s)(\\d{1,3})\\s*%")
+        let barRegex = try? NSRegularExpression(pattern: "(?:▕[^▏]*▏|\\[[=#>\\s.-]+\\]|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏])")
+        let spaceRegex = try? NSRegularExpression(pattern: "\\s{2,}")
+
+        for segment in rawSegments {
+            var cleaned = segment
+            if let barRegex {
+                let range = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
+                cleaned = barRegex.stringByReplacingMatches(in: cleaned, range: range, withTemplate: " ")
+            }
+            if let spaceRegex {
+                let range = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
+                cleaned = spaceRegex.stringByReplacingMatches(in: cleaned, range: range, withTemplate: " ")
+            }
+            cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleaned.isEmpty else { continue }
+
+            latestStatusLine = cleaned
+
+            if let percentRegex {
+                let range = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
+                let matches = percentRegex.matches(in: cleaned, range: range)
+                if let lastMatch = matches.last,
+                   lastMatch.numberOfRanges > 1,
+                   let valueRange = Range(lastMatch.range(at: 1), in: cleaned),
+                   let percentValue = Int(cleaned[valueRange]) {
+                    let clamped = min(max(percentValue, 0), 100)
+                    latestFraction = Double(clamped) / 100.0
+                }
+            }
+
+            let lower = cleaned.lowercased()
+            if lower.contains("verifying sha256")
+                || lower.contains("writing manifest")
+                || lower == "success" {
+                latestFraction = 1.0
+            } else if lower.contains("pulling manifest") && latestFraction == nil {
+                latestFraction = 0.0
+            }
+        }
+
+        guard !latestStatusLine.isEmpty || latestFraction != nil else {
+            return nil
+        }
+
+        return (latestFraction, latestStatusLine)
     }
 
     private static func slugify(_ value: String) -> String {
@@ -1940,6 +2119,17 @@ struct SettingsView: View {
 
                     localOCRActionButtons()
                 }
+
+            case .none:
+                VStack(alignment: .leading, spacing: 12) {
+                    providerExplanation([
+                        "OCR disabled.",
+                        "Converts each Supernote .note file into a PDF attachment.",
+                        "Automatically creates a companion Markdown note with frontmatter and a ![[<Note>.pdf]] embed.",
+                        "Preserves existing manually edited Markdown notes.",
+                        "Does not require a Mistral API key, Ollama, or Marker."
+                    ])
+                }
             }
         }
     }
@@ -2035,7 +2225,31 @@ struct SettingsView: View {
                 }
             }
 
-            if model.isRunningLocalOCRCommand {
+            if model.isInstallingOllamaModel {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Downloading & installing Ollama model…")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+
+                        Spacer()
+
+                        if let progress = model.ollamaInstallProgress {
+                            Text("\(Int((progress * 100).rounded()))%")
+                                .font(.system(.footnote, design: .monospaced))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+
+                    if let progress = model.ollamaInstallProgress {
+                        ProgressView(value: progress, total: 1.0)
+                            .progressViewStyle(.linear)
+                    } else {
+                        ProgressView()
+                            .progressViewStyle(.linear)
+                    }
+                }
+            } else if model.isRunningLocalOCRCommand {
                 HStack(spacing: 8) {
                     ProgressView()
                         .controlSize(.small)
@@ -2639,5 +2853,56 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         model.load()
         model.selectedSection = .setup
         show()
+    }
+}
+
+nonisolated final class ProcessChunkCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var collectedData = Data()
+    private let maxStoredBytes = 32_768
+    private let recentWindowBytes = 2_048
+    private let onOutputChunk: (@Sendable (String) -> Void)?
+
+    nonisolated init(onOutputChunk: (@Sendable (String) -> Void)?) {
+        self.onOutputChunk = onOutputChunk
+    }
+
+    nonisolated func append(_ chunk: Data) {
+        guard !chunk.isEmpty else { return }
+
+        let recentText: String
+        lock.lock()
+        collectedData.append(chunk)
+        if collectedData.count > maxStoredBytes {
+            collectedData.removeFirst(collectedData.count - maxStoredBytes)
+        }
+        let windowData = collectedData.suffix(recentWindowBytes)
+        recentText = String(decoding: windowData, as: UTF8.self)
+        lock.unlock()
+
+        onOutputChunk?(recentText)
+    }
+
+    nonisolated func finish(remainingChunk: Data = Data()) -> String {
+        let finalText: String
+        var trailingWindowText: String?
+
+        lock.lock()
+        if !remainingChunk.isEmpty {
+            collectedData.append(remainingChunk)
+            if collectedData.count > maxStoredBytes {
+                collectedData.removeFirst(collectedData.count - maxStoredBytes)
+            }
+            let windowData = collectedData.suffix(recentWindowBytes)
+            trailingWindowText = String(decoding: windowData, as: UTF8.self)
+        }
+        finalText = String(decoding: collectedData, as: UTF8.self)
+        lock.unlock()
+
+        if let trailingWindowText {
+            onOutputChunk?(trailingWindowText)
+        }
+
+        return finalText
     }
 }

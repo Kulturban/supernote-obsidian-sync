@@ -743,3 +743,172 @@ def test_nested_html_table_is_left_unchanged(load_sync_module) -> None:
     assert converted == html
     assert converted_count == 0
     assert unchanged_count == 1
+
+
+def test_file_stability_waits_for_ongoing_write_in_first_sync(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module()
+    source_dir = tmp_path / "source"
+    source_dir.mkdir(parents=True)
+    note_file = source_dir / "FreshSync.note"
+    note_file.write_bytes(b"partial")
+
+    monkeypatch.setattr(module, "SOURCE_DIR", source_dir)
+    monkeypatch.setattr(module, "OBSIDIAN_NOTE_DIR", tmp_path / "vault" / "notes")
+    monkeypatch.setattr(module, "PDF_DIR", tmp_path / "vault" / "attachments")
+    monkeypatch.setattr(module, "ACTIVE_ATTACHMENT_FOLDER", "Attachments/Test")
+    monkeypatch.setattr(module, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(module, "OPEN_REQUIRES_OBSIDIAN_RUNNING", False)
+    monkeypatch.setattr(module, "FILE_STABILITY_WAIT_SECONDS", 1)
+    monkeypatch.setattr(module, "OCR_PROVIDER", "none")
+
+    sleep_calls = 0
+
+    def fake_sleep(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 1:
+            note_file.write_bytes(b"complete-note-payload")
+
+    def fake_convert(_note_file: Path, pdf_file: Path) -> None:
+        pdf_file.parent.mkdir(parents=True, exist_ok=True)
+        pdf_file.write_bytes(b"pdf-bytes")
+
+    monkeypatch.setattr(module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(module, "convert_note_to_pdf", fake_convert)
+
+    module.scan_active_notebook_once()
+
+    md_file = tmp_path / "vault" / "notes" / "FreshSync.md"
+    assert sleep_calls == 2
+    assert md_file.exists()
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert state[str(note_file)] == module.note_state_signature(note_file)
+
+
+def test_process_note_without_ocr_creates_md_with_frontmatter_and_preserves_manual_edits(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module({"ocr_provider": "none"})
+    source_dir = tmp_path / "source"
+    source_dir.mkdir(parents=True)
+    note_file = source_dir / "Sketch.note"
+    note_file.write_bytes(b"note-v1")
+
+    monkeypatch.setattr(module, "SOURCE_DIR", source_dir)
+    monkeypatch.setattr(module, "OBSIDIAN_NOTE_DIR", tmp_path / "vault" / "notes")
+    monkeypatch.setattr(module, "PDF_DIR", tmp_path / "vault" / "attachments")
+    monkeypatch.setattr(module, "ACTIVE_ATTACHMENT_FOLDER", "Attachments/Test")
+
+    def fake_convert(_note_file: Path, pdf_file: Path) -> None:
+        pdf_file.parent.mkdir(parents=True, exist_ok=True)
+        pdf_file.write_bytes(b"pdf-content")
+
+    monkeypatch.setattr(module, "convert_note_to_pdf", fake_convert)
+
+    module.process_note(note_file)
+
+    md_file = tmp_path / "vault" / "notes" / "Sketch.md"
+    pdf_file = tmp_path / "vault" / "attachments" / "Sketch" / "Sketch.pdf"
+    assert pdf_file.exists()
+    assert md_file.exists()
+    content = md_file.read_text(encoding="utf-8")
+    assert content.startswith("---\n")
+    assert 'title: "Sketch"' in content
+    assert "ocr: false" in content
+    assert "![[Sketch.pdf]]" in content
+
+    manual_content = content + "\n## Manual user notes\nDo not overwrite me.\n"
+    md_file.write_text(manual_content, encoding="utf-8")
+    note_file.write_bytes(b"note-v2")
+
+    module.process_note(note_file)
+
+    assert md_file.read_text(encoding="utf-8") == manual_content
+
+
+def test_process_note_writes_no_intermediate_files_into_vault_during_ocr(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module()
+    source_dir = tmp_path / "source"
+    source_dir.mkdir(parents=True)
+    note_file = source_dir / "CleanVault.note"
+    note_file.write_bytes(b"note")
+
+    vault_notes_dir = tmp_path / "vault" / "notes"
+    vault_attachments_dir = tmp_path / "vault" / "attachments"
+    monkeypatch.setattr(module, "SOURCE_DIR", source_dir)
+    monkeypatch.setattr(module, "OBSIDIAN_NOTE_DIR", vault_notes_dir)
+    monkeypatch.setattr(module, "PDF_DIR", vault_attachments_dir)
+    monkeypatch.setattr(module, "ACTIVE_ATTACHMENT_FOLDER", "Attachments/Test")
+    monkeypatch.setattr(module, "OCR_PROVIDER", "mistral")
+
+    vault_files_during_ocr: list[Path] = []
+
+    def fake_convert(_note_file: Path, pdf_file: Path) -> None:
+        pdf_file.parent.mkdir(parents=True, exist_ok=True)
+        pdf_file.write_bytes(b"pdf")
+
+    def fake_ocr_pdf(_pdf_file: Path, _image_dir: Path, _obsidian_image_folder: str) -> str:
+        vault_root = tmp_path / "vault"
+        if vault_root.exists():
+            vault_files_during_ocr.extend(
+                path for path in vault_root.rglob("*") if path.is_file()
+            )
+        return "## Page 1\n\nRecognized text\n"
+
+    monkeypatch.setattr(module, "convert_note_to_pdf", fake_convert)
+    monkeypatch.setattr(module, "ocr_pdf", fake_ocr_pdf)
+
+    module.process_note(note_file)
+
+    assert vault_files_during_ocr == []
+    assert not (vault_notes_dir / "CleanVault.note").exists()
+    assert (vault_notes_dir / "CleanVault.md").exists()
+    assert (vault_attachments_dir / "CleanVault" / "CleanVault.pdf").exists()
+
+
+def test_scan_once_with_folder_option_scans_only_selected_notebook(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module()
+    notebooks = [
+        {
+            "name": "Psychomotorik",
+            "source_dir": str(tmp_path / "source_a"),
+            "obsidian_note_folder": "Psychomotorik",
+            "attachment_folder": "Attachments/Psychomotorik",
+            "state_file": "processed_a.json",
+        },
+        {
+            "name": "Didaktik",
+            "source_dir": str(tmp_path / "source_b"),
+            "obsidian_note_folder": "Didaktik",
+            "attachment_folder": "Attachments/Didaktik",
+            "state_file": "processed_b.json",
+        },
+    ]
+    monkeypatch.setattr(module, "NOTEBOOKS", notebooks)
+
+    scanned: list[str] = []
+    monkeypatch.setattr(
+        module,
+        "scan_active_notebook_once",
+        lambda: scanned.append(module.ACTIVE_NOTEBOOK["name"]),
+    )
+
+    module.scan_once(folder_name="didaktik")
+    assert scanned == ["Didaktik"]
+
+    with pytest.raises(SystemExit, match="Configured folder not found"):
+        module.scan_once(folder_name="NonExistentFolder")
