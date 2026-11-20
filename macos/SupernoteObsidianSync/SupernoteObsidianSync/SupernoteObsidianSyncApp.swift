@@ -16,14 +16,10 @@ struct MenuSetupStatusView: View {
     var body: some View {
         Group {
             if runner.isSyncing {
-                Button {
-                    runner.showActiveSyncWindow()
-                } label: {
-                    if let fraction = runner.syncFractionCompleted {
-                        Text("🔄 Syncing (\(Int((fraction * 100).rounded()))%) — Show Window")
-                    } else {
-                        Text("🔄 Syncing… — Show Window")
-                    }
+                if let fraction = runner.syncFractionCompleted {
+                    Text("🔄 Syncing (\(Int((fraction * 100).rounded()))%)")
+                } else {
+                    Text("🔄 Syncing…")
                 }
 
                 if !runner.syncStageSummary.isEmpty {
@@ -39,8 +35,12 @@ struct MenuSetupStatusView: View {
                 }
 
                 if !runner.lastSyncSummary.isEmpty {
-                    Button(runner.lastSyncSummary) {
-                        runner.showActiveSyncWindow()
+                    if runner.lastSyncFailed {
+                        Button(runner.lastSyncSummary) {
+                            runner.showLastSyncDetails()
+                        }
+                    } else {
+                        Text(runner.lastSyncSummary)
                     }
                 }
             } else {
@@ -56,11 +56,6 @@ struct MenuSetupStatusView: View {
             Divider()
 
             Button(runner.isSyncing ? "Sync Now (Running…)" : "Sync Now") {
-                if runner.isSyncing {
-                    runner.showActiveSyncWindow()
-                    return
-                }
-
                 let currentModel = SettingsViewModel()
 
                 if currentModel.setupReady {
@@ -69,6 +64,7 @@ struct MenuSetupStatusView: View {
                     SettingsWindowController.shared.showSetup()
                 }
             }
+            .disabled(runner.isSyncing)
 
             Menu("Sync Folder") {
                 if model.notebooks.isEmpty {
@@ -82,11 +78,6 @@ struct MenuSetupStatusView: View {
                             : notebook.name.trimmingCharacters(in: .whitespacesAndNewlines)
 
                         Button(folderName) {
-                            if runner.isSyncing {
-                                runner.showActiveSyncWindow()
-                                return
-                            }
-
                             let currentModel = SettingsViewModel()
 
                             if currentModel.setupReady {
@@ -95,16 +86,12 @@ struct MenuSetupStatusView: View {
                                 SettingsWindowController.shared.showSetup()
                             }
                         }
+                        .disabled(runner.isSyncing)
                     }
 
                     Divider()
 
                     Button("Sync All Folders") {
-                        if runner.isSyncing {
-                            runner.showActiveSyncWindow()
-                            return
-                        }
-
                         let currentModel = SettingsViewModel()
 
                         if currentModel.setupReady {
@@ -113,12 +100,7 @@ struct MenuSetupStatusView: View {
                             SettingsWindowController.shared.showSetup()
                         }
                     }
-                }
-            }
-
-            if runner.hasSyncWindow {
-                Button("Show Sync Status Window") {
-                    runner.showActiveSyncWindow()
+                    .disabled(runner.isSyncing)
                 }
             }
         }
@@ -193,9 +175,8 @@ final class CommandRunner: ObservableObject {
     @Published var syncStageSummary = ""
     @Published var syncContextSummary = ""
     @Published var lastSyncSummary = ""
-    @Published var hasSyncWindow = false
+    @Published var lastSyncFailed = false
 
-    private var activeSyncWindow: OutputWindowController?
     private var lastSyncTitle = "Sync Now"
     private var lastSyncText = ""
     private var windowControllers: [OutputWindowController] = []
@@ -213,25 +194,13 @@ final class CommandRunner: ObservableObject {
 
     private init() {}
 
-    func showActiveSyncWindow() {
-        if let activeSyncWindow {
-            activeSyncWindow.bringToFront()
-        } else if !lastSyncText.isEmpty {
-            let reopened = OutputWindowController.show(
-                title: lastSyncTitle,
-                output: lastSyncText,
-                reuseExisting: true
-            )
-            reopened.updateProgress(
-                isRunning: isSyncing,
-                fraction: syncFractionCompleted,
-                label: isSyncing ? syncStageSummary : lastSyncSummary,
-                context: syncContextSummary
-            )
-            reopened.bringToFront()
-            activeSyncWindow = reopened
-            hasSyncWindow = true
-        }
+    func showLastSyncDetails() {
+        guard !lastSyncText.isEmpty else { return }
+        _ = OutputWindowController.show(
+            title: lastSyncTitle,
+            output: lastSyncText,
+            reuseExisting: true
+        )
     }
 
     private func initialOutput(for arguments: [String], title: String) -> String {
@@ -338,43 +307,12 @@ final class CommandRunner: ObservableObject {
         syncContextSummary = trimmedFolder.map { "Folder: \($0)" } ?? "All configured folders"
         lastSyncTitle = windowTitle
         lastSyncText = syncRunningOutput
-        hasSyncWindow = true
-
-        let outputWindow = OutputWindowController.show(
-            title: windowTitle,
-            output: syncRunningOutput,
-            reuseExisting: true
-        )
-        activeSyncWindow = outputWindow
-        outputWindow.updateProgress(
-            isRunning: true,
-            fraction: nil,
-            label: "Preparing sync…",
-            context: syncContextSummary
-        )
+        lastSyncFailed = false
 
         Task {
             if shouldOpenPartner {
                 await MainActor.run {
-                    let partnerWaitLabel = "Opening Supernote Partner and waiting \(delaySeconds)s…"
-                    self.syncStageSummary = partnerWaitLabel
-                    outputWindow.updateProgress(
-                        isRunning: true,
-                        fraction: nil,
-                        label: partnerWaitLabel,
-                        context: self.syncContextSummary
-                    )
-                    let waitingText = """
-                    \(windowTitle)
-
-                    Opening Supernote Partner…
-                    App/path:
-                    \(partnerApp)
-
-                    Waiting \(delaySeconds) second(s) before Supsidian sync starts.
-                    """
-                    self.lastSyncText = waitingText
-                    outputWindow.update(text: waitingText)
+                    self.syncStageSummary = "Opening Supernote Partner and waiting \(delaySeconds)s…"
                 }
 
                 let openResult = await CommandRunner.openApplicationOrPath(partnerApp)
@@ -383,15 +321,10 @@ final class CommandRunner: ObservableObject {
                         self.isSyncing = false
                         self.syncFractionCompleted = nil
                         self.syncStageSummary = ""
-                        self.lastSyncSummary = "❌ Could not open Supernote Partner"
+                        self.lastSyncSummary = "❌ Could not open Supernote Partner — Show Details"
+                        self.lastSyncFailed = true
                         self.lastSyncText = openResult.displayText
-                        outputWindow.updateProgress(
-                            isRunning: false,
-                            fraction: nil,
-                            label: "Could not open Supernote Partner",
-                            context: self.syncContextSummary
-                        )
-                        outputWindow.update(text: openResult.displayText)
+                        self.showLastSyncDetails()
                     }
                     return
                 }
@@ -416,16 +349,7 @@ final class CommandRunner: ObservableObject {
                 }
 
                 await MainActor.run {
-                    let lookingLabel = "Looking for changed Supernote notes…"
-                    self.syncStageSummary = lookingLabel
-                    self.lastSyncText = syncRunningOutput
-                    outputWindow.updateProgress(
-                        isRunning: true,
-                        fraction: nil,
-                        label: lookingLabel,
-                        context: self.syncContextSummary
-                    )
-                    outputWindow.update(text: syncRunningOutput)
+                    self.syncStageSummary = "Looking for changed Supernote notes…"
                 }
             }
 
@@ -440,13 +364,6 @@ final class CommandRunner: ObservableObject {
                         self.syncStageSummary = progressTracker.currentStageDescription
                         self.syncContextSummary = progressTracker.currentContextSummary
                         self.lastSyncText = progressText
-                        outputWindow.updateProgress(
-                            isRunning: true,
-                            fraction: progressTracker.fractionCompleted,
-                            label: progressTracker.currentStageDescription,
-                            context: progressTracker.currentContextSummary
-                        )
-                        outputWindow.update(text: progressText)
                     }
                 }
             )
@@ -456,6 +373,7 @@ final class CommandRunner: ObservableObject {
                 self.isSyncing = false
                 self.syncFractionCompleted = result.succeeded ? 1.0 : nil
                 self.lastSyncText = result.displayText
+                self.lastSyncFailed = !result.succeeded
 
                 let summaryLabel: String
                 if result.succeeded {
@@ -473,13 +391,9 @@ final class CommandRunner: ObservableObject {
                 self.lastSyncSummary = summaryLabel
                 self.syncStageSummary = summaryLabel
 
-                outputWindow.updateProgress(
-                    isRunning: false,
-                    fraction: result.succeeded ? 1.0 : nil,
-                    label: summaryLabel,
-                    context: progressTracker.currentContextSummary
-                )
-                outputWindow.update(text: result.displayText)
+                if !result.succeeded {
+                    self.showLastSyncDetails()
+                }
             }
         }
     }
