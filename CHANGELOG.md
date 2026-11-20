@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.12.1
+
+- Added a visual progress bar header to the macOS **Sync Now** window and live sync status directly at the top of the menu bar menu.
+- Kept the **Sync Now** window floating while a sync is running, disabled duplicate window tabs, and added a **Show Sync Status Window** menu action.
+- Added the `--folder` CLI option and a **Sync Folder** submenu in the macOS menu bar app to sync individual Supernote folders.
+- Added the **No OCR (PDF Embed Only)** option (`ocr_provider: "none"`) to create companion Markdown notes with YAML frontmatter and `![[<Note>.pdf]]` embeds without overwriting manual edits.
+- Improved file stability checks across multiple intervals so freshly synced `.note` files are processed on the first **Sync Now** run.
+- Staged PDF conversion and OCR outside the Obsidian vault and wrote outputs atomically so no temporary `.note` or incomplete files appear in Obsidian during OCR.
+- Fixed Ollama model pull progress parsing across carriage-return (`\r`) and ANSI updates with a linear progress bar.
+
 ## v0.12.0
 
 - Added machine-readable `SUSPIDIAN_PROGRESS:` events to the CLI and live progress streaming in the macOS **Sync Now** output window.
