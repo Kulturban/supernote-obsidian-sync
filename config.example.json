@@ -1,14 +1,37 @@
 {
-  "source_dir": "/Users/YOUR_USERNAME/Library/Containers/com.ratta.supernote/Data/Library/Application Support/com.ratta.supernote/YOUR_SUPERNOTE_ID/Supernote/Note/YOUR_NOTEBOOK_OR_FOLDER",
   "vault_dir": "/Users/YOUR_USERNAME/Documents/Obsidian Vault",
-  "obsidian_note_folder": "Supernote",
-  "attachment_folder": "Attachments/Supernote",
-  "state_file": "local/processed_notes.json",
+  "supernote_tool_path": "/opt/homebrew/bin/supernote-tool",
   "check_interval_seconds": 60,
   "file_stability_wait_seconds": 10,
-  "supernote_tool_path": "/Users/YOUR_USERNAME/supernote-automation/.venv/bin/supernote-tool",
+  "open_requires_obsidian_running": true,
+  "open_supernote_partner_before_sync": false,
+  "supernote_partner_app": "Supernote Partner",
+  "supernote_partner_sync_delay_seconds": 15,
+  "ocr_provider": "gemini",
+  "ocr_model": "gemini-4-hydrogen",
+  "ocr_reasoning_effort": "low",
+  "local_ollama_url": "http://localhost:11434/api/generate",
+  "local_ollama_model": "qwen3-vl:8b-instruct",
+  "local_ollama_num_ctx": 8192,
+  "local_ollama_unload_after_note": true,
+  "hybrid_marker_command": "marker_single",
   "task_marker": "#",
   "task_tag": "#task",
-  "open_requires_obsidian_running": true
+  "custom_ocr_instructions": [
+    {
+      "id": "task-conversion",
+      "name": "Task Conversion",
+      "enabled": true,
+      "instruction": "If a handwritten line starts with '#', convert it into an Obsidian task checkbox line: '- [ ] #task <text>' (preserving the original task text)."
+    }
+  ],
+  "notebooks": [
+    {
+      "name": "Supernote",
+      "source_dir": "/Users/YOUR_USERNAME/Library/Containers/com.ratta.supernote/Data/Library/Application Support/com.ratta.supernote/YOUR_SUPERNOTE_ID/Supernote/Note/YOUR_NOTEBOOK_OR_FOLDER",
+      "obsidian_note_folder": "Supernote",
+      "attachment_folder": "Attachments/Supernote",
+      "state_file": "processed_supernote.json"
+    }
+  ]
 }
-

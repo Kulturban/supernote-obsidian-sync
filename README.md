@@ -1,422 +1,172 @@
 # Supsidian
 
-**Supernote → Obsidian Sync**
+**Supernote → Obsidian Sync for macOS**
 
-Supsidian is a macOS menu bar app and command-line tool for syncing handwritten Supernote notes into an Obsidian vault.
+Supsidian is a lightweight macOS menu bar app and Python CLI that turns handwritten Supernote `.note` files into searchable Obsidian Markdown notes — complete with PDF attachments, automatically cropped hand-drawn sketches and diagrams, page-level incremental syncing, and customizable OCR instruction tabs.
 
-It converts Supernote `.note` files into PDFs, recognizes them with your selected OCR provider, saves the text as Markdown, preserves extracted visuals where available, and can convert handwritten task markers into Obsidian tasks.
+---
 
 ## Highlights
 
-* macOS menu bar app
-* Manual **Sync Now** action
-* Multi-folder Supernote → Obsidian mappings
-* Mistral and local OCR provider options
-* Optional **Custom OCR Instruction**
-* PDF attachments saved directly into your Obsidian vault
-* Extracted OCR images embedded in Markdown
-* Task conversion for handwritten task markers (works with Obsidian's "Task" plugin)
-* First-time setup flow
-* Diagnostics and log access
-* Runs as a menu-bar-only app and stays hidden from the Dock
+- **Menu Bar App with Live Progress:** Runs quietly in the macOS menu bar (hidden from the Dock) and displays live sync progress (`🔄 Supsidian 40%`) directly in the menu bar and dropdown without intrusive popup windows.
+- **Sync All, Sync Folder, or Sync a Single File:**
+  - **Sync Now:** Sync all configured Supernote folders.
+  - **Sync Folder → `<Folder>` → `Sync Entire Folder`:** Sync one specific folder.
+  - **Sync Folder → `<Folder>` → `<Note.note>`:** Sync a single `.note` file on demand.
+- **Page-Level Incremental Sync:** Hashes rendered PDF pages locally (`SHA-256`) so only newly added or modified pages are sent to OCR. Unchanged `## Page N` sections — including your manual edits in Obsidian — are preserved in place.
+- **Cloud & Local OCR Providers (v0.13.5):**
+  - **Google Gemini** (`gemini-4-hydrogen` default, plus `gemini-3.5-flash-lite`, `gemini-3.8-flash`, `gemini-4-neon`, `gemini-4-argon`, `gemini-4-carbon`)
+  - **Anthropic Claude** (`claude-sonnet-5-5` default, plus `claude-haiku-5-5`, `claude-opus-5-5`, `claude-fable-5-2`)
+  - **OpenAI** (`gpt-6.1-terra` default, plus `gpt-6-luna`, `gpt-6.2-sol`, `gpt-6.2-astra`)
+  - **Mistral OCR** (`mistral-ocr-latest`)
+  - **Local Ollama** (`qwen3-vl:8b-instruct` recommended for 16 GB Macs, or `richardyoung/olmocr2:7b-q8`)
+  - **Hybrid Marker + Ollama (Experimental)** (sequential RAM unload before Marker + local Qwen3-VL sketch fallback)
+  - **No OCR (PDF Embed Only)** (generates companion `.md` with YAML frontmatter and `![[<Note>.pdf]]` embed)
+- **Automatic Sketch & Diagram Cropping:** Cloud VLM providers and Qwen3-VL detect hand-drawn sketches, diagrams, and charts via normalized bounding boxes (`0..1000`). Supsidian crops them **locally with Pillow** (adding a safety margin and trimming excess whitespace) and embeds them as `![[.../extracted_visuals/page-NNN-visual-MMM.jpeg]]` at the exact vertical reading position.
+- **Tabbed Custom OCR Instructions:** Organize custom prompt rules in horizontal tabs under **Settings → OCR** (including built-in **Task Conversion**: `# Buy milk` → `- [ ] #task Buy milk`). Toggle, edit, save (`.json`/`.txt`), and load instruction tabs — applied across every OCR provider.
+- **Privacy & Data Minimization:** Unchanged and blank pages are filtered 100% locally. Cloud VLM requests send only metadata-free page bitmaps (no filenames, folder paths, usernames, or full PDFs), and `config.json` / `.env` are written with restricted `0600` permissions.
 
-## Installation
+---
 
-### 1. Install the command-line tool
+## Download & Installation
 
-```
+### Option A: Direct Download from GitHub Releases (Recommended)
+
+1. Download **`Supsidian-0.13.5-macOS.zip`** from the [latest GitHub Release](https://github.com/Kulturban/supernote-obsidian-sync/releases/tag/v0.13.5).
+2. Unzip and move **`Supsidian.app`** into `/Applications`.
+3. Install the Python CLI backend (and `supernote-tool` converter):
+   ```bash
+   git clone https://github.com/Kulturban/supernote-obsidian-sync.git ~/supernote-obsidian-sync
+   cd ~/supernote-obsidian-sync
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install -e .
+   ```
+4. Remove the macOS Gatekeeper quarantine flag (required once for unsigned builds) and launch **Supsidian**:
+   ```bash
+   xattr -dr com.apple.quarantine /Applications/Supsidian.app
+   open -a Supsidian
+   ```
+
+### Option B: Homebrew
+
+```bash
 brew install kulturban/supernote-obsidian-sync/supernote-obsidian-sync
-```
-
-### 2. Install Supsidian
-
-```
 brew install --cask kulturban/supernote-obsidian-sync/supsidian
-```
-
-### 3. Open Supsidian
-
-```
 open -a Supsidian
 ```
 
-Supsidian runs as a menu bar app. It does not appear in the Dock.
+---
 
-## First setup
+## First-Time Setup
 
-After opening Supsidian, click the menu bar icon and open **Settings**.
+Click the **Supsidian** icon in the macOS menu bar and choose **Settings…**:
 
-The setup will guide you through:
+1. **Obsidian Settings:** Select your **Obsidian vault** root folder and click **Auto-detect** (or **Choose…**) for `supernote-tool`.
+2. **Folders:** Add each Supernote folder as a horizontal tab (**+ New Folder**) and choose its target Markdown and attachment folders inside your vault.
+3. **OCR:** Choose your preferred OCR provider:
+   - For **Google Gemini / Anthropic Claude / OpenAI**: Enter your API key, pick a model preset (or click **Load Available Models** to query live model IDs from the API), keep **Reasoning / Thinking effort** on `Low (Empfohlen)` for fast, low-cost OCR, and click **Test Connection**.
+   - For **Local Ollama / Hybrid Marker + Ollama**: Select **`qwen3-vl:8b-instruct (Recommended — 16 GB)`** (or `richardyoung/olmocr2:7b-q8`) and click **Install Ollama Model** / **Check Local OCR Setup**.
+4. Click **Save Settings**, then run **Sync Now** (or **Sync Folder**) from the menu bar.
 
-1. Choosing your Obsidian vault
-2. Choosing the `supernote-tool` path
-3. Choosing an OCR strategy
-4. Adding a Mistral API key only when using Mistral
-5. Adding one or more Supernote folders
+---
 
-After setup, use **Sync Now** from the menu bar.
+## OCR Providers Overview
 
-## How it works
+| Provider (`ocr_provider`) | Runs Where | Visual / Sketch Extraction | Best For |
+| :--- | :--- | :--- | :--- |
+| `gemini` | Cloud (Google) | Bounding-Box + local Pillow crop | Fast, high-accuracy handwriting & sketches (`gemini-4-hydrogen`) |
+| `claude` | Cloud (Anthropic) | Bounding-Box + local Pillow crop | Complex structured notes (`claude-sonnet-5-5`) |
+| `openai` | Cloud (OpenAI) | Bounding-Box + local Pillow crop | Visual reasoning & precise coordinates (`gpt-6.1-terra`) |
+| `mistral` | Cloud (Mistral) | Native Mistral OCR image assets | Fast full-PDF cloud OCR (`mistral-ocr-latest`) |
+| `local_ollama` | 100% Local (Mac) | Text transcription | Private local handwriting OCR (`qwen3-vl:8b-instruct`) |
+| `hybrid_marker_olmocr` | 100% Local (Mac) | Marker crops + Qwen3-VL fallback | Local OCR with diagram/sketch extraction on 16 GB+ Macs |
+| `none` | 100% Local (Mac) | Full PDF embed (`![[Note.pdf]]`) | Instant PDF sync with companion Markdown frontmatter |
 
-Supsidian uses this basic workflow:
+> **Important Note for Local Qwen3-VL on Ollama:** Always use **`qwen3-vl:8b-instruct`** (the non-thinking instruct variant) rather than `qwen3-vl:8b`, so Ollama writes the transcription directly without spending tokens in thinking mode.
 
-```
-Supernote .note file
-→ PDF conversion
-→ Selected OCR provider
-→ Markdown note in Obsidian
-→ Original PDF and extracted visuals saved as attachments
-```
+---
 
-The original Supernote note is not edited. Supsidian creates Markdown output inside your Obsidian vault.
+## Custom OCR Instructions & Task Conversion
 
-## OCR providers
+Under **Settings → OCR → Custom OCR Instructions**, each horizontal tab defines a rule that is automatically appended to every OCR run regardless of the active provider:
 
-Supsidian supports three OCR providers. New interactive setup defaults to local Ollama; existing configurations without an explicit provider continue using Mistral for compatibility.
+- **Task Conversion (included by default):**
+  ```text
+  # Buy milk
+  ```
+  becomes an Obsidian task checkbox:
+  ```markdown
+  - [ ] #task Buy milk
+  ```
+- **Custom Tabs:** Click **+ New Instruction** to add rules (e.g. math formatting, language hints, or heading structure). Use **Save…** and **Load…** to export or import instruction presets as `.json` or `.txt`.
 
-### local_ollama
+---
 
-`local_ollama` is the local OCR option. Supsidian renders each page and sends the rendered page image only to Ollama running on your own machine.
+## Privacy & Security Architecture
 
-It requires:
+When using external cloud providers (`gemini`, `claude`, `openai`), Supsidian minimizes transmitted data automatically:
 
-* [Ollama](https://ollama.com/)
-* PyMuPDF in the active Supsidian Python environment
-* the `richardyoung/olmocr2:7b-q8` model
+1. **Page-Level SHA-256 Cache:** Unchanged pages are matched locally against `cache.json` and never re-uploaded.
+2. **Local Blank-Page Filtering:** Empty or near-blank template pages (`< 0.03%` ink) are detected locally and skipped without an API request.
+3. **Metadata-Free Bitmaps:** Only a freshly encoded RGB PNG of the changed page (capped at `1800 px` on the longest edge) is sent — no `.note` files, no full PDFs, no file names, no folder paths, and no EXIF chunks.
+4. **Local Pillow Cropping:** The cloud model only returns numeric coordinates (`[ymin, xmin, ymax, xmax]`). All sketch cropping and whitespace trimming happen locally on your Mac.
+5. **Restricted Credentials (`0600`):** API keys in `~/Library/Application Support/Supernote Obsidian Sync/config.json` and `.env` are written with POSIX `0600` owner-only permissions (or can be supplied via `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `MISTRAL_API_KEY`).
 
-Pull the default model with:
+---
 
-```
-ollama pull richardyoung/olmocr2:7b-q8
-```
+## Command-Line Interface (`supernote-obsidian-sync`)
 
-By default, Supsidian unloads the Ollama model after each processed note to free memory on 16 GB Macs. You can disable this for faster batch processing with `local_ollama_unload_after_note: false`.
-
-The first local OCR run for a note can still be slow because every page needs OCR. Later runs are much faster when pages are unchanged; if only one page changed, Supsidian can reuse cached OCR for the unchanged pages.
-
-### mistral
-
-`mistral` is the cloud OCR option and the best compatibility choice for existing configurations. It sends note/PDF content to Mistral's OCR API and requires a `MISTRAL_API_KEY`.
-
-### hybrid_marker_olmocr
-
-`hybrid_marker_olmocr` is an **Experimental** backend option for advanced users. It combines local Ollama/olmOCR text recognition with Marker layout and visual extraction. When Marker identifies drawings or other visual assets, Supsidian copies the cropped asset into the note attachment folder and embeds it near its document position in Obsidian.
-
-It requires all `local_ollama` prerequisites plus `marker_single` on the runtime PATH. It is available in interactive setup as an **Experimental** option, and advanced users can also select it manually in `config.json`.
-
-Hybrid mode also uses the page-level cache for Ollama text. Marker is used only for visual/layout enrichment and is run on changed pages when cache information is available.
-
-If the app or LaunchAgent PATH does not include `marker_single`, set `hybrid_marker_command` to its absolute path:
-
-```json
-{
-  "ocr_provider": "hybrid_marker_olmocr",
-  "hybrid_marker_command": "/absolute/path/to/marker_single"
-}
-```
-
-### Privacy
-
-`local_ollama` and `hybrid_marker_olmocr` do not send note pages to Mistral. They rely on Ollama and, for hybrid mode, Marker running on your own machine. `mistral` sends note/PDF content to Mistral's API. Local processing depends on how your local tools and machine are configured, so Supsidian does not describe it as fully private.
-
-### Selecting a provider in config.json
-
-Interactive setup offers `local_ollama`, `mistral`, and `hybrid_marker_olmocr`. You can also select a provider manually in:
-
-```
-~/Library/Application Support/Supernote Obsidian Sync/config.json
-```
-
-Example local Ollama configuration:
-
-```json
-{
-  "ocr_provider": "local_ollama",
-  "local_ollama_url": "http://localhost:11434/api/generate",
-  "local_ollama_model": "richardyoung/olmocr2:7b-q8",
-  "local_ollama_num_ctx": 8192,
-  "local_ollama_unload_after_note": true
-}
-```
-
-After changing providers, run diagnostics:
-
-```
-supernote-obsidian-sync --diagnose
-```
-
-## Configuration folder
-
-Supsidian currently stores settings here:
-
-```
-~/Library/Application Support/Supernote Obsidian Sync/
-```
-
-This folder name is kept for compatibility with earlier versions.
-
-Important files:
-
-```
-config.json
-.env
-supernote_obsidian_sync.log
-```
-
-## Provider-specific setup notes
-
-`MISTRAL_API_KEY` is needed only when `ocr_provider` is `mistral`. It is not required for `local_ollama` or `hybrid_marker_olmocr`.
-
-For Mistral, the key is stored locally in:
-
-```
-~/Library/Application Support/Supernote Obsidian Sync/.env
-```
-
-Example:
-
-```
-MISTRAL_API_KEY=your_key_here
-```
-
-For local providers, ensure the required local tools are available, then run:
-
-```
-supernote-obsidian-sync --diagnose
-```
-
-## Custom OCR Instruction
-
-The **Custom OCR Instruction** field is optional.
-
-You can use it to guide how OCR output should be rendered.
-
-Example:
-
-```
-Preserve headings and bullet lists. Keep diagrams as images. Do not summarize. Keep the original wording as faithfully as possible.
-```
-
-Leave it empty for the default faithful OCR behavior.
-
-Bad instructions can reduce OCR quality, so keep the prompt short and clear.
-
-## Task conversion
-
-Supsidian can convert OCR lines into Obsidian tasks.
-
-Default handwritten/OCR line:
-
-```
-# Buy milk
-```
-
-Becomes:
-
-```
-- [ ] #task Buy milk
-```
-
-The default task settings are:
-
-```
-task_marker: #
-task_tag: #task
-```
-
-You can change these in **Settings → OCR & Tasks**.
-
-## Multi-folder sync
-
-Supsidian supports multiple Supernote folders.
-
-Each folder can be mapped to its own Obsidian note folder and attachment folder.
-
-Example:
-
-```
-Supernote/Psychomotorik
-→ Obsidian/Psychomotorik
-→ Attachments/Supernote/Psychomotorik
-```
-
-Configure folders in:
-
-```
-Settings → Folders
-```
-
-## Manual sync
-
-Supsidian is currently designed around manual syncing.
-
-Use:
-
-```
-Sync Now
-```
-
-from the menu bar.
-
-The command-line equivalent is:
-
-```
+```bash
+# Sync all configured folders once
 supernote-obsidian-sync --once
-```
 
-## Reprocessing notes
+# Sync only a specific configured folder
+supernote-obsidian-sync --once --folder "Praktikum Dietlimoos"
 
-Switching OCR provider does not automatically reprocess notes already recorded as processed. To process eligible notes again with the selected provider, run:
+# Sync only a single .note file (by path, relative path, or filename/stem)
+supernote-obsidian-sync --once --folder "Praktikum Dietlimoos" --file "Praktikumstag 3.note"
 
-```
+# Run setup diagnostics
+supernote-obsidian-sync --diagnose
+
+# Show current configuration & status
+supernote-obsidian-sync --status
+
+# Open settings folder or log file
+supernote-obsidian-sync --open-settings
+supernote-obsidian-sync --open-log
+
+# Reset processed-note state to force a full check on next sync
 supernote-obsidian-sync --reset-state
-supernote-obsidian-sync --once
 ```
 
-`--reset-state` makes eligible notes process again and may update generated Markdown and PDF attachment outputs. Back up important Obsidian notes before mass reprocessing.
+---
 
-## Diagnostics
+## Development & Building from Source
 
-Run diagnostics from the menu bar:
-
-```
-Settings → Diagnostics
-```
-
-Or from Terminal:
-
-```
-supernote-obsidian-sync --diagnose
-```
-
-Show status:
-
-```
-supernote-obsidian-sync --status
-```
-
-Open settings folder:
-
-```
-supernote-obsidian-sync --open-settings
-```
-
-Open log:
-
-```
-supernote-obsidian-sync --open-log
-```
-
-## Command-line tool
-
-The command-line tool is still called:
-
-```
-supernote-obsidian-sync
-```
-
-This is intentional for compatibility.
-
-Useful commands:
-
-```
-supernote-obsidian-sync --once
-supernote-obsidian-sync --diagnose
-supernote-obsidian-sync --status
-supernote-obsidian-sync --open-settings
-supernote-obsidian-sync --open-log
-```
-
-## Development
-
-Clone the repository:
-
-```
+```bash
 git clone https://github.com/Kulturban/supernote-obsidian-sync.git
 cd supernote-obsidian-sync
-```
 
-Install in editable mode:
-
-```
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e .
-```
+pip install -e ".[test]"
 
-Run tests:
+# Run unit test suite
+.venv/bin/pytest -q
 
-```
-pytest -q
-```
-
-Build the macOS app:
-
-```
+# Build macOS Release app
 xcodebuild \
   -project macos/SupernoteObsidianSync/SupernoteObsidianSync.xcodeproj \
   -scheme SupernoteObsidianSync \
   -configuration Release \
   -derivedDataPath /tmp/supsidian-build \
-  clean build
+  build
 ```
 
-Find the app:
-
-```
-find /tmp/supsidian-build -name "*.app" -type d
-```
-
-## Current naming
-
-Public app name:
-
-```
-Supsidian
-```
-
-Command-line tool:
-
-```
-supernote-obsidian-sync
-```
-
-Python package:
-
-```
-supernote_obsidian_sync
-```
-
-Settings folder:
-
-```
-~/Library/Application Support/Supernote Obsidian Sync/
-```
-
-This avoids breaking existing installations.
-
-## Notes
-
-Supsidian is currently unsigned and not notarized.
-
-If macOS blocks the app, right-click the app and choose **Open**. You may need to do this the first time you start the app.
-
-If macOS says the app is damaged, cannot be opened, or offers to move it to the Trash, this is usually Gatekeeper quarantine behavior for unsigned apps.
-
-You can remove the quarantine flag manually:
-
-```
-xattr -dr com.apple.quarantine /Applications/Supsidian.app
-```
-
-Then open Supsidian again:
-
-```
-open -a Supsidian
-```
-
-Code signing and notarization are planned for a future release.
+---
 
 ## License
 
-MIT License
+[MIT License](LICENSE)
