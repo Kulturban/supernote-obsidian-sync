@@ -2,6 +2,12 @@
 
 **Supernote → Obsidian Sync for macOS**
 
+[![Latest Release](https://img.shields.io/badge/release-v0.13.5-blue)](https://github.com/Kulturban/supernote-obsidian-sync/releases/latest)
+[![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)](https://github.com/Kulturban/supernote-obsidian-sync/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+> **[⬇️ Download Latest macOS App (`Supsidian-0.13.5-macOS.zip`)](https://github.com/Kulturban/supernote-obsidian-sync/releases/latest)**
+
 Supsidian is a lightweight macOS menu bar app and Python CLI that turns handwritten Supernote `.note` files into searchable Obsidian Markdown notes — complete with PDF attachments, automatically cropped hand-drawn sketches and diagrams, page-level incremental syncing, and customizable OCR instruction tabs.
 
 ---
