@@ -4,6 +4,10 @@ import AppKit
 import Combine
 import UniformTypeIdentifiers
 
+extension Notification.Name {
+    static let supsidianSettingsDidChange = Notification.Name("supsidianSettingsDidChange")
+}
+
 // MARK: - Models
 
 struct NotebookConfig: Identifiable, Codable {
@@ -416,7 +420,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     case setup = "Setup"
     case obsidianSettings = "Obsidian Settings"
     case folders = "Folders"
-    case ocrTasks = "OCR & Tasks"
+    case ocrTasks = "OCR"
     case advanced = "Advanced"
     case diagnostics = "About & Diagnose"
 
@@ -448,7 +452,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .folders:
             return "Supernote → Obsidian"
         case .ocrTasks:
-            return "OCR and task conversion"
+            return "OCR and instructions"
         case .advanced:
             return "Timing and startup"
         case .diagnostics:
@@ -509,7 +513,7 @@ enum SetupStep: String, CaseIterable, Identifiable {
         case .obsidianVault, .supernoteTool:
             return "Open Obsidian Settings"
         case .ocrProvider:
-            return "Open OCR & Tasks"
+            return "Open OCR"
         case .folders:
             return "Open Folders"
         }
@@ -599,6 +603,7 @@ final class SettingsViewModel: ObservableObject {
     private let appSupportDir: URL
     private let configURL: URL
     private let envURL: URL
+    private var lastLoadedConfigSignature: String = ""
 
     private var launchAgentURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -623,6 +628,26 @@ final class SettingsViewModel: ObservableObject {
 
     // MARK: Load / Save
 
+    private func currentFilesSignature() -> String {
+        func statPart(_ url: URL) -> String {
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+                return "missing"
+            }
+            let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+            let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+            return "\(mtime):\(size)"
+        }
+        return "\(statPart(configURL))|\(statPart(envURL))"
+    }
+
+    func reloadIfChanged() {
+        let sig = currentFilesSignature()
+        guard sig != lastLoadedConfigSignature else {
+            return
+        }
+        load()
+    }
+
     func load() {
         do {
             try FileManager.default.createDirectory(
@@ -642,6 +667,7 @@ final class SettingsViewModel: ObservableObject {
             apply(config)
             mistralApiKey = loadEnvValue(for: "MISTRAL_API_KEY") ?? ""
             refreshStartAtLoginStatus()
+            lastLoadedConfigSignature = currentFilesSignature()
             statusMessage = "Settings loaded."
         } catch {
             statusMessage = "❌ Failed to load settings: \(error.localizedDescription)"
@@ -710,6 +736,9 @@ final class SettingsViewModel: ObservableObject {
                 )
             }
 
+            lastLoadedConfigSignature = currentFilesSignature()
+            NotificationCenter.default.post(name: .supsidianSettingsDidChange, object: nil)
+
             if let nextStep = nextSetupStep {
                 statusMessage = "✅ Settings saved. Continue setup: \(nextStep.title)."
             } else {
@@ -771,7 +800,18 @@ final class SettingsViewModel: ObservableObject {
         localOllamaNumCtx = String(config.local_ollama_num_ctx > 0 ? config.local_ollama_num_ctx : 8192)
         localOllamaUnloadAfterNote = config.local_ollama_unload_after_note
         hybridMarkerCommand = config.hybrid_marker_command.isEmpty ? "marker_single" : config.hybrid_marker_command
-        notebooks = config.notebooks
+        let existingIDsByKey = Dictionary(
+            notebooks.map { ("\($0.name)|\(($0.source_dir as NSString).expandingTildeInPath)", $0.id) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        notebooks = config.notebooks.map { incoming in
+            var copy = incoming
+            let key = "\(incoming.name)|\( (incoming.source_dir as NSString).expandingTildeInPath )"
+            if let existingID = existingIDsByKey[key] {
+                copy.id = existingID
+            }
+            return copy
+        }
         if let currentID = selectedNotebookID,
            notebooks.contains(where: { $0.id == currentID }) {
             selectedNotebookID = currentID

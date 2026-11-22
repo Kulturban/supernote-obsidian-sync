@@ -374,6 +374,10 @@ CLOUD_VISUAL_EXTRACTION_VERSION = "bbox-pillow-crop-v1"
 CLOUD_VISUAL_PADDING_RATIO = 0.035
 CLOUD_VISUAL_TRIM_MARGIN_PX = 8
 CLOUD_VISUAL_WHITE_THRESHOLD = 248
+CLOUD_OCR_MAX_IMAGE_EDGE_PX = positive_int_or_default(
+    config.get("cloud_ocr_max_image_edge_px"), 1800
+)
+CLOUD_SKIP_BLANK_PAGES_LOCALLY = bool(config.get("cloud_skip_blank_pages_locally", True))
 LOCAL_OLLAMA_URL = (
     str(config.get("local_ollama_url", "http://localhost:11434/api/generate")).strip()
     or "http://localhost:11434/api/generate"
@@ -3310,6 +3314,65 @@ def call_openai_ocr_page(
     return parse_cloud_vlm_json_response(raw_text, "openai", page_number)
 
 
+def is_page_blank_locally(
+    page_image_bytes: bytes,
+    white_threshold: int = CLOUD_VISUAL_WHITE_THRESHOLD,
+    min_ink_ratio: float = 0.0003,
+) -> bool:
+    """
+    Detect blank or near-blank pages locally so empty pages are never uploaded
+    to external cloud OCR providers.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return False
+
+    try:
+        with Image.open(io.BytesIO(page_image_bytes)) as raw_image:
+            width, height = raw_image.size
+            if width <= 0 or height <= 0:
+                return True
+            gray = raw_image.convert("L")
+            non_white_mask = gray.point(lambda pixel: 255 if pixel < white_threshold else 0)
+            if non_white_mask.getbbox() is None:
+                return True
+            non_white_pixels = non_white_mask.histogram()[255]
+            return (non_white_pixels / float(width * height)) < min_ink_ratio
+    except Exception:
+        return False
+
+
+def prepare_cloud_upload_image_bytes(
+    page_image_bytes: bytes,
+    max_long_edge_px: int | None = None,
+) -> bytes:
+    """
+    Re-encode a rendered page bitmap into a clean, metadata-free PNG (no EXIF,
+    no text chunks, no file paths) and cap the longest edge to minimize uploaded data.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return page_image_bytes
+
+    cap = CLOUD_OCR_MAX_IMAGE_EDGE_PX if max_long_edge_px is None else int(max_long_edge_px)
+    try:
+        with Image.open(io.BytesIO(page_image_bytes)) as raw_image:
+            rgb = raw_image.convert("RGB")
+            width, height = rgb.size
+            long_edge = max(width, height)
+            if cap > 0 and long_edge > cap:
+                scale = cap / float(long_edge)
+                new_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+                rgb = rgb.resize(new_size, Image.Resampling.LANCZOS)
+            out = io.BytesIO()
+            rgb.save(out, format="PNG", optimize=True)
+            return out.getvalue()
+    except Exception:
+        return page_image_bytes
+
+
 def call_cloud_vlm_ocr_page(
     provider: str,
     page_image_bytes: bytes,
@@ -3392,9 +3455,24 @@ def cloud_vlm_ocr_selected_pdf_pages(
                 alpha=PAGE_HASH_ALPHA,
             )
             page_image_bytes = pixmap.tobytes("png")
+            if CLOUD_SKIP_BLANK_PAGES_LOCALLY and is_page_blank_locally(page_image_bytes):
+                log(
+                    f"Cloud OCR privacy optimization: skipped blank page {page_number} locally "
+                    "without external upload"
+                )
+                remove_stale_page_visual_files(
+                    extracted_visual_dir,
+                    page_number,
+                    existing_page_transcriptions or [],
+                )
+                page_transcriptions[page_number] = ""
+                page_assets[page_number] = []
+                continue
+
+            upload_image_bytes = prepare_cloud_upload_image_bytes(page_image_bytes)
             raw_markdown, visuals = call_cloud_vlm_ocr_page(
                 selected_provider,
-                page_image_bytes,
+                upload_image_bytes,
                 page_number,
                 model,
                 api_key,

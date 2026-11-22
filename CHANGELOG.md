@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.13.5
+
+- Renamed the **OCR & Tasks** settings section to **OCR** and generalized task conversion into tabbed **Custom OCR Instructions** (with **+ New Instruction**, **Load…**, **Save…**, **Active** toggle, and **Remove**) applied across all OCR providers.
+- Added single-file syncing (`--file` CLI option and nested per-folder `.note` file submenus under **Sync Folder** in the menu bar app).
+- Fixed a menu bar submenu collapse issue where a 2-second polling timer regenerated folder UUIDs and closed open **Sync Folder** submenus while hovering.
+- Removed the redundant **Manual Sync Mode** and **Useful Commands** info cards from Settings.
+- Added local cloud-privacy pre-processing (`is_page_blank_locally` and metadata-free, resolution-capped `prepare_cloud_upload_image_bytes`) so blank pages are never uploaded to external cloud providers.
+
 ## v0.13.2
 
 - Recommended `qwen3-vl:8b-instruct` (the non-thinking instruct variant) in macOS Settings and added a warning banner with a one-click switch when a non-instruct `qwen3-vl` thinking tag is configured.

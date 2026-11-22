@@ -11,7 +11,6 @@ import AppKit
 struct MenuSetupStatusView: View {
     @StateObject private var model = SettingsViewModel()
     @ObservedObject private var runner = CommandRunner.shared
-    private let refreshTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
     var body: some View {
         Group {
@@ -131,9 +130,9 @@ struct MenuSetupStatusView: View {
             }
         }
         .onAppear {
-            model.load()
+            model.reloadIfChanged()
         }
-        .onReceive(refreshTimer) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .supsidianSettingsDidChange)) { _ in
             model.load()
         }
     }

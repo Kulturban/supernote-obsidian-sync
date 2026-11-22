@@ -166,3 +166,50 @@ def test_scan_once_with_file_filter_syncs_only_selected_note(
     # Missing file raises a clear SystemExit
     with pytest.raises(SystemExit, match="Note file not found"):
         module.scan_once(folder_name="Work", note_file_filter="DoesNotExist.note")
+
+
+def test_cloud_ocr_skips_blank_pages_locally_without_external_upload(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    fitz = pytest.importorskip("fitz")
+    module = load_sync_module(
+        {
+            "ocr_provider": "gemini",
+            "gemini_api_key": "gem-test-key",
+        }
+    )
+
+    pdf_file = tmp_path / "blank_and_written.pdf"
+    doc = fitz.open()
+    try:
+        # Page 1: completely blank
+        doc.new_page(width=400, height=500)
+        # Page 2: has text
+        p2 = doc.new_page(width=400, height=500)
+        p2.insert_text((40, 80), "Written content on page 2", fontsize=16)
+        doc.save(pdf_file)
+    finally:
+        doc.close()
+
+    api_calls: list[int] = []
+
+    def fake_call_cloud(provider: str, image_bytes: bytes, page_number: int, model: str, api_key: str):
+        api_calls.append(page_number)
+        return f"Transcribed page {page_number}", []
+
+    monkeypatch.setattr(module, "call_cloud_vlm_ocr_page", fake_call_cloud)
+
+    transcriptions, _ = module.cloud_vlm_ocr_selected_pdf_pages(
+        pdf_file,
+        [1, 2],
+        "gemini",
+        tmp_path / "extracted_visuals",
+        "Attachments/Note",
+    )
+
+    # Page 1 was blank -> skipped locally without calling external cloud API!
+    assert api_calls == [2]
+    assert transcriptions[1] == ""
+    assert transcriptions[2] == "Transcribed page 2"
