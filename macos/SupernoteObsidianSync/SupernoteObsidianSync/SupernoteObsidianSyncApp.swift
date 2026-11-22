@@ -76,17 +76,43 @@ struct MenuSetupStatusView: View {
                         let folderName = notebook.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                             ? "Unnamed Folder"
                             : notebook.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let files = noteFiles(for: notebook)
 
-                        Button(folderName) {
-                            let currentModel = SettingsViewModel()
+                        Menu(folderName) {
+                            Button("Sync Entire Folder") {
+                                let currentModel = SettingsViewModel()
 
-                            if currentModel.setupReady {
-                                CommandRunner.shared.runSyncNow(model: currentModel, folderName: folderName)
+                                if currentModel.setupReady {
+                                    CommandRunner.shared.runSyncNow(model: currentModel, folderName: folderName)
+                                } else {
+                                    SettingsWindowController.shared.showSetup()
+                                }
+                            }
+                            .disabled(runner.isSyncing)
+
+                            Divider()
+
+                            if files.isEmpty {
+                                Text("No .note files found")
                             } else {
-                                SettingsWindowController.shared.showSetup()
+                                ForEach(files, id: \.path) { file in
+                                    Button(file.label) {
+                                        let currentModel = SettingsViewModel()
+
+                                        if currentModel.setupReady {
+                                            CommandRunner.shared.runSyncNow(
+                                                model: currentModel,
+                                                folderName: folderName,
+                                                noteFilePath: file.path
+                                            )
+                                        } else {
+                                            SettingsWindowController.shared.showSetup()
+                                        }
+                                    }
+                                    .disabled(runner.isSyncing)
+                                }
                             }
                         }
-                        .disabled(runner.isSyncing)
                     }
 
                     Divider()
@@ -109,6 +135,46 @@ struct MenuSetupStatusView: View {
         }
         .onReceive(refreshTimer) { _ in
             model.load()
+        }
+    }
+
+    private func noteFiles(for notebook: NotebookConfig) -> [(label: String, path: String)] {
+        let rawPath = notebook.source_dir.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawPath.isEmpty else {
+            return []
+        }
+
+        let expandedPath = (rawPath as NSString).expandingTildeInPath
+        let rootURL = URL(fileURLWithPath: expandedPath, isDirectory: true).standardizedFileURL
+        guard FileManager.default.fileExists(atPath: rootURL.path),
+              let enumerator = FileManager.default.enumerator(
+                  at: rootURL,
+                  includingPropertiesForKeys: [.isRegularFileKey],
+                  options: [.skipsHiddenFiles]
+              )
+        else {
+            return []
+        }
+
+        let rootPrefix = rootURL.path.hasSuffix("/") ? rootURL.path : rootURL.path + "/"
+        var results: [(label: String, path: String)] = []
+
+        for case let fileURL as URL in enumerator {
+            guard fileURL.pathExtension.lowercased() == "note" else {
+                continue
+            }
+            let standardizedPath = fileURL.standardizedFileURL.path
+            let relativeLabel: String
+            if standardizedPath.hasPrefix(rootPrefix) {
+                relativeLabel = String(standardizedPath.dropFirst(rootPrefix.count))
+            } else {
+                relativeLabel = fileURL.lastPathComponent
+            }
+            results.append((label: relativeLabel, path: standardizedPath))
+        }
+
+        return results.sorted {
+            $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending
         }
     }
 }
@@ -269,7 +335,11 @@ final class CommandRunner: ObservableObject {
         }
     }
 
-    func runSyncNow(model: SettingsViewModel, folderName: String? = nil) {
+    func runSyncNow(
+        model: SettingsViewModel,
+        folderName: String? = nil,
+        noteFilePath: String? = nil
+    ) {
         let shouldOpenPartner = model.openSupernotePartnerBeforeSync
         let partnerApp = model.supernotePartnerApp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? "Supernote Partner"
@@ -285,14 +355,25 @@ final class CommandRunner: ObservableObject {
         }
 
         let trimmedFolder = folderName?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let syncArguments: [String]
+        let trimmedFile = noteFilePath?.trimmingCharacters(in: .whitespacesAndNewlines)
+        var syncArguments = ["--once"]
         let windowTitle: String
+        let contextSummary: String
+
         if let trimmedFolder, !trimmedFolder.isEmpty {
-            syncArguments = ["--once", "--folder", trimmedFolder]
+            syncArguments.append(contentsOf: ["--folder", trimmedFolder])
+        }
+        if let trimmedFile, !trimmedFile.isEmpty {
+            syncArguments.append(contentsOf: ["--file", trimmedFile])
+            let fileLabel = URL(fileURLWithPath: trimmedFile).lastPathComponent
+            windowTitle = "Sync File — \(fileLabel)"
+            contextSummary = "File: \(fileLabel)"
+        } else if let trimmedFolder, !trimmedFolder.isEmpty {
             windowTitle = "Sync Folder — \(trimmedFolder)"
+            contextSummary = "Folder: \(trimmedFolder)"
         } else {
-            syncArguments = ["--once"]
             windowTitle = "Sync Now"
+            contextSummary = "All configured folders"
         }
 
         let syncRunningOutput = initialOutput(for: syncArguments, title: windowTitle)
@@ -304,7 +385,7 @@ final class CommandRunner: ObservableObject {
         isSyncing = true
         syncFractionCompleted = nil
         syncStageSummary = "Preparing sync…"
-        syncContextSummary = trimmedFolder.map { "Folder: \($0)" } ?? "All configured folders"
+        syncContextSummary = contextSummary
         lastSyncTitle = windowTitle
         lastSyncText = syncRunningOutput
         lastSyncFailed = false

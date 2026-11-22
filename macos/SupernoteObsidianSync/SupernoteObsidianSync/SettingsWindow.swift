@@ -2,6 +2,7 @@ import SwiftUI
 import ServiceManagement
 import AppKit
 import Combine
+import UniformTypeIdentifiers
 
 // MARK: - Models
 
@@ -44,6 +45,47 @@ struct NotebookConfig: Identifiable, Codable {
         self.obsidian_note_folder = try container.decode(String.self, forKey: .obsidian_note_folder)
         self.attachment_folder = try container.decode(String.self, forKey: .attachment_folder)
         self.state_file = try container.decode(String.self, forKey: .state_file)
+    }
+}
+
+struct CustomOCRInstructionItem: Identifiable, Codable, Equatable {
+    var id: String
+    var name: String
+    var enabled: Bool
+    var instruction: String
+
+    static let defaultTaskConversion = CustomOCRInstructionItem(
+        id: "task-conversion",
+        name: "Task Conversion",
+        enabled: true,
+        instruction: "If a handwritten line starts with '#', convert it into an Obsidian task checkbox line: '- [ ] #task <text>' (preserving the original task text)."
+    )
+
+    init(
+        id: String = UUID().uuidString,
+        name: String,
+        enabled: Bool = true,
+        instruction: String
+    ) {
+        self.id = id
+        self.name = name
+        self.enabled = enabled
+        self.instruction = instruction
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case enabled
+        case instruction
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        self.name = try container.decodeIfPresent(String.self, forKey: .name) ?? "Custom Instruction"
+        self.enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        self.instruction = try container.decodeIfPresent(String.self, forKey: .instruction) ?? ""
     }
 }
 
@@ -214,6 +256,7 @@ struct SyncConfig: Codable {
     var task_marker: String
     var task_tag: String
     var custom_ocr_instruction: String?
+    var custom_ocr_instructions: [CustomOCRInstructionItem]?
     var open_requires_obsidian_running: Bool
     var open_supernote_partner_before_sync: Bool
     var supernote_partner_app: String
@@ -239,6 +282,7 @@ struct SyncConfig: Codable {
         task_marker: "#",
         task_tag: "#task",
         custom_ocr_instruction: "",
+        custom_ocr_instructions: [.defaultTaskConversion],
         open_requires_obsidian_running: true,
         open_supernote_partner_before_sync: false,
         supernote_partner_app: "Supernote Partner",
@@ -265,6 +309,7 @@ struct SyncConfig: Codable {
         case task_marker
         case task_tag
         case custom_ocr_instruction
+        case custom_ocr_instructions
         case open_requires_obsidian_running
         case open_supernote_partner_before_sync
         case supernote_partner_app
@@ -291,6 +336,7 @@ struct SyncConfig: Codable {
         task_marker: String,
         task_tag: String,
         custom_ocr_instruction: String?,
+        custom_ocr_instructions: [CustomOCRInstructionItem]? = nil,
         open_requires_obsidian_running: Bool,
         open_supernote_partner_before_sync: Bool,
         supernote_partner_app: String,
@@ -315,6 +361,7 @@ struct SyncConfig: Codable {
         self.task_marker = task_marker
         self.task_tag = task_tag
         self.custom_ocr_instruction = custom_ocr_instruction
+        self.custom_ocr_instructions = custom_ocr_instructions
         self.open_requires_obsidian_running = open_requires_obsidian_running
         self.open_supernote_partner_before_sync = open_supernote_partner_before_sync
         self.supernote_partner_app = supernote_partner_app
@@ -343,6 +390,7 @@ struct SyncConfig: Codable {
         self.task_marker = try container.decodeIfPresent(String.self, forKey: .task_marker) ?? "#"
         self.task_tag = try container.decodeIfPresent(String.self, forKey: .task_tag) ?? "#task"
         self.custom_ocr_instruction = try container.decodeIfPresent(String.self, forKey: .custom_ocr_instruction)
+        self.custom_ocr_instructions = try container.decodeIfPresent([CustomOCRInstructionItem].self, forKey: .custom_ocr_instructions)
         self.open_requires_obsidian_running = try container.decodeIfPresent(Bool.self, forKey: .open_requires_obsidian_running) ?? true
         self.open_supernote_partner_before_sync = try container.decodeIfPresent(Bool.self, forKey: .open_supernote_partner_before_sync) ?? false
         self.supernote_partner_app = try container.decodeIfPresent(String.self, forKey: .supernote_partner_app) ?? "Supernote Partner"
@@ -513,6 +561,8 @@ final class SettingsViewModel: ObservableObject {
     @Published var taskMarker = "#"
     @Published var taskTag = "#task"
     @Published var customOcrInstruction = ""
+    @Published var customOCRInstructions: [CustomOCRInstructionItem] = [.defaultTaskConversion]
+    @Published var selectedInstructionID: String? = CustomOCRInstructionItem.defaultTaskConversion.id
     @Published var openRequiresObsidianRunning = true
     @Published var openSupernotePartnerBeforeSync = false
     @Published var supernotePartnerApp = "Supernote Partner"
@@ -612,7 +662,8 @@ final class SettingsViewModel: ObservableObject {
                 file_stability_wait_seconds: Int(fileStabilityWaitSeconds) ?? 10,
                 task_marker: taskMarker,
                 task_tag: taskTag,
-                custom_ocr_instruction: customOcrInstruction,
+                custom_ocr_instruction: "",
+                custom_ocr_instructions: customOCRInstructions,
                 open_requires_obsidian_running: openRequiresObsidianRunning,
                 open_supernote_partner_before_sync: openSupernotePartnerBeforeSync,
                 supernote_partner_app: supernotePartnerApp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -677,6 +728,28 @@ final class SettingsViewModel: ObservableObject {
         taskMarker = config.task_marker
         taskTag = config.task_tag
         customOcrInstruction = config.custom_ocr_instruction ?? ""
+        if let savedInstructions = config.custom_ocr_instructions, !savedInstructions.isEmpty {
+            customOCRInstructions = savedInstructions
+        } else {
+            var bootstrapped: [CustomOCRInstructionItem] = [.defaultTaskConversion]
+            let legacy = (config.custom_ocr_instruction ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !legacy.isEmpty {
+                bootstrapped.append(
+                    CustomOCRInstructionItem(
+                        name: "Custom Instruction",
+                        enabled: true,
+                        instruction: legacy
+                    )
+                )
+            }
+            customOCRInstructions = bootstrapped
+        }
+        if let currentInstructionID = selectedInstructionID,
+           customOCRInstructions.contains(where: { $0.id == currentInstructionID }) {
+            selectedInstructionID = currentInstructionID
+        } else {
+            selectedInstructionID = customOCRInstructions.first?.id
+        }
         openRequiresObsidianRunning = config.open_requires_obsidian_running
         let trimmedPartnerApp = config.supernote_partner_app.trimmingCharacters(in: .whitespacesAndNewlines)
         openSupernotePartnerBeforeSync = config.open_supernote_partner_before_sync
@@ -1382,6 +1455,112 @@ final class SettingsViewModel: ObservableObject {
             }
         }
         statusMessage = "Removed folder."
+    }
+
+    // MARK: Custom OCR Instructions
+
+    var selectedCustomOCRInstruction: CustomOCRInstructionItem? {
+        if let id = selectedInstructionID,
+           let match = customOCRInstructions.first(where: { $0.id == id }) {
+            return match
+        }
+        return customOCRInstructions.first
+    }
+
+    func addCustomOCRInstruction() {
+        let nextIndex = customOCRInstructions.count + 1
+        let item = CustomOCRInstructionItem(
+            name: "Instruction \(nextIndex)",
+            enabled: true,
+            instruction: ""
+        )
+        customOCRInstructions.append(item)
+        selectedInstructionID = item.id
+        statusMessage = "Added custom OCR instruction tab."
+    }
+
+    func removeCustomOCRInstruction(_ item: CustomOCRInstructionItem) {
+        let removedIndex = customOCRInstructions.firstIndex(where: { $0.id == item.id })
+        customOCRInstructions.removeAll { $0.id == item.id }
+        if selectedInstructionID == item.id {
+            if let idx = removedIndex, !customOCRInstructions.isEmpty {
+                let nextIndex = min(idx, customOCRInstructions.count - 1)
+                selectedInstructionID = customOCRInstructions[nextIndex].id
+            } else {
+                selectedInstructionID = customOCRInstructions.first?.id
+            }
+        }
+        statusMessage = "Removed instruction '\(item.name)'."
+    }
+
+    func exportCustomOCRInstruction(_ item: CustomOCRInstructionItem) {
+        let panel = NSSavePanel()
+        panel.title = "Save Custom OCR Instruction"
+        panel.allowedContentTypes = [.json, .plainText]
+        let slug = Self.slugify(item.name.isEmpty ? "ocr_instruction" : item.name)
+        panel.nameFieldStringValue = "\(slug).json"
+
+        guard panel.runModal() == .OK, let url = panel.url else {
+            return
+        }
+
+        do {
+            if url.pathExtension.lowercased() == "json" {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                let data = try encoder.encode(item)
+                try data.write(to: url, options: [.atomic])
+            } else {
+                try item.instruction.write(to: url, atomically: true, encoding: .utf8)
+            }
+            statusMessage = "✅ Saved instruction '\(item.name)' to \(url.lastPathComponent)."
+        } catch {
+            statusMessage = "❌ Failed to save instruction: \(error.localizedDescription)"
+        }
+    }
+
+    func importCustomOCRInstruction() {
+        let panel = NSOpenPanel()
+        panel.title = "Load Custom OCR Instruction"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.json, .plainText]
+
+        guard panel.runModal() == .OK, let url = panel.url else {
+            return
+        }
+
+        do {
+            let data = try Data(contentsOf: url)
+            if url.pathExtension.lowercased() == "json",
+               let decoded = try? JSONDecoder().decode(CustomOCRInstructionItem.self, from: data) {
+                let imported = CustomOCRInstructionItem(
+                    id: UUID().uuidString,
+                    name: decoded.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ? url.deletingPathExtension().lastPathComponent
+                        : decoded.name,
+                    enabled: decoded.enabled,
+                    instruction: decoded.instruction
+                )
+                customOCRInstructions.append(imported)
+                selectedInstructionID = imported.id
+                statusMessage = "✅ Loaded instruction '\(imported.name)'."
+                return
+            }
+
+            let rawText = String(data: data, encoding: .utf8) ?? ""
+            let imported = CustomOCRInstructionItem(
+                name: url.deletingPathExtension().lastPathComponent,
+                enabled: true,
+                instruction: rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+            customOCRInstructions.append(imported)
+            selectedInstructionID = imported.id
+            statusMessage = "✅ Loaded instruction '\(imported.name)'."
+        } catch {
+            statusMessage = "❌ Failed to load instruction: \(error.localizedDescription)"
+        }
     }
 
     func chooseSupernoteFolder(for notebook: NotebookConfig) {
@@ -3167,51 +3346,164 @@ struct SettingsView: View {
                 title: "OCR Provider",
                 description: "Choose between cloud OCR and local OCR providers. Provider-specific settings are saved to config.json."
             ) {
-                ocrProviderSettingsContent(showCustomInstruction: true)
+                ocrProviderSettingsContent(showCustomInstruction: false)
             }
 
             SettingsCard(
-                title: "Task Conversion",
-                description: "Turn handwritten or OCR-detected task lines into Obsidian-compatible checkboxes."
+                title: "Custom OCR Instructions",
+                description: "Each tab defines an instruction prompt included in every OCR run, regardless of which OCR provider is selected. Save, load, edit, or toggle individual instruction tabs."
             ) {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Example")
-                        .font(.headline)
+                tabbedCustomOCRInstructionsSection
+            }
+        }
+    }
 
-                    CodeBlock("# Buy milk")
+    @ViewBuilder
+    private var tabbedCustomOCRInstructionsSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(model.customOCRInstructions) { item in
+                        let isSelected = model.selectedCustomOCRInstruction?.id == item.id
+                        let tabTitle = item.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            ? "Unnamed Instruction"
+                            : item.name
 
-                    Text("becomes")
+                        Button {
+                            model.selectedInstructionID = item.id
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: item.enabled ? "checkmark.circle.fill" : "circle")
+                                    .font(.caption)
+                                    .foregroundColor(item.enabled ? (isSelected ? .accentColor : .green) : .secondary)
+                                Text(tabTitle)
+                                    .font(.subheadline)
+                                    .fontWeight(isSelected ? .semibold : .regular)
+                                    .lineLimit(1)
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .foregroundColor(isSelected ? .accentColor : .primary)
+                            .background(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(
+                                        isSelected
+                                            ? Color.accentColor.opacity(0.14)
+                                            : Color.secondary.opacity(0.08)
+                                    )
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(
+                                        isSelected ? Color.accentColor.opacity(0.45) : Color.clear,
+                                        lineWidth: 1
+                                    )
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    Button {
+                        model.addCustomOCRInstruction()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "plus")
+                                .font(.caption.weight(.semibold))
+                            Text("New Instruction")
+                                .font(.subheadline)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
                         .foregroundColor(.secondary)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8)
+                                .strokeBorder(
+                                    Color.secondary.opacity(0.35),
+                                    style: StrokeStyle(lineWidth: 1, dash: [4, 3])
+                                )
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help("Add a new custom OCR instruction tab")
 
-                    CodeBlock("- [ ] #task Buy milk")
+                    Button {
+                        model.importCustomOCRInstruction()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "square.and.arrow.down")
+                                .font(.caption)
+                            Text("Load…")
+                                .font(.subheadline)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .foregroundColor(.secondary)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(Color.secondary.opacity(0.08))
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help("Load a saved instruction file (.json or .txt)")
+                }
+                .padding(.vertical, 2)
+            }
 
-                    Text("Write the task marker at the beginning of a line in Supernote. During sync, that line becomes a checkbox task in Obsidian.")
+            if let activeItem = model.selectedCustomOCRInstruction,
+               let index = model.customOCRInstructions.firstIndex(where: { $0.id == activeItem.id }) {
+                VStack(alignment: .leading, spacing: 14) {
+                    HStack(spacing: 10) {
+                        Toggle("Active (include in every OCR run)", isOn: $model.customOCRInstructions[index].enabled)
+                            .toggleStyle(.switch)
+
+                        Spacer()
+
+                        Button("Save…") {
+                            model.exportCustomOCRInstruction(model.customOCRInstructions[index])
+                        }
+
+                        Button("Remove") {
+                            model.removeCustomOCRInstruction(model.customOCRInstructions[index])
+                        }
+                    }
+
+                    Divider()
+
+                    SettingField(
+                        title: "Instruction name",
+                        text: $model.customOCRInstructions[index].name
+                    )
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Instruction prompt")
+                            .font(.headline)
+
+                        TextEditor(text: $model.customOCRInstructions[index].instruction)
+                            .font(.system(.body, design: .default))
+                            .frame(minHeight: 110)
+                            .padding(6)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(Color.secondary.opacity(0.25))
+                            )
+                    }
+
+                    Text("All active instruction tabs are automatically included for every OCR method (Mistral, Gemini, Claude, OpenAI, Local Ollama, and Hybrid Marker).")
                         .font(.footnote)
                         .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-            }
-
-            SettingsCard(
-                title: "Task Settings",
-                description: "Customize how handwritten task lines are detected and tagged."
-            ) {
-                SettingField(
-                    title: "Task marker",
-                    text: $model.taskMarker
+                .padding(14)
+                .background(
+                    RoundedRectangle(cornerRadius: 14)
+                        .fill(Color(nsColor: .controlBackgroundColor))
                 )
-
-                Text("The marker that tells the sync app: this line should become a task. Default: #")
-                    .font(.footnote)    
-                    .foregroundColor(.secondary)
-
-                SettingField(
-                    title: "Task tag",
-                    text: $model.taskTag
+            } else {
+                EmptyStateView(
+                    icon: "text.badge.plus",
+                    title: "No custom OCR instructions",
+                    message: "Click + New Instruction or Load… to add an instruction tab."
                 )
-
-                Text("The tag added to converted tasks. Default: #task")
-                    .font(.footnote)
-                    .foregroundColor(.secondary)
             }
         }
     }
@@ -3321,18 +3613,6 @@ struct SettingsView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-
-            SettingsCard(
-                title: "Manual Sync Mode",
-                description: "This app now syncs only when you choose Sync Now from the menu bar."
-            ) {
-                VStack(alignment: .leading, spacing: 8) {
-                    Label("No background watcher is shown in the release UI.", systemImage: "checkmark.circle")
-                    Label("No start-at-login setup is needed.", systemImage: "checkmark.circle")
-                    Label("Check interval is hidden because it is only used for background watching.", systemImage: "checkmark.circle")
-                }
-                .foregroundColor(.secondary)
-            }
         }
     }
 
@@ -3376,28 +3656,6 @@ struct SettingsView: View {
                     Button("Open Log File") {
                         CommandRunner.shared.runSilently(["--open-log"], title: "Open Log")
                     }
-                }
-            }
-
-            SettingsCard(
-                title: "Useful Commands",
-                description: "These actions use the same command-line backend as the menu bar app."
-            ) {
-                VStack(alignment: .leading, spacing: 10) {
-                    CommandInfoRow(
-                        title: "Run Diagnose",
-                        description: "Checks your config, folders, API key, and supernote-tool installation."
-                    )
-
-                    CommandInfoRow(
-                        title: "Open Settings Folder",
-                        description: "Opens the macOS Application Support folder where config.json, .env, state files, and logs are stored."
-                    )
-
-                    CommandInfoRow(
-                        title: "Open Log File",
-                        description: "Shows the sync log for troubleshooting OCR, PDF conversion, and folder problems."
-                    )
                 }
             }
         }

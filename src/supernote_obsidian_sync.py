@@ -59,6 +59,7 @@ DEFAULT_CONFIG = {
     "supernote_tool_path": "",
     "task_marker": "#",
     "task_tag": "#task",
+    "custom_ocr_instructions": [],
     "open_requires_obsidian_running": True,
     "ocr_provider": "mistral",
     "ocr_model": "",
@@ -258,6 +259,80 @@ TASK_TAG = config.get("task_tag", "#task")
 
 OPEN_REQUIRES_OBSIDIAN_RUNNING = bool(config.get("open_requires_obsidian_running", True))
 CUSTOM_OCR_INSTRUCTION = str(config.get("custom_ocr_instruction", "")).strip()
+
+
+def normalize_custom_ocr_instructions(raw_config: dict) -> list[dict]:
+    raw_items = raw_config.get("custom_ocr_instructions")
+    if not isinstance(raw_items, list):
+        return []
+
+    normalized: list[dict] = []
+    for index, item in enumerate(raw_items, start=1):
+        if not isinstance(item, dict):
+            continue
+        instruction = str(item.get("instruction", "")).strip()
+        name = str(item.get("name", "")).strip() or f"Instruction {index}"
+        item_id = str(item.get("id", "")).strip() or f"{slugify(name)}-{index}"
+        enabled = bool(item.get("enabled", True))
+        normalized.append(
+            {
+                "id": item_id,
+                "name": name,
+                "enabled": enabled,
+                "instruction": instruction,
+            }
+        )
+    return normalized
+
+
+CUSTOM_OCR_INSTRUCTIONS = normalize_custom_ocr_instructions(config)
+
+
+def compose_custom_ocr_instruction(
+    instructions: list[dict] | None = None,
+    legacy_instruction: str | None = None,
+) -> str:
+    """
+    Combine all enabled custom OCR instruction tabs (plus optional legacy
+    custom_ocr_instruction) into a single instruction block applied to every
+    OCR provider.
+    """
+    items = CUSTOM_OCR_INSTRUCTIONS if instructions is None else instructions
+    legacy = CUSTOM_OCR_INSTRUCTION if legacy_instruction is None else str(legacy_instruction).strip()
+
+    parts: list[str] = []
+    seen_texts: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict) or not item.get("enabled", True):
+            continue
+        text = str(item.get("instruction", "")).strip()
+        if not text:
+            continue
+        name = str(item.get("name", "")).strip()
+        seen_texts.add(text)
+        parts.append(f"- {name}: {text}" if name else f"- {text}")
+
+    if legacy and legacy not in seen_texts:
+        parts.append(legacy)
+
+    return "\n".join(parts).strip()
+
+
+def should_run_hash_task_conversion() -> bool:
+    """
+    Run deterministic hash-line task conversion unless the user explicitly
+    disabled the 'Task Conversion' instruction tab.
+    """
+    for item in CUSTOM_OCR_INSTRUCTIONS:
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id", "")).strip().lower()
+        name = str(item.get("name", "")).strip().lower()
+        if item_id == "task-conversion" or name == "task conversion":
+            return bool(item.get("enabled", True))
+    return True
+
+
 OCR_PROVIDER = str(config.get("ocr_provider", "mistral")).strip().lower() or "mistral"
 OCR_MODEL = str(config.get("ocr_model", "")).strip()
 OCR_REASONING_EFFORT_OPTIONS = ("minimal", "low", "medium", "high")
@@ -592,7 +667,7 @@ def ocr_settings_fingerprint(provider: str | None = None) -> str:
     if selected_provider == "mistral":
         fingerprint_data["mistral"] = {
             "model": "mistral-ocr-latest",
-            "custom_ocr_instruction": CUSTOM_OCR_INSTRUCTION,
+            "custom_ocr_instruction": compose_custom_ocr_instruction(),
         }
     elif selected_provider in CLOUD_VLM_OCR_PROVIDERS:
         fingerprint_data["cloud_vlm"] = {
@@ -600,7 +675,7 @@ def ocr_settings_fingerprint(provider: str | None = None) -> str:
             "ocr_model": resolve_cloud_ocr_model(selected_provider),
             "ocr_reasoning_effort": resolve_ocr_reasoning_effort(),
             "visual_extraction": CLOUD_VISUAL_EXTRACTION_VERSION,
-            "custom_ocr_instruction": CUSTOM_OCR_INSTRUCTION,
+            "custom_ocr_instruction": compose_custom_ocr_instruction(),
             "prompt": build_cloud_vlm_ocr_prompt(),
             "rendering": {
                 "dpi": PAGE_HASH_DPI,
@@ -889,8 +964,9 @@ def mistral_ocr_pdf(pdf_file: Path, image_dir: Path, obsidian_image_folder: str)
         "include_image_base64": True,
     }
 
-    if CUSTOM_OCR_INSTRUCTION:
-        payload["document_annotation_prompt"] = CUSTOM_OCR_INSTRUCTION
+    effective_custom_instruction = compose_custom_ocr_instruction()
+    if effective_custom_instruction:
+        payload["document_annotation_prompt"] = effective_custom_instruction
         payload["document_annotation_format"] = {"type": "text"}
 
     response = requests.post(
@@ -994,11 +1070,11 @@ def should_run_qwen_visual_fallback(model_name: str | None = None) -> bool:
 
 
 def resolve_local_ollama_prompt(model_name: str | None = None) -> str:
-    if is_qwen3_vl_model(model_name):
-        if CUSTOM_OCR_INSTRUCTION:
-            return f"{QWEN3_VL_OCR_PROMPT}\n\nAdditional user instructions:\n{CUSTOM_OCR_INSTRUCTION}"
-        return QWEN3_VL_OCR_PROMPT
-    return LOCAL_OLLAMA_PROMPT
+    base_prompt = QWEN3_VL_OCR_PROMPT if is_qwen3_vl_model(model_name) else LOCAL_OLLAMA_PROMPT
+    effective_custom_instruction = compose_custom_ocr_instruction()
+    if effective_custom_instruction:
+        return f"{base_prompt}\n\nAdditional user instructions:\n{effective_custom_instruction}"
+    return base_prompt
 
 
 def local_ollama_chat_url(url: str | None = None) -> str:
@@ -2661,8 +2737,9 @@ GEMINI_OCR_RESPONSE_SCHEMA = {
 
 
 def build_cloud_vlm_ocr_prompt() -> str:
-    if CUSTOM_OCR_INSTRUCTION:
-        return f"{CLOUD_VLM_OCR_PROMPT}\n\nAdditional user instructions:\n{CUSTOM_OCR_INSTRUCTION}"
+    effective_custom_instruction = compose_custom_ocr_instruction()
+    if effective_custom_instruction:
+        return f"{CLOUD_VLM_OCR_PROMPT}\n\nAdditional user instructions:\n{effective_custom_instruction}"
     return CLOUD_VLM_OCR_PROMPT
 
 
@@ -3609,7 +3686,7 @@ def convert_hash_lines_to_tasks(ocr_text: str) -> str:
             converted_lines.append(line)
             continue
 
-        if TASK_MARKER and clean.startswith(TASK_MARKER):
+        if TASK_MARKER and clean.startswith(TASK_MARKER) and should_run_hash_task_conversion():
             task_text = clean[len(TASK_MARKER):].strip()
 
             if task_text:
@@ -3754,25 +3831,71 @@ def process_note(note_file: Path) -> None:
     log(f"Done: {md_file}")
 
 
-def scan_active_notebook_once() -> None:
+def select_note_files_in_source(
+    source_dir: Path,
+    note_file_filter: str | None = None,
+) -> list[Path]:
+    all_notes = sorted(source_dir.rglob("*.note"))
+    if note_file_filter is None or not str(note_file_filter).strip():
+        return all_notes
+
+    target = str(note_file_filter).strip()
+    target_folded = target.casefold()
+    resolved_target: Path | None = None
+    try:
+        resolved_target = Path(target).expanduser().resolve()
+    except OSError:
+        resolved_target = None
+
+    exact_matches: list[Path] = []
+    for note_file in all_notes:
+        if resolved_target is not None:
+            try:
+                if note_file.resolve() == resolved_target:
+                    exact_matches.append(note_file)
+                    continue
+            except OSError:
+                pass
+        try:
+            rel_path = str(note_file.relative_to(source_dir))
+            if rel_path == target or rel_path.casefold() == target_folded:
+                exact_matches.append(note_file)
+                continue
+        except ValueError:
+            pass
+    if exact_matches:
+        return exact_matches
+
+    return [
+        note_file
+        for note_file in all_notes
+        if note_file.name.casefold() == target_folded
+        or note_file.stem.casefold() == target_folded
+    ]
+
+
+def scan_active_notebook_once(note_file_filter: str | None = None) -> int:
     """
-    Scan the Supernote source folder once.
+    Scan the Supernote source folder once (optionally restricted to a single .note file).
+    Returns the number of matching .note files inspected.
     """
     if OPEN_REQUIRES_OBSIDIAN_RUNNING and not is_obsidian_running():
         log("Obsidian is not running. Skipping.")
-        return
+        return 0
 
     if not SOURCE_DIR.exists():
         raise SystemExit(f"Source folder not found: {SOURCE_DIR}")
 
     state = load_state()
+    note_files = select_note_files_in_source(SOURCE_DIR, note_file_filter)
+    explicit_single_file = bool(note_file_filter and str(note_file_filter).strip())
 
-    for note_file in sorted(SOURCE_DIR.rglob("*.note")):
+    for note_file in note_files:
         key = str(note_file)
         current_signature = note_state_signature(note_file)
         md_file = OBSIDIAN_NOTE_DIR / f"{safe_name(note_file)}.md"
 
-        if state.get(key) == current_signature and md_file.exists():
+        if not explicit_single_file and state.get(key) == current_signature and md_file.exists():
             continue
 
         log(f"Found new or changed note: {note_file}")
@@ -3789,6 +3912,8 @@ def scan_active_notebook_once() -> None:
         except Exception as exc:
             logging.exception("Error processing %s", note_file)
             log(f"Error processing {note_file}: {exc}")
+
+    return len(note_files)
 
 
 
@@ -3825,11 +3950,15 @@ def select_notebooks(folder_name: str | None = None) -> list[dict]:
     )
 
 
-def scan_once(folder_name: str | None = None) -> None:
+def scan_once(
+    folder_name: str | None = None,
+    note_file_filter: str | None = None,
+) -> None:
     """
-    Scan all configured Supernote notebooks (or a single selected folder) once.
+    Scan all configured Supernote notebooks (or a single selected folder / file) once.
     """
     selected_notebooks = select_notebooks(folder_name)
+    total_matched_files = 0
     for index, notebook in enumerate(selected_notebooks, start=1):
         use_notebook(notebook)
         notebook_name = ACTIVE_NOTEBOOK.get("name", "Unnamed notebook")
@@ -3840,7 +3969,15 @@ def scan_once(folder_name: str | None = None) -> None:
             notebook_index=index,
             notebook_count=len(selected_notebooks),
         )
-        scan_active_notebook_once()
+        if note_file_filter and str(note_file_filter).strip():
+            matched = scan_active_notebook_once(note_file_filter=note_file_filter)
+        else:
+            matched = scan_active_notebook_once()
+        if isinstance(matched, int):
+            total_matched_files += matched
+
+    if note_file_filter and str(note_file_filter).strip() and total_matched_files == 0:
+        raise SystemExit(f"❌ Note file not found: '{str(note_file_filter).strip()}'")
 
 
 # ------------------------------------------------------------
@@ -4789,11 +4926,20 @@ def _sync_output_snapshot(notebooks: list[dict] | None = None) -> dict:
     return snapshot
 
 
-def sync_now_with_summary(folder_name: str | None = None) -> None:
+def sync_now_with_summary(
+    folder_name: str | None = None,
+    note_file_filter: str | None = None,
+) -> None:
     """
     Run a one-time sync and print a user-friendly summary for the GUI window.
     """
-    if folder_name and folder_name.strip():
+    if note_file_filter and note_file_filter.strip():
+        file_label = Path(note_file_filter.strip()).name
+        if folder_name and folder_name.strip():
+            print(f"\nSync File: {folder_name.strip()} / {file_label}\n")
+        else:
+            print(f"\nSync File: {file_label}\n")
+    elif folder_name and folder_name.strip():
         print(f"\nSync Folder: {folder_name.strip()}\n")
     else:
         print("\nSync Now\n")
@@ -4806,7 +4952,7 @@ def sync_now_with_summary(folder_name: str | None = None) -> None:
     selected_notebooks = select_notebooks(folder_name)
     before = _sync_output_snapshot(selected_notebooks)
 
-    scan_once(folder_name=folder_name)
+    scan_once(folder_name=folder_name, note_file_filter=note_file_filter)
 
     after = _sync_output_snapshot(selected_notebooks)
 
@@ -4847,6 +4993,13 @@ def main() -> None:
         type=str,
         default=None,
         help="Sync only the specified configured Supernote folder.",
+    )
+
+    parser.add_argument(
+        "--file",
+        type=str,
+        default=None,
+        help="Sync only the specified .note file (path, relative path, or filename/stem).",
     )
 
     parser.add_argument(
@@ -4915,8 +5068,8 @@ def main() -> None:
         setup()
     elif args.diagnose:
         diagnose()
-    elif args.once or args.folder:
-        sync_now_with_summary(folder_name=args.folder)
+    elif args.once or args.folder or args.file:
+        sync_now_with_summary(folder_name=args.folder, note_file_filter=args.file)
     elif args.status:
         show_status()
     elif args.open_settings:
