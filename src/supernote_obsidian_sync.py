@@ -426,7 +426,7 @@ HYBRID_MARKER_HIGHRES_IMAGE_DPI = positive_int_or_default(
 )
 HYBRID_MARKER_DISABLE_TQDM = bool(config.get("hybrid_marker_disable_tqdm", True))
 HYBRID_QWEN_VISUAL_FALLBACK = bool(config.get("hybrid_qwen_visual_fallback", True))
-LOCAL_OLLAMA_PIPELINE_VERSION = "ollama-pipeline-v2"
+LOCAL_OLLAMA_PIPELINE_VERSION = "ollama-pipeline-v3"
 MARKER_VISUAL_MIN_WIDTH_PX = 24
 MARKER_VISUAL_MIN_HEIGHT_PX = 24
 MARKER_VISUAL_MIN_INK_RATIO = 0.002
@@ -1225,7 +1225,13 @@ def ollama_ocr_selected_pdf_pages(pdf_file: Path, page_numbers: list[int]) -> di
                 pixmap = render_ollama_page_pixmap(page, dpi=200)
                 pixmap.save(page_path)
 
-                encoded_image = base64.b64encode(page_path.read_bytes()).decode("ascii")
+                page_image_bytes = page_path.read_bytes()
+                if is_page_blank_locally(page_image_bytes, white_threshold=255, min_ink_ratio=0):
+                    page_transcriptions[page_number] = ""
+                    log(f"Ollama OCR skipped blank page {page_number}/{len(document)}")
+                    continue
+
+                encoded_image = base64.b64encode(page_image_bytes).decode("ascii")
                 use_qwen_chat = is_qwen3_vl_model(LOCAL_OLLAMA_MODEL)
                 ollama_options: dict[str, object] = {
                     "num_ctx": LOCAL_OLLAMA_NUM_CTX,

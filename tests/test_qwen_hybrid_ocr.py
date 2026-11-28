@@ -129,6 +129,29 @@ def test_qwen3_vl_uses_chat_endpoint_with_think_false_and_strips_think_blocks(
     assert "finished in " in output
 
 
+def test_local_ollama_skips_blank_page_without_shifting_later_pages(
+    load_sync_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = load_sync_module(
+        {"ocr_provider": "local_ollama", "local_ollama_model": "qwen3-vl:8b"}
+    )
+    pdf_file = tmp_path / "note.pdf"
+    write_test_pdf(pdf_file, ["First page", "", "."])
+    calls: list[dict] = []
+
+    def fake_post(_url, json, **_kwargs):
+        calls.append(json)
+        return FakeHTTPResponse(
+            200, {"message": {"content": f"Transcription {len(calls)}"}}
+        )
+
+    monkeypatch.setattr(module.requests, "post", fake_post)
+    assert module.ollama_ocr_pdf_pages(pdf_file) == ["Transcription 1", "", "Transcription 2"]
+    assert len(calls) == 2
+
+
 def test_switching_model_from_olmocr2_to_qwen3_vl_invalidates_cache_even_with_existing_md(
     load_sync_module,
     monkeypatch: pytest.MonkeyPatch,

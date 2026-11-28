@@ -26,6 +26,7 @@ Supsidian is a lightweight macOS menu bar app and Python CLI that turns handwrit
   - **OpenAI** (`gpt-6.1-terra` default, plus `gpt-6-luna`, `gpt-6.2-sol`, `gpt-6.2-astra`)
   - **Mistral OCR** (`mistral-ocr-latest`)
   - **Local Ollama** (`qwen3-vl:8b-instruct` recommended for 16 GB Macs, or `richardyoung/olmocr2:7b-q8`)
+    Fully white pages are skipped before Ollama OCR, and their page headings are retained.
   - **Hybrid Marker + Ollama (Experimental)** (sequential RAM unload before Marker + local Qwen3-VL sketch fallback)
   - **No OCR (PDF Embed Only)** (generates companion `.md` with YAML frontmatter and `![[<Note>.pdf]]` embed)
 - **Automatic Sketch & Diagram Cropping:** Cloud VLM providers and Qwen3-VL detect hand-drawn sketches, diagrams, and charts via normalized bounding boxes (`0..1000`). Supsidian crops them **locally with Pillow** (adding a safety margin and trimming excess whitespace) and embeds them as `![[.../extracted_visuals/page-NNN-visual-MMM.jpeg]]` at the exact vertical reading position.
